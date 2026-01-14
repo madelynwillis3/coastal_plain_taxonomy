@@ -30,88 +30,173 @@ library(stringr)
     #lab data: CEC
     ncss_labdata <- read.csv("../data/ncss_labdata.csv") #ncsslabdataiidref is pedon id , seq is hz 
     
+    #ped_taxa:
+    ncss_ped_taxa <- read.csv("../data/ncss_pedon_taxa_history.csv")
     # str(ncss_pedon)
     # str(ncss_phorizon)
     # str(ncss_color)
     # str(ncss_mottles)
     # str(ncss_labdata)
-    
-    # --- 1) pedon -> horizon join (pedon id key is peiid <-> peiidref) ---
-      # Pedons you want to keep (your MLRA-clipped set)
-      keep_peiid <- ncss_pedon %>%
-        distinct(peiid)
-      
-      # Horizons that belong to those pedons (also gives you the horizon ids)
-      keep_hz <- ncss_phorizon %>%
-        semi_join(keep_peiid, by = c("peiidref" = "peiid")) %>%
-        distinct(peiidref, phiid)
-      
-      keep_phiid <- keep_hz %>% distinct(phiid)
-    
-      ncss_phorizon_mlra <- ncss_phorizon %>%
-      semi_join(keep_peiid, by = c("peiidref" = "peiid"))
+```
 
-      ncss_color_mlra <- ncss_color %>%
-      semi_join(keep_phiid, by = c("phiidref" = "phiid"))
-    
-      ncss_mottles_mlra <- ncss_mottles %>%
-      semi_join(keep_phiid, by = c("phiidref" = "phiid"))
+```{r}
 
-      keep_labsamp <- ncss_pedon %>%
-      distinct(pedlabsampnum) %>%
-      filter(!is.na(pedlabsampnum), pedlabsampnum != "")
-    
-      ncss_labdata_mlra <- ncss_labdata %>%
-      semi_join(keep_labsamp, by = c("labsampnum" = "pedlabsampnum"))
 
-    # --- 2a) summarize colors per horizon ---
+#========================================================
+# 0) Keep set: pedons in your clipped MLRA pedon table
+#========================================================
+keep_peiid <- ncss_pedon %>% distinct(peiid)
 
-    
-    color_summ <- ncss_color_mlra %>%
-      mutate(color = str_trim(paste(colorhue, colorvalue, "/", colorchroma))) %>%
-      group_by(phiidref) %>%
-      summarise(
-        # keep a compact list of distinct colors
-        colors = paste(unique(na.omit(color)), collapse = "; "))
+# horizons that belong to those pedons (needed to filter color/mottles by phiid)
+keep_hz <- ncss_phorizon %>%
+  semi_join(keep_peiid, by = c("peiidref" = "peiid")) %>%
+  distinct(peiidref, phiid)
 
-    
-    # --- 2b) summarize mottles per horizon ---
+keep_phiid <- keep_hz %>% distinct(phiid)
 
-    mottle_summ <- ncss_mottles_mlra %>%
-      mutate(mottle_color = str_trim(paste(colorhue, colorvalue, "/", colorchroma))) %>%
-      group_by(phiidref) %>%
-      summarise(
-        mottles = paste(
-          unique(na.omit(
-            paste0(
-              ifelse(is.na(mottlepct), "", paste0(mottlepct, "% ")),
-              mottlecntrst, " ", mottlesize, " ",
-              mottle_color,
-              ifelse(is.na(mottleloc) | mottleloc == "", "", paste0(" (", mottleloc, ")"))
-            )
-          )),
-          collapse = "; "
-        ),
-        .groups = "drop"
-      )
-    
-    # --- 2c) join onto horizon master ---
+#========================================================
+# 1) Filter each table to the MLRA set
+#========================================================
+ncss_phorizon_mlra <- ncss_phorizon %>%
+  semi_join(keep_peiid, by = c("peiidref" = "peiid"))
 
-    hz_master2 <- hz_master %>%
-      left_join(color_summ,  by = c("phiid" = "phiidref")) %>%
-      left_join(mottle_summ, by = c("phiid" = "phiidref"))
+ncss_color_mlra <- ncss_color %>%
+  semi_join(keep_phiid, by = c("phiidref" = "phiid"))
 
-    # 3C)
-    lab_keep <- ncss_labdata_mlra %>%
-      select(labsampnum, layerseqnum, hzdept, hzdepb,
-             cec7, ecec, cecsumcations, sumbases, basesatnh4oac, basesatsumcations)
-    
-    hz_master3 <- hz_master2 %>%
-      left_join(
-        lab_keep,
-        by = c("pedlabsampnum" = "labsampnum", "seqnum" = "layerseqnum")
-      )
+ncss_mottles_mlra <- ncss_mottles %>%
+  semi_join(keep_phiid, by = c("phiidref" = "phiid"))
 
+ncss_ped_taxa_mlra <- ncss_ped_taxa %>%
+  semi_join(keep_peiid, by = c("peiidref" = "peiid"))
+
+#========================================================
+# 2) Summarize horizon-level morphology (colors + mottles)
+#========================================================
+color_summ <- ncss_color_mlra %>%
+  mutate(color = str_trim(paste(colorhue, colorvalue, "/", colorchroma))) %>%
+  group_by(phiidref) %>%
+  summarise(
+    colors = paste(unique(na.omit(color)), collapse = "; "),
+    dom_color = {
+      x <- .[.$colormoistst == "Moist" & .$colorphysst == "Interior", , drop = FALSE]
+      if (nrow(x) == 0) NA_character_
+      else str_trim(paste(x$colorhue[1], x$colorvalue[1], "/", x$colorchroma[1]))
+    },
+    .groups = "drop"
+  )
+
+mottle_summ <- ncss_mottles_mlra %>%
+  mutate(mottle_color = str_trim(paste(colorhue, colorvalue, "/", colorchroma))) %>%
+  group_by(phiidref) %>%
+  summarise(
+    mottles = paste(
+      unique(na.omit(
+        paste0(
+          ifelse(is.na(mottlepct), "", paste0(mottlepct, "% ")),
+          mottlecntrst, " ", mottlesize, " ",
+          mottle_color,
+          ifelse(is.na(mottleloc) | mottleloc == "", "", paste0(" (", mottleloc, ")"))
+        )
+      )),
+      collapse = "; "
+    ),
+    mottle_pct = {
+      x <- suppressWarnings(max(mottlepct, na.rm = TRUE))
+      if (is.infinite(x)) NA_real_ else x
+    },
+    .groups = "drop"
+  )
+
+#========================================================
+# 3) Choose ONE taxonomy record per pedon (most recent)
+#========================================================
+taxa_best <- ncss_ped_taxa_mlra %>%
+  mutate(
+    taxorder = na_if(str_trim(taxorder), ""),
+    classtype = str_trim(classtype)
+  ) %>%
+  group_by(peiidref) %>%
+  arrange(
+    desc(classtype == "Sampled as"),
+    desc(!is.na(taxorder))
+  ) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    peiidref,
+    series = taxonname,          # <- rename so it won't collide
+    taxclname,
+    taxorder,
+    taxsuborder,
+    taxgrtgroup,
+    taxsubgrp,
+    taxpartsize
+  )
+
+#========================================================
+# 4) Build horizon master and slim horizon table
+#========================================================
+
+hz_master2 <- ncss_phorizon_mlra %>%
+  left_join(
+    ncss_pedon %>% select(peiid, siteobsiidref, upedonid),
+    by = c("peiidref" = "peiid")
+  ) %>%
+  left_join(taxa_best, by = "peiidref") %>%
+  left_join(color_summ,  by = c("phiid" = "phiidref")) %>%
+  left_join(mottle_summ, by = c("phiid" = "phiidref"))
+
+hz_slim <- hz_master2 %>%
+  transmute(
+    peiidref, siteobsiidref, upedonid,
+    series, taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize,
+    seqnum, hzname, hzdept, hzdepb,
+    texture, sandtotest, silttotest, claytotest,
+    dom_color, mottle_pct, mottles
+  ) %>%
+  separate(dom_color, into = c("color_hue", "color_vc"), sep = "\\s+", fill = "right", extra = "merge") %>%
+  separate(color_vc, into = c("color_value", "color_chroma"), sep = "/", fill = "right") %>%
+  mutate(
+    color_value = suppressWarnings(as.numeric(color_value)),
+    color_chroma = suppressWarnings(as.integer(color_chroma))
+  ) 
+
+
+```
+
+```{r data wrangling}
+# helper: choose the most common non-missing value in a vector
+mode_nonmissing <- function(x) {
+  x <- str_trim(as.character(x))
+  x[x == ""] <- NA
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  tab <- sort(table(x), decreasing = TRUE)
+  names(tab)[1]
+}
+
+hz_slim_clean <- hz_slim %>%
+  mutate(
+    # --- 1) clean series name ---
+    series = str_squish(series),
+    series = str_to_lower(series),
+    series = str_to_title(series)  # "RED BAY" -> "Red Bay", "persanti" -> "Persanti"
+  ) %>%
+  group_by(series) %>%
+  mutate(
+    # --- 2) make taxonomy identical within series (fill from best/most common) ---
+    taxclname   = mode_nonmissing(taxclname),
+    taxorder    = mode_nonmissing(taxorder),
+    taxsuborder = mode_nonmissing(taxsuborder),
+    taxgrtgroup = mode_nonmissing(taxgrtgroup),
+    taxsubgrp   = mode_nonmissing(taxsubgrp),
+    taxpartsize = mode_nonmissing(taxpartsize)
+  ) %>%
+  ungroup()
+```
+
+
+```{r}
 #Perry data:
   #data to keep: hz name, seq, top depth, bottom depth, txt class, txt percentages (test), Hue, Value, Chroma, and mottle HVC and percentages
 ```
