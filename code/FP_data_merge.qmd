@@ -1,0 +1,118 @@
+---
+title: "FP_data_merge"
+format: html
+---
+
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+
+```
+
+```{r}
+#data pull:
+
+#FP data:
+perry_FP <- read.csv("../data/Perry Full-Profile SampleData 1_15_2026_corrected.csv")
+
+#texture data:
+
+txt <- read.csv("../data/all_results_texture_01_15_2026.csv")
+
+      # str(perry_FP)
+      # str(txt)
+
+```
+
+
+```{r}
+
+#----------------------------------------
+# 1) Standardize join keys + clean txt
+#----------------------------------------
+perry_FP2 <- perry_FP %>%
+  mutate(
+    Sample.ID.Lab = as.integer(Sample.ID.Lab)   # join key in FP
+  )
+
+txt2 <- txt %>%
+  mutate(
+    base_ID = as.integer(base_ID),
+    texture_class = str_trim(texture_class),
+    # keep the %s you actually want to merge
+    CLAY = as.numeric(CLAY),
+    SAND = as.numeric(SAND),
+    SILT = as.numeric(SILT)
+  )
+
+#----------------------------------------
+# 2) Enforce "only one sample per base_ID" in txt
+#    - if duplicates exist, we keep ONE deterministically
+#      (you can change the rule)
+#----------------------------------------
+txt_dupes <- txt2 %>%
+  count(base_ID, name = "n") %>%
+  filter(n > 1)
+
+# pick a single record per base_ID (rule: keep first non-NA texture_class,
+# then prefer non-boundary, then first row)
+txt_one <- txt2 %>%
+  arrange(
+    base_ID,
+    desc(!is.na(texture_class) & texture_class != ""),
+    is_boundary,            # FALSE before TRUE if logical
+    ID
+  ) %>%
+  group_by(base_ID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(base_ID, texture_class, CLAY, SAND, SILT)
+
+#----------------------------------------
+# 3) Join txt onto perry_FP and "replace" FP columns
+#----------------------------------------
+merged <- perry_FP2 %>%
+  left_join(txt_one, by = c("Sample.ID.Lab" = "base_ID")) %>%
+ mutate(
+  replaced_by_txt = !is.na(CLAY) & !is.na(SAND) & !is.na(SILT) & !is.na(texture_class),
+  Clay_FP = as.numeric(Clay),
+  Sand_FP = as.numeric(Sand),
+  Silt_FP = as.numeric(Silt),
+  Tex_FP  = Lab.Texture..LPSA..preliminary.,
+  Clay_txt = CLAY,
+  Sand_txt = SAND,
+  Silt_txt = SILT,
+  Tex_txt  = texture_class,
+  Clay = if_else(replaced_by_txt, CLAY, Clay_FP),
+  Sand = if_else(replaced_by_txt, SAND, Sand_FP),
+  Silt = if_else(replaced_by_txt, SILT, Silt_FP),
+  Lab.Texture..LPSA..preliminary. =
+    if_else(replaced_by_txt, texture_class, Tex_FP)
+) %>%
+  select(-CLAY, -SAND, -SILT, -texture_class)
+
+#----------------------------------------
+# 4) Output the subsets you asked for
+#----------------------------------------
+perry_FP_replaced <- merged
+
+replaced_rows <- merged %>% filter(replaced_by_txt)
+not_replaced_rows <- merged %>% filter(!replaced_by_txt)
+
+# txt rows that never got used (no matching Sample.ID.Lab in FP)
+txt_not_used <- txt_one %>%
+  anti_join(perry_FP2 %>% distinct(Sample.ID.Lab),
+            by = c("base_ID" = "Sample.ID.Lab"))
+
+#----------------------------------------
+# 5) Quick sanity checks
+#----------------------------------------
+cat("FP rows:", nrow(perry_FP2), "\n")
+cat("Replaced rows:", nrow(replaced_rows), "\n")
+cat("Not replaced rows:", nrow(not_replaced_rows), "\n")
+cat("txt base_IDs:", nrow(txt_one), "\n")
+cat("txt base_ID duplicates:", nrow(txt_dupes), "\n")
+cat("txt base_IDs not used in FP:", nrow(txt_not_used), "\n")
+```
+
