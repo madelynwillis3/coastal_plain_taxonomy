@@ -1,0 +1,130 @@
+---
+title: "FP_data_clean_02_12_2026"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(soilDB)
+library(aqp)
+library(soiltexture)
+library(ggplot2)
+```
+```{r}
+library(dplyr)
+library(stringr)
+library(aqp)
+
+fp_data <- read.csv("../data/Perry_FP_data_cleaned_updated_series_02_12_2026(FP_dataset).csv",
+                    stringsAsFactors = FALSE)
+
+fp_hz <- fp_data %>%
+  mutate(
+    Point = as.character(Point),
+
+    top_cm_parsed = suppressWarnings(as.numeric(str_extract(To.Depth..cm., "^\\d+"))),
+    bottom_cm_parsed = suppressWarnings(as.numeric(str_extract(To.Depth..cm., "(?<=-)\\d+"))),
+
+    bottom_cm_parsed = ifelse(
+      is.na(bottom_cm_parsed) & !is.na(top_cm_parsed) & !is.na(H.Depth.cm.),
+      top_cm_parsed + as.numeric(H.Depth.cm.),
+      bottom_cm_parsed
+    )
+  ) %>%
+  group_by(Point) %>%
+  arrange(
+    ifelse(is.na(top_cm_parsed), 1e9, top_cm_parsed),
+    Sample.ID.Lab
+  ) %>%
+  mutate(
+    thickness_cm = suppressWarnings(as.numeric(H.Depth.cm.)),
+    thickness_cm = ifelse(is.na(thickness_cm) | thickness_cm <= 0, NA_real_, thickness_cm),
+
+    top_cm_cum = c(0, head(cumsum(replace_na(thickness_cm, 0)), -1)),
+    bottom_cm_cum = cumsum(replace_na(thickness_cm, 0)),
+
+    top = ifelse(!is.na(top_cm_parsed), top_cm_parsed, top_cm_cum),
+    bottom = ifelse(!is.na(bottom_cm_parsed), bottom_cm_parsed, bottom_cm_cum)
+  ) %>%
+  ungroup() %>%
+  filter(is.finite(top), is.finite(bottom), bottom > top) %>%
+  mutate(
+    hzname = ifelse(is.na(Horizon) | trimws(Horizon) == "",
+                    paste0("hz", ave(Point, Point, FUN = seq_along)),
+                    Horizon)
+  ) %>%
+  as.data.frame()
+
+# ---- Build SPC using the assignment form ----
+spc <- fp_hz
+aqp::depths(spc) <- Point ~ top + bottom
+aqp::hzdesgnname(spc) <- "hzname"
+
+
+```
+
+```{r}
+# horizon table
+hz <- horizons(spc)
+
+# hex colors from Munsell
+hz$Matrix_hex <- aqp::parseMunsell(hz$Matrix.Color)
+
+# write back into the SPC
+horizons(spc)$Matrix_hex <- hz$Matrix_hex
+
+# plot: hex colors + horizon labels
+
+
+plotSPC(
+  spc,
+  color = "Matrix_hex",
+  name.style ="center-center",
+  hz.depths = FALSE,
+  width = 0.3,      # ← smaller = more space between pedons
+  cex.names = 0.6
+)
+
+```
+```{r}
+out_dir <- "../outputs/pedon_plots"
+dir.create(out_dir, showWarnings = FALSE)
+
+ids <- profile_id(spc)
+
+for (id in ids) {
+
+  spc_i <- spc[profile_id(spc) == id, ]
+
+  file_name <- file.path(out_dir, paste0(id, ".jpg"))
+
+  jpeg(filename = file_name, width = 500, height = 1200, quality = 100)
+
+  plotSPC(
+    spc_i,
+    color = "Matrix_hex",
+    name.style = "center-center",
+    cex.names = 3,          # large font
+    hz.depths = TRUE,
+    depth.axis = FALSE,
+    width = 0.2,
+    print.id = FALSE
+  )
+
+  dev.off()
+}
+
+
+```
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
