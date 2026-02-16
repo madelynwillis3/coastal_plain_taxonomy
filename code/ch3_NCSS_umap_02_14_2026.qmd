@@ -1,0 +1,1042 @@
+---
+title: "ch3_NCSS_umap_02_14_2026"
+format: html
+---
+
+```{r}
+
+
+#libraries:
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(umap)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(stringr)
+library(beepr)
+library(doParallel)
+```
+
+```{r}
+#Pull data:
+clean_name <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    dplyr::na_if("") %>%
+    stringr::str_to_lower() %>%             # standardize case
+    stringr::str_replace_all("\\s+", " ")   # collapse weird spacing
+}
+
+pretty_title <- function(x) {
+  # Optional: for plotting labels (title case)
+  stringr::str_to_title(x)
+}
+
+#NCSS data:
+
+    #pedon, taxonomic name and series name: 
+    ncss_pedon <- read.csv("../data/Pedon_SCP_MLRA.csv") #siteobsiiref is pedon id
+    
+    #horizon name, seq, top depth, bottom depth, some texture:
+    ncss_phorizon <- fread("../data/ncss_phorizon.csv") #peiidref is pedon id (multiples per pedon)
+
+    #color per horizon, hue value, chroma:
+    ncss_color <- read.csv("../data/ncss_phcolor.csv") #phiidref is pedon id
+    
+    #mottles present per hz, HVC and percentage:
+    ncss_mottles <- read.csv("../data/ncss_phmottles.csv") #phiidref is pedon id
+    
+    #lab data: CEC
+    ncss_labdata  <- fread("../data/ncss_labdata.csv") #ncsslabdataiidref is pedon id , seq is hz 
+    
+    #ped_taxa:
+    ncss_ped_taxa <- read.csv("../data/petaxhistory.csv")
+    
+    #ncss pedon lab data:
+    ncss_pedonlabdata <- read.csv("../data/ncss_pedonlabdata.csv") 
+   # str(ncss_pedon)
+   #  str(ncss_phorizon)
+   #  str(ncss_color)
+   #  str(ncss_mottles)
+   #  str(ncss_labdata)
+   #  str(ncss_pedonlabdata)
+    # =========================
+# FILTER: Coastal Plain only
+# =========================
+# Adjust these patterns to match your pedon dataset’s region labels.
+# Common fields: mlra, mlraoffice, soilphysreg, geomregion, state, etc.
+# Start with MLRA name/office + state as a practical filter.
+# ============================
+# FAST FILTER: keep only Coastal Plain pedons BEFORE joins
+# Put this right after reading the CSVs
+# ============================
+
+# Coastal Plain pedon IDs (peiidref) + site obs ids
+cp_peiidref <- unique(ncss_pedon$peiid)
+cp_siteobsi <- unique(ncss_pedon$siteobsiidref)
+
+# 1) Field horizons (keyed by peiidref)
+ncss_phorizon <- ncss_phorizon %>%
+  filter(peiidref %in% cp_peiidref)
+
+# 2) Pedon lab summary (keyed by peiidref already)
+ncss_pedonlabdata <- ncss_pedonlabdata %>%
+  filter(peiidref %in% cp_peiidref)
+
+# 3) Lab horizons (keyed by labsampnum; filter by pedlabsampnum from pedon table)
+cp_labsamp <- unique(ncss_pedon$pedlabsampnum)
+cp_labsamp <- cp_labsamp[!is.na(cp_labsamp) & cp_labsamp != ""]
+
+ncss_labdata <- ncss_labdata %>%
+  filter(labsampnum %in% cp_labsamp)
+
+# 4) Tax history (usually keyed by peiidref; if yours uses peiid instead, adjust here)
+if ("peiidref" %in% names(ncss_ped_taxa)) {
+  ncss_ped_taxa <- ncss_ped_taxa %>% filter(peiidref %in% cp_peiidref)
+} else if ("peiid" %in% names(ncss_ped_taxa)) {
+  ncss_ped_taxa <- ncss_ped_taxa %>% filter(peiid %in% cp_peiidref)
+}
+
+# 5) Optional: Color + mottles are keyed by phiidref (horizon id), so filter using horizon ids
+hz_id_col <- intersect(names(ncss_phorizon), c("phiid", "phiidref"))[1]
+
+if (!is.na(hz_id_col)) {
+  cp_phiid <- unique(ncss_phorizon[[hz_id_col]])
+  cp_phiid <- cp_phiid[!is.na(cp_phiid)]
+
+  ncss_color <- ncss_color %>% filter(phiidref %in% cp_phiid)
+  ncss_mottles <- ncss_mottles %>% filter(phiidref %in% cp_phiid)
+} else {
+  message("No phiid/phiidref column in ncss_phorizon, so can't pre-filter color/mottles by horizon id.")
+}
+# 
+# # Quick check: this should now be *much* smaller
+# cat("CP pedons:", length(cp_peiidref), "\n")
+# cat("Horizons kept:", nrow(ncss_phorizon), "\n")
+# cat("Lab horizons kept:", nrow(ncss_labdata), "\n")
+# cat("Colors kept:", nrow(ncss_color), "\n")
+# cat("Mottles kept:", nrow(ncss_mottles), "\n")
+
+
+```
+
+```{r}
+
+# ---- Pedon keys (keep only what we need) ----
+ped_key <- ncss_pedon %>%
+  transmute(
+    peiidref = peiid,
+    upedonid,
+    series_raw   = taxonname,
+    series_clean = clean_name(taxonname),
+    pedlabsampnum
+  )
+
+# ---- Field horizons (profile horizon table) ----
+hz_field <- ncss_phorizon %>%
+  transmute(
+    peiidref,
+    seqnum,
+    hzdept,
+    hzdepb,
+    hzname,
+    texture = na_if(str_squish(texture), "")
+  )
+
+# ---- Lab horizons (tie to pedon using labsampnum) ----
+hz_lab <- ncss_labdata %>%
+  transmute(
+    pedlabsampnum = labsampnum,
+    seqnum = layerseqnum,
+    hzdept_lab = hzdept,
+    hzdepb_lab = hzdepb,
+    hzname_lab = hzname,
+    sand = sandtotmeasured,
+    silt = silttotmeasured,
+    clay = claytotmeasured,
+    cec7 = cec7,
+    ecec = ecec
+  ) %>%
+  left_join(ped_key %>% select(peiidref, pedlabsampnum), by = "pedlabsampnum") %>%
+  select(-pedlabsampnum)
+
+# ---- Merge pedon + horizons + lab ----
+hz_master <- hz_field %>%
+  left_join(ped_key, by = "peiidref") %>%
+  full_join(hz_lab, by = c("peiidref", "seqnum")) %>%
+  mutate(
+    hzdept = coalesce(hzdept, hzdept_lab),
+    hzdepb = coalesce(hzdepb, hzdepb_lab),
+    hzname = coalesce(hzname, hzname_lab)
+  ) %>%
+  select(-hzdept_lab, -hzdepb_lab, -hzname_lab)
+
+# quick sanity
+dplyr::glimpse(hz_master)
+```
+
+```{r}
+# Helper: pick a join column if present
+hz_id_col <- intersect(names(ncss_phorizon), c("phiid", "phiidref", "phiid_iidref", "phiidrefref"))[1]
+
+if (!is.na(hz_id_col)) {
+
+  hz_ids <- ncss_phorizon %>%
+    transmute(
+      peiidref, seqnum,
+      phiidref = .data[[hz_id_col]]
+    )
+
+  # color (take dominant / first record per horizon)
+  hz_color <- ncss_color %>%
+    transmute(
+      phiidref,
+      color_hue = na_if(str_squish(colorhue), ""),
+      color_value = colorvalue,
+      color_chroma = colorchroma
+    ) %>%
+    group_by(phiidref) %>%
+    summarise(
+      color_hue = first(na.omit(color_hue)),
+      color_value = suppressWarnings(median(color_value, na.rm = TRUE)),
+      color_chroma = suppressWarnings(median(color_chroma, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  # mottles (summarise per horizon)
+  hz_mott <- ncss_mottles %>%
+    transmute(
+      phiidref,
+      mottle_pct = mottlepct
+    ) %>%
+    group_by(phiidref) %>%
+    summarise(
+      mottle_pct = suppressWarnings(max(mottle_pct, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  hz_master <- hz_master %>%
+    left_join(hz_ids, by = c("peiidref", "seqnum")) %>%
+    left_join(hz_color, by = "phiidref") %>%
+    left_join(hz_mott, by = "phiidref") %>%
+    select(-phiidref)
+
+} else {
+  message("No horizon-ID column found in ncss_phorizon (phiid/phiidref). Skipping color/mottle joins.")
+}
+
+```
+
+```{r}
+cut_cm <- 150
+
+```
+
+
+```{r}
+mode_chr <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) return(NA_character_)
+  tt <- sort(table(x), decreasing = TRUE)
+  names(tt)[1]
+}
+
+
+```
+
+```{r}
+
+
+# Clean taxonomy history and pick "best" record per peiidref
+tax_best <- ncss_ped_taxa %>%
+  mutate(
+    peiidref = as.integer(peiidref),
+    taxorder    = clean_name(taxorder),
+    taxsuborder = clean_name(taxsuborder),
+    taxgrtgroup = clean_name(taxgrtgroup),
+    taxsubgrp   = clean_name(taxsubgrp),
+    taxpartsize = clean_name(taxpartsize),
+    taxclname   = clean_name(taxclname),
+    recwlupdated_dt = suppressWarnings(as.POSIXct(recwlupdated, format = "%m/%d/%Y %H:%M:%S"))
+  ) %>%
+  group_by(peiidref) %>%
+  arrange(desc(recwlupdated_dt)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(peiidref, taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x), "unknown", .x)))
+
+
+```
+
+```{r}
+encode_hz_by_depth <- function(hz_df, cut_cm = 150, slice_cm = 15) {
+
+  # Ensure needed cols exist:
+  stopifnot(all(c("peiidref", "hzdept", "hzdepb", "hzname") %in% names(hz_df)))
+
+  # 1) Clip horizons to 0–cut_cm and drop anything outside
+  hz_clip <- hz_df %>%
+    filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+    mutate(
+      top = pmax(hzdept, 0),
+      bot = pmin(hzdepb, cut_cm)
+    ) %>%
+    filter(bot > top)
+
+  # 2) Define depth slices: [0, slice_cm), [slice_cm, 2*slice_cm), ...
+  slice_edges <- seq(0, cut_cm, by = slice_cm)
+  slices <- tibble(
+    slice_top = slice_edges[-length(slice_edges)],
+    slice_bot = slice_edges[-1]
+  ) %>%
+    mutate(slice_id = paste0(slice_top, "_", slice_bot))
+
+  # 3) Horizon “type” to encode (master horizons, but keeps Bt separately)
+  hz_clip <- hz_clip %>%
+    mutate(
+      hz_type = case_when(
+        str_detect(hzname, "^Ap") ~ "Ap",
+        str_detect(hzname, "^[Aa]") ~ "A",
+        str_detect(hzname, "^[Ee]") ~ "E",
+        str_detect(hzname, "Bt|bt") ~ "Bt",
+        str_detect(hzname, "Bg|bg") ~ "Bg",
+        str_detect(hzname, "^[Bb]") ~ "B",
+        str_detect(hzname, "^[Cc]") ~ "C",
+        str_detect(hzname, "^[Rr]") ~ "R",
+        TRUE ~ "Other"
+      )
+    )
+
+  # 4) Compute overlap of each horizon with each slice (pedon-wise cross join)
+  ov <- hz_clip %>%
+    inner_join(slices, by = character()) %>%  # cross join (careful but manageable after filtering)
+    mutate(
+      overlap = pmax(0, pmin(bot, slice_bot) - pmax(top, slice_top))
+    ) %>%
+    filter(overlap > 0)
+
+  # 5) Convert overlaps -> proportion of slice (so each slice sums to 1 across hz_type)
+  slice_prop <- ov %>%
+    group_by(peiidref, slice_id, hz_type) %>%
+    summarise(overlap = sum(overlap), .groups = "drop") %>%
+    group_by(peiidref, slice_id) %>%
+    mutate(slice_total = sum(overlap),
+           prop = overlap / slice_total) %>%
+    ungroup()
+
+  # 6) One-hot in wide form: columns like "hz_Bt_0_15", "hz_A_30_45", ...
+  slice_wide <- slice_prop %>%
+    transmute(
+      peiidref,
+      feature = paste0("hz_", hz_type, "_", slice_id),
+      value = prop
+    ) %>%
+    pivot_wider(names_from = feature, values_from = value, values_fill = 0)
+
+  return(slice_wide)
+}
+
+hz_depth_features <- encode_hz_by_depth(
+  hz_master,
+  cut_cm = 150,
+  slice_cm = 15
+)
+
+
+```
+
+```{r}
+# ============================================
+# PEDON-LEVEL FEATURE TABLE (0–150 cm only)
+# taxonomy + morph + lab summaries + depth-hot-encoding
+# ============================================
+
+cut_cm <- 150
+
+# 0) Clip hz_master to 0–150 and make thickness weights
+hz_0_150 <- hz_master %>%
+  filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+  mutate(
+    top = pmax(hzdept, 0),
+    bot = pmin(hzdepb, cut_cm),
+    thk = pmax(0, bot - top)
+  ) %>%
+  filter(thk > 0)
+
+mode_chr <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) return(NA_character_)
+  tt <- sort(table(x), decreasing = TRUE)
+  names(tt)[1]
+}
+
+# 1) Pedon-level summaries from morph/lab/color (weighted to 0–150)
+pedon_summary <- hz_0_150 %>%
+  group_by(peiidref, upedonid, series_clean) %>%
+  summarise(
+    max_depth = max(bot, na.rm = TRUE),
+    total_thickness = sum(thk, na.rm = TRUE),
+
+    # lab texture + chemistry
+    mean_sand = weighted.mean(sand, w = thk, na.rm = TRUE),
+    mean_silt = weighted.mean(silt, w = thk, na.rm = TRUE),
+    mean_clay = weighted.mean(clay, w = thk, na.rm = TRUE),
+    mean_cec7 = weighted.mean(cec7, w = thk, na.rm = TRUE),
+    mean_ecec = weighted.mean(ecec, w = thk, na.rm = TRUE),
+
+    # color/mottle (if present)
+    mean_value  = weighted.mean(color_value,  w = thk, na.rm = TRUE),
+    mean_chroma = weighted.mean(color_chroma, w = thk, na.rm = TRUE),
+    dom_hue     = mode_chr(color_hue),
+    mean_mottle_pct = weighted.mean(mottle_pct, w = thk, na.rm = TRUE),
+    any_mottles = as.integer(any(!is.na(mottle_pct))),
+
+    # morphology flags (within 0–150)
+    has_A = as.integer(any(str_detect(hzname, "^[Aa]"))),
+    has_E = as.integer(any(str_detect(hzname, "^[Ee]"))),
+    has_B = as.integer(any(str_detect(hzname, "^[Bb]"))),
+    has_C = as.integer(any(str_detect(hzname, "^[Cc]"))),
+    Bt_present = as.integer(any(str_detect(hzname, "Bt|bt"))),
+
+    dom_texture = mode_chr(texture),
+
+    .groups = "drop"
+  )
+pedon_summary <- pedon_summary %>%
+  mutate(series = pretty_title(series_clean))
+pedon_summary <- pedon_summary %>% mutate(peiidref = as.integer(peiidref))
+tax_best      <- tax_best      %>% mutate(peiidref = as.integer(peiidref))
+hz_depth_features <- hz_depth_features %>% mutate(peiidref = as.integer(peiidref))
+
+# 2) Merge taxonomy (tax_best) onto pedon summaries
+pedon_features <- pedon_summary %>%
+  left_join(tax_best, by = "peiidref") %>%
+  mutate(across(
+    c(taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize),
+    ~ ifelse(is.na(.x) | .x == "", "Unknown", .x)
+  ))
+# Make sure join keys are identical types
+pedon_summary <- pedon_summary %>%
+  mutate(peiidref = as.integer(peiidref))
+
+hz_depth_features <- hz_depth_features %>%
+  mutate(peiidref = as.integer(peiidref))
+
+# 3) Merge depth-hot-encoded horizon structure (0–150 slices)
+pedon_features <- pedon_features %>%
+  left_join(hz_depth_features, by = "peiidref")
+hz_cols <- grep("^hz_", names(pedon_features), value = TRUE)
+length(hz_cols)
+
+
+# 4) Build UMAP input matrix: numeric + one-hot categorical + the hz_* slice features
+hz_cols <- grep("^hz_", names(pedon_features), value = TRUE)
+
+num_vars <- pedon_features %>%
+  select(
+    max_depth, total_thickness,
+    mean_sand, mean_silt, mean_clay, mean_cec7, mean_ecec,
+    mean_value, mean_chroma, mean_mottle_pct, any_mottles,
+    has_A, has_E, has_B, has_C, Bt_present,
+    all_of(hz_cols)         # <-- depth-hot-encoded horizons
+  )
+
+# median-impute numeric NAs (UMAP needs no NA)
+num_vars_clean <- num_vars %>%
+  mutate(across(everything(),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+cat_vars <- pedon_features %>%
+  select(
+    dom_texture, dom_hue,
+    taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize
+  ) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x) | .x == "", "Unknown", .x)))
+
+cat_mm <- model.matrix(~ . - 1, data = cat_vars)
+
+umap_input <- cbind(num_vars_clean, cat_mm)
+
+# Drop zero-variance columns to avoid NaN scaling
+good_cols <- apply(umap_input, 2, function(x) is.finite(sd(x)) && sd(x) > 0)
+umap_input2 <- umap_input[, good_cols, drop = FALSE]
+
+umap_scaled <- scale(umap_input2)
+stopifnot(all(is.finite(umap_scaled)))
+
+# 5) Run UMAP
+set.seed(42)
+umap_out <- umap(
+  umap_scaled,
+  n_neighbors = 15,
+  min_dist = 0.1,
+  metric = "euclidean"
+)
+
+beepr::beep("wilhelm")
+
+umap_coords <- as.data.frame(umap_out$layout)
+names(umap_coords) <- c("UMAP1", "UMAP2")
+
+umap_df <- bind_cols(
+  pedon_features %>%
+    select(peiidref, upedonid, series,
+           taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize,
+           mean_sand, mean_clay, mean_cec7),
+  umap_coords
+)
+umap_df <- bind_cols(
+  pedon_features %>%
+    transmute(
+      peiidref, upedonid,
+      series = pretty_title(series_clean),
+      taxorder = pretty_title(taxorder),
+      taxsubgrp = pretty_title(taxsubgrp),
+      mean_sand, mean_clay, mean_cec7
+    ),
+  umap_coords
+)
+
+ggplot(umap_df, aes(UMAP1, UMAP2, color = series )) +
+  geom_point(alpha = 0.7, size = 2.0) +
+  theme_minimal() +
+  labs(title = "UMAP of Coastal Plain NCSS Pedons (0–150 cm features)",
+       color = "Order")
+
+```
+
+
+```{r}
+numCores <- detectCores() - 1 # leave one core free for the system
+registerDoParallel(numCores)  # use multicore, set to the number of our cores
+# --- numeric block ---
+num_vars <- pedon_bin2 %>%
+  select(
+    max_depth_in_bin, total_thickness,
+    mean_sand, mean_silt, mean_clay, mean_cec7, mean_ecec,
+    mean_value, mean_chroma, mean_mottle_pct, any_mottles,
+    has_A, has_E, has_B, has_C, Bt_present
+  )
+
+num_vars_clean <- num_vars %>%
+  mutate(across(everything(),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+# --- categorical block ---
+cat_vars <- pedon_bin2 %>%
+  select(
+    depth_bin, dom_texture, dom_hue,
+    taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize
+  ) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x) | .x == "", "Unknown", .x)))
+
+cat_mm <- model.matrix(~ . - 1, data = cat_vars)
+
+# combine
+umap_input <- cbind(num_vars_clean, cat_mm)
+
+#parallel processing:
+
+# prevent NaN issues
+good_cols <- apply(umap_input, 2, function(x) is.finite(sd(x)) && sd(x) > 0)
+umap_input2 <- umap_input[, good_cols, drop = FALSE]
+
+umap_scaled <- scale(umap_input2)
+stopifnot(all(is.finite(umap_scaled)))
+
+set.seed(42)
+umap_out <- umap(
+  umap_scaled,
+  n_neighbors = 15,
+  min_dist = 0.1,
+  metric = "euclidean"
+)
+#beep when done
+beepr::beep("wilhelm")
+
+umap_coords <- as.data.frame(umap_out$layout)
+names(umap_coords) <- c("UMAP1", "UMAP2")
+umap_df <- bind_cols(
+  pedon_bin2 %>%
+    select(peiidref, upedonid, series, depth_bin,
+           taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize,
+           mean_sand, mean_clay, mean_cec7),
+  umap_coords
+)
+
+
+
+ggplot(umap_df, aes(UMAP1, UMAP2, color = taxorder)) +
+  geom_point(alpha = 0.7, size = 2.2) +
+  theme_minimal() +
+  labs(title = "UMAP of NCSS Coastal Plain Pedons (0–150 vs 150+ cm)",
+       color = "Depth bin")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# libraries
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(umap)
+library(ggplot2)
+library(data.table)
+library(beepr)
+```
+
+```{r}
+
+# =========================
+# helpers
+# =========================
+clean_name <- function(x) {
+  x %>%
+    as.character() %>%
+    stringr::str_trim() %>%
+    dplyr::na_if("") %>%
+    stringr::str_to_lower() %>%
+    stringr::str_replace_all("\\s+", " ")
+}
+
+pretty_title <- function(x) stringr::str_to_title(x)
+
+mode_chr <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+  if (length(x) == 0) return(NA_character_)
+  tt <- sort(table(x), decreasing = TRUE)
+  names(tt)[1]
+}
+```
+
+``` {r}
+
+# =========================
+# Pull data
+# =========================
+ncss_pedon <- read.csv("../data/Pedon_SCP_MLRA.csv")
+
+ncss_phorizon <- fread("../data/ncss_phorizon.csv")
+ncss_color    <- read.csv("../data/ncss_phcolor.csv")
+ncss_mottles  <- read.csv("../data/ncss_phmottles.csv")
+
+ncss_labdata  <- fread("../data/ncss_labdata.csv")
+ncss_ped_taxa <- read.csv("../data/petaxhistory.csv")
+
+ncss_pedonlabdata <- read.csv("../data/ncss_pedonlabdata.csv")
+# ============================
+# FAST FILTER: keep only Coastal Plain pedons BEFORE joins
+# (you said ncss_pedon is already coastal plain; this just ensures the big tables match)
+# ============================
+cp_peiidref <- unique(ncss_pedon$peiid)
+
+# horizons
+ncss_phorizon <- ncss_phorizon %>%
+  filter(peiidref %in% cp_peiidref)
+
+# pedon lab summary
+ncss_pedonlabdata <- ncss_pedonlabdata %>%
+  filter(peiidref %in% cp_peiidref)
+
+# lab horizons: filter by labsampnum present in the coastal plain pedons
+cp_labsamp <- unique(ncss_pedon$pedlabsampnum)
+cp_labsamp <- cp_labsamp[!is.na(cp_labsamp) & cp_labsamp != ""]
+
+ncss_labdata <- ncss_labdata %>%
+  filter(labsampnum %in% cp_labsamp)
+
+# tax history
+if ("peiidref" %in% names(ncss_ped_taxa)) {
+  ncss_ped_taxa <- ncss_ped_taxa %>% filter(peiidref %in% cp_peiidref)
+} else if ("peiid" %in% names(ncss_ped_taxa)) {
+  ncss_ped_taxa <- ncss_ped_taxa %>% filter(peiid %in% cp_peiidref)
+}
+
+# optional: filter color/mottles by horizon id if available in horizon table
+hz_id_col <- intersect(names(ncss_phorizon), c("phiid", "phiidref"))[1]
+if (!is.na(hz_id_col)) {
+  cp_phiid <- unique(ncss_phorizon[[hz_id_col]])
+  cp_phiid <- cp_phiid[!is.na(cp_phiid)]
+  ncss_color   <- ncss_color %>% filter(phiidref %in% cp_phiid)
+  ncss_mottles <- ncss_mottles %>% filter(phiidref %in% cp_phiid)
+} else {
+  message("No phiid/phiidref column in ncss_phorizon; skipping pre-filter for color/mottles.")
+}
+```
+
+```{r}
+
+# =========================
+# Build horizon master: pedon + field horizons + lab horizons
+# =========================
+
+# pedon key (clean series here!)
+ped_key <- ncss_pedon %>%
+  transmute(
+    peiidref = as.integer(peiid),
+    upedonid,
+    series_raw   = taxonname,
+    series_clean = clean_name(taxonname),
+    pedlabsampnum
+  )
+
+# field horizons
+hz_field <- ncss_phorizon %>%
+  transmute(
+    peiidref = as.integer(peiidref),
+    seqnum,
+    hzdept,
+    hzdepb,
+    hzname,
+    texture = na_if(str_squish(texture), "")
+  )
+
+# lab horizons (link labsampnum -> peiidref using ped_key)
+hz_lab <- ncss_labdata %>%
+  transmute(
+    pedlabsampnum = labsampnum,
+    seqnum = layerseqnum,
+    hzdept_lab = hzdept,
+    hzdepb_lab = hzdepb,
+    hzname_lab = hzname,
+    sand = sandtotmeasured,
+    silt = silttotmeasured,
+    clay = claytotmeasured,
+    cec7 = cec7,
+    ecec = ecec
+  ) %>%
+  left_join(ped_key %>% select(peiidref, pedlabsampnum), by = "pedlabsampnum") %>%
+  select(-pedlabsampnum)
+
+# merge all
+hz_master <- hz_field %>%
+  left_join(ped_key, by = "peiidref") %>%
+  full_join(hz_lab, by = c("peiidref", "seqnum")) %>%
+  mutate(
+    hzdept = coalesce(hzdept, hzdept_lab),
+    hzdepb = coalesce(hzdepb, hzdepb_lab),
+    hzname = coalesce(hzname, hzname_lab)
+  ) %>%
+  select(-hzdept_lab, -hzdepb_lab, -hzname_lab)
+
+glimpse(hz_master)
+```
+
+```{r}
+# =========================
+# Add color + mottles if horizon id exists
+# =========================
+hz_id_col <- intersect(names(ncss_phorizon), c("phiid", "phiidref", "phiid_iidref", "phiidrefref"))[1]
+
+if (!is.na(hz_id_col)) {
+
+  hz_ids <- ncss_phorizon %>%
+    transmute(
+      peiidref = as.integer(peiidref), seqnum,
+      phiidref = .data[[hz_id_col]]
+    )
+
+  hz_color <- ncss_color %>%
+    transmute(
+      phiidref,
+      color_hue = na_if(str_squish(colorhue), ""),
+      color_value = colorvalue,
+      color_chroma = colorchroma
+    ) %>%
+    group_by(phiidref) %>%
+    summarise(
+      color_hue = first(na.omit(color_hue)),
+      color_value = suppressWarnings(median(color_value, na.rm = TRUE)),
+      color_chroma = suppressWarnings(median(color_chroma, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  hz_mott <- ncss_mottles %>%
+    transmute(phiidref, mottle_pct = mottlepct) %>%
+    group_by(phiidref) %>%
+    summarise(
+      mottle_pct = suppressWarnings(max(mottle_pct, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  hz_master <- hz_master %>%
+    left_join(hz_ids, by = c("peiidref", "seqnum")) %>%
+    left_join(hz_color, by = "phiidref") %>%
+    left_join(hz_mott,  by = "phiidref") %>%
+    select(-phiidref)
+
+} else {
+  message("No horizon-ID column in ncss_phorizon; skipping color/mottle joins.")
+}
+```
+
+```{r}
+# =========================
+# Taxonomy: pick best (most recent) per pedon and CLEAN it
+# =========================
+tax_best <- ncss_ped_taxa %>%
+  mutate(
+    peiidref = as.integer(peiidref),
+    taxorder    = clean_name(taxorder),
+    taxsuborder = clean_name(taxsuborder),
+    taxgrtgroup = clean_name(taxgrtgroup),
+    taxsubgrp   = clean_name(taxsubgrp),
+    taxpartsize = clean_name(taxpartsize),
+    taxclname   = clean_name(taxclname),
+    recwlupdated_dt = suppressWarnings(as.POSIXct(recwlupdated, format = "%m/%d/%Y %H:%M:%S"))
+  ) %>%
+  group_by(peiidref) %>%
+  arrange(desc(recwlupdated_dt)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(peiidref, taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x), "unknown", .x)))
+```
+```{r}
+# =========================
+# Depth-hot-encoding of horizons to 150 cm
+# =========================
+encode_hz_by_depth <- function(hz_df, cut_cm = 150, slice_cm = 15) {
+
+  stopifnot(all(c("peiidref", "hzdept", "hzdepb", "hzname") %in% names(hz_df)))
+
+  hz_clip <- hz_df %>%
+    filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+    mutate(
+      top = pmax(hzdept, 0),
+      bot = pmin(hzdepb, cut_cm)
+    ) %>%
+    filter(bot > top) %>%
+    mutate(peiidref = as.integer(peiidref))
+
+  slice_edges <- seq(0, cut_cm, by = slice_cm)
+  slices <- tibble(
+    slice_top = slice_edges[-length(slice_edges)],
+    slice_bot = slice_edges[-1],
+    slice_id  = paste0(slice_edges[-length(slice_edges)], "_", slice_edges[-1])
+  )
+
+  hz_clip <- hz_clip %>%
+    mutate(
+      hz_type = case_when(
+        str_detect(hzname, "^Ap") ~ "Ap",
+        str_detect(hzname, "^[Aa]") ~ "A",
+        str_detect(hzname, "^[Ee]") ~ "E",
+        str_detect(hzname, "Bt|bt") ~ "Bt",
+        str_detect(hzname, "Bg|bg") ~ "Bg",
+        str_detect(hzname, "^[Bb]") ~ "B",
+        str_detect(hzname, "^[Cc]") ~ "C",
+        str_detect(hzname, "^[Rr]") ~ "R",
+        TRUE ~ "Other"
+      )
+    )
+
+  ov <- hz_clip %>%
+    inner_join(slices, by = character()) %>%  # cross join
+    mutate(overlap = pmax(0, pmin(bot, slice_bot) - pmax(top, slice_top))) %>%
+    filter(overlap > 0)
+
+  slice_prop <- ov %>%
+    group_by(peiidref, slice_id, hz_type) %>%
+    summarise(overlap = sum(overlap), .groups = "drop") %>%
+    group_by(peiidref, slice_id) %>%
+    mutate(prop = overlap / sum(overlap)) %>%
+    ungroup()
+
+  slice_wide <- slice_prop %>%
+    transmute(peiidref,
+              feature = paste0("hz_", hz_type, "_", slice_id),
+              value = prop) %>%
+    pivot_wider(names_from = feature, values_from = value, values_fill = 0)
+
+  slice_wide
+}
+
+hz_depth_features <- encode_hz_by_depth(hz_master, cut_cm = 150, slice_cm = 15)
+
+# sanity: should be > 0
+sum(grepl("^hz_", names(hz_depth_features)))
+
+```
+```{r}
+# =========================
+# Pedon-level features (0–150 cm summaries) + merge taxonomy + merge hot encoding
+# =========================
+cut_cm <- 150
+
+hz_0_150 <- hz_master %>%
+  filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+  mutate(
+    peiidref = as.integer(peiidref),
+    top = pmax(hzdept, 0),
+    bot = pmin(hzdepb, cut_cm),
+    thk = pmax(0, bot - top)
+  ) %>%
+  filter(thk > 0)
+
+pedon_summary <- hz_0_150 %>%
+  group_by(peiidref, upedonid, series_clean) %>%
+  summarise(
+    max_depth = max(bot, na.rm = TRUE),
+    total_thickness = sum(thk, na.rm = TRUE),
+
+    mean_sand = weighted.mean(sand, w = thk, na.rm = TRUE),
+    mean_silt = weighted.mean(silt, w = thk, na.rm = TRUE),
+    mean_clay = weighted.mean(clay, w = thk, na.rm = TRUE),
+    mean_cec7 = weighted.mean(cec7, w = thk, na.rm = TRUE),
+    mean_ecec = weighted.mean(ecec, w = thk, na.rm = TRUE),
+
+    mean_value  = weighted.mean(color_value,  w = thk, na.rm = TRUE),
+    mean_chroma = weighted.mean(color_chroma, w = thk, na.rm = TRUE),
+    dom_hue     = mode_chr(color_hue),
+    mean_mottle_pct = weighted.mean(mottle_pct, w = thk, na.rm = TRUE),
+    any_mottles = as.integer(any(!is.na(mottle_pct))),
+
+    has_A = as.integer(any(str_detect(hzname, "^[Aa]"))),
+    has_E = as.integer(any(str_detect(hzname, "^[Ee]"))),
+    has_B = as.integer(any(str_detect(hzname, "^[Bb]"))),
+    has_C = as.integer(any(str_detect(hzname, "^[Cc]"))),
+    Bt_present = as.integer(any(str_detect(hzname, "Bt|bt"))),
+
+    dom_texture = mode_chr(texture),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    series = pretty_title(series_clean),
+    dom_hue = clean_name(dom_hue),
+    dom_texture = clean_name(dom_texture)
+  )
+
+pedon_features <- pedon_summary %>%
+  left_join(tax_best, by = "peiidref") %>%
+  left_join(hz_depth_features %>% mutate(peiidref = as.integer(peiidref)), by = "peiidref") %>%
+  mutate(across(c(taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize),
+                ~ ifelse(is.na(.x) | .x == "", "unknown", .x)))
+
+# sanity: hz_ columns exist
+hz_cols <- grep("^hz_", names(pedon_features), value = TRUE)
+length(hz_cols)
+```
+```{r}
+# =========================
+# UMAP
+# =========================
+hz_cols <- grep("^hz_", names(pedon_features), value = TRUE)
+
+num_vars <- pedon_features %>%
+  select(
+    max_depth, total_thickness,
+    mean_sand, mean_silt, mean_clay, mean_cec7, mean_ecec,
+    mean_value, mean_chroma, mean_mottle_pct, any_mottles,
+    has_A, has_E, has_B, has_C, Bt_present,
+    all_of(hz_cols)
+  )
+
+num_vars_clean <- num_vars %>%
+  mutate(across(everything(),
+                ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+
+cat_vars <- pedon_features %>%
+  select(dom_texture, dom_hue,
+         taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x) | .x == "", "unknown", .x)))
+
+cat_mm <- model.matrix(~ . - 1, data = cat_vars)
+
+umap_input <- cbind(num_vars_clean, cat_mm)
+
+good_cols <- apply(umap_input, 2, function(x) is.finite(sd(x)) && sd(x) > 0)
+umap_input2 <- umap_input[, good_cols, drop = FALSE]
+
+umap_scaled <- scale(umap_input2)
+stopifnot(all(is.finite(umap_scaled)))
+
+set.seed(42)
+umap_out <- umap(umap_scaled, n_neighbors = 15, min_dist = 0.1, metric = "euclidean")
+beepr::beep("wilhelm")
+
+umap_coords <- as.data.frame(umap_out$layout)
+names(umap_coords) <- c("UMAP1", "UMAP2")
+
+umap_df <- bind_cols(
+  pedon_features %>%
+    transmute(
+      peiidref, upedonid,
+      series = pretty_title(series_clean),
+      taxorder = pretty_title(taxorder),
+      mean_sand, mean_clay, mean_cec7
+    ),
+  umap_coords
+)
+
+# plot by series (cleaned)
+ggplot(umap_df, aes(UMAP1, UMAP2, color = series)) +
+  geom_point(alpha = 0.7, size = 2.0) +
+  theme_minimal() +
+  labs(title = "UMAP of Coastal Plain NCSS Pedons (0–150 cm + depth-hot-encoding)",
+       color = "Series")
+
+# plot by sand
+ggplot(umap_df, aes(UMAP1, UMAP2, color = series)) +
+  geom_point(alpha = 0.7, size = 2.0) +
+  theme_minimal() +
+  labs(title = "UMAP colored by mean sand (0–150 cm)")
+
+
+#end chunk
+```
