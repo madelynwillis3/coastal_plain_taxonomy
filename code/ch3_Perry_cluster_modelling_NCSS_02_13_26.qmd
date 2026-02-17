@@ -8,6 +8,12 @@ format: html
 library(dplyr)
 library(tidyr)
 library(stringr)
+library(umap)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(stringr)
+
 ```
 
 ```{r}
@@ -45,9 +51,6 @@ library(stringr)
 ```
 
 ```{r}
-library(dplyr)
-library(data.table)
-library(stringr)
 
 #try to merge labdata and phorizon based on unique patterns per pedon:
 # keep only your pedons
