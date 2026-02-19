@@ -1,0 +1,365 @@
+---
+title: "ch3_Perry__NCSS_02_18_2026"
+format: html
+---
+
+```{r}
+#libraries:
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(umap)
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(stringr)
+
+```
+
+```{r}
+#Pull data:
+
+#NCSS data:
+
+    #pedon, taxonomic name and series name: 
+    ncss_pedon <- read.csv("../data/Pedon_SCP_MLRA.csv") #siteobsiiref is pedon id
+    
+    #horizon name, seq, top depth, bottom depth, some texture:
+    ncss_phorizon <- read.csv("../data/ncss_phorizon.csv") #peiidref is pedon id (multiples per pedon)
+  
+    #color per horizon, hue value, chroma:
+    ncss_color <- read.csv("../data/ncss_phcolor.csv") #phiidref is pedon id
+    
+    #mottles present per hz, HVC and percentage:
+    ncss_mottles <- read.csv("../data/ncss_phmottles.csv") #phiidref is pedon id
+    
+    #lab data: CEC
+    ncss_labdata <- read.csv("../data/ncss_labdata.csv") #ncsslabdataiidref is pedon id , seq is hz 
+    
+    #ped_taxa:
+    ncss_ped_taxa <- read.csv("../data/petaxhistory.csv")
+    
+    #ncss pedon lab data:
+    ncss_pedonlabdata <- read.csv("../data/ncss_pedonlabdata.csv")
+    #ncss layer lab data:
+    ncss_layerlabdata <- read.csv("../data/ncss_layerlabdata.csv") 
+    
+    #pedon horizon sample:
+    ncss_phsample <- read.csv("../data/ncss_phsample.csv") #peiidref is pedon id, seq is hz, sampleid is sample id
+    
+    # str(ncss_pedon)
+    # str(ncss_phorizon)
+    str(ncss_color)
+    # str(ncss_mottles)
+    # str(ncss_labdata)
+    # str(ncss_pedonlabdata)
+    str(ncss_phsample)
+```
+
+```{r}
+
+#try to merge labdata and phorizon based on unique patterns per pedon:
+
+# keep only your pedons
+my_pedons <- unique(ncss_pedon$peiid)
+
+# bridge lab layers -> peiidref (pedon)
+pedlab_unique <- ncss_layerlabdata %>%
+  mutate(
+    filled_n = rowSums(!is.na(across(everything())))
+  ) %>%
+  group_by(ncsslayerlabdataiid, labsampnum) %>%
+  arrange(desc(filled_n), desc(recwlupdated)) %>%
+  slice(1) %>%
+  ungroup()
+
+lab_with_ped <- ncss_labdata %>%
+  left_join(
+    pedlab_unique %>% select(ncsspedonlabdataiid, peiidref),
+    by = c("ncsspedonlabdataiidref" = "ncsspedonlabdataiid")
+  ) %>%
+  filter(peiidref %in% my_pedons)
+clean_hz <- function(x) {
+  x <- toupper(trimws(as.character(x)))
+  x <- ifelse(is.na(x) | x == "", NA_character_, x)
+  # remove spaces, keep letters+digits
+  x <- gsub("\\s+", "", x)
+  x
+}
+
+
+# clean the sample number format (this matters a lot)
+lab_key <- lab_with_ped %>%
+  mutate(labsampnum = str_trim(labsampnum)) %>%
+  filter(!is.na(labsampnum), labsampnum != "") %>%
+  distinct(labsampnum, .keep_all = TRUE)   # labsampnum should be unique in lab layer table
+
+phs_key <- ncss_phsample %>%
+  mutate(labsampnum = str_trim(labsampnum)) %>%
+  filter(!is.na(labsampnum), labsampnum != "")
+phs_key %>%
+  count(labsampnum) %>%
+  summarise(n = n(), n_dupes = sum(n > 1), max_dupe = max(n))
+phs_best <- phs_key %>%
+  mutate(filled = rowSums(!is.na(across(everything())))) %>%
+  group_by(labsampnum) %>%
+  arrange(desc(filled), desc(recwlupdated)) %>%
+  slice(1) %>%
+  ungroup()
+phs_lab <- phs_best %>%
+  left_join(
+    lab_key %>%
+      select(
+        labsampnum, peiidref, ncsslayerlabdataiid, layerseqnum,
+        hzdept, hzdepb, hzname, hznameoriginal
+      ),
+    by = "labsampnum"
+  )
+phorizon_joined <- ncss_phorizon %>%
+  left_join(
+    phs_lab %>% select(phiidref, labsampnum, peiidref, ncsslayerlabdataiid, layerdepthtop, layerdepthbottom),
+    by = c("phiid" = "phiidref")
+  )
+phorizon_joined2 <- phorizon_joined %>%
+  left_join(
+    ncss_labdata,
+    by = "ncsslayerlabdataiid"
+  )
+cat("phsample rows:", nrow(ncss_phsample), "\n")
+cat("phs_best rows:", nrow(phs_best), "\n")
+cat("Rows in phs_lab with peiidref:", sum(!is.na(phs_lab$peiidref)), "\n")
+cat("phorizon rows:", nrow(ncss_phorizon), "\n")
+cat("phorizon rows with labsampnum:", sum(!is.na(phorizon_joined$labsampnum)), "\n")
+
+# check depth consistency between phsample and phorizon (optional but super useful)
+phorizon_joined %>%
+  filter(!is.na(labsampnum)) %>%
+  summarise(
+    pct_top_match = mean(hzdept == layerdepthtop, na.rm = TRUE) * 100,
+    pct_bot_match = mean(hzdepb == layerdepthbottom, na.rm = TRUE) * 100,
+    median_top_diff = median(abs(hzdept - layerdepthtop), na.rm = TRUE),
+    median_bot_diff = median(abs(hzdepb - layerdepthbottom), na.rm = TRUE)
+  )
+
+```
+```{r}
+coastal_peiid <- unique(ncss_pedon$peiid)
+length(coastal_peiid)
+phorizon_cp <- phorizon_joined2 %>%
+  filter(peiidref.x %in% coastal_peiid)
+
+cat("Rows (all):", nrow(phorizon_joined2), "\n")
+cat("Rows (coastal plain):", nrow(phorizon_cp), "\n")
+cat("Unique pedons (coastal plain):", n_distinct(phorizon_cp$peiidref), "\n")
+ped_cp <- ncss_pedon %>%
+  transmute(
+    peiidref = peiid,
+    upedonid,
+    taxonname,
+    taxclname,
+    labsourceid,
+    pedlabsampnum,
+    pedonhydricrating,
+    grpiidref
+  )
+
+phorizon_cp <- phorizon_cp %>%
+  #rename peiidref.x to peiidref for clarity
+  rename(peiidref = peiidref.x) %>%
+  left_join(ped_cp, by = "peiidref") %>%
+  #drop empty columns if all NA
+  select(where(~ !all(is.na(.))))
+```
+```{r}
+
+taxa_best <- ncss_ped_taxa %>%
+  mutate(
+    classtype = str_trim(classtype),
+    taxorder = na_if(str_trim(taxorder), ""),
+    taxsuborder = na_if(str_trim(taxsuborder), ""),
+    taxgrtgroup = na_if(str_trim(taxgrtgroup), ""),
+    taxsubgrp = na_if(str_trim(taxsubgrp), ""),
+    taxpartsize = na_if(str_trim(taxpartsize), ""),
+    taxclname = na_if(str_trim(taxclname), ""),
+    taxonname = na_if(str_trim(taxonname), "")
+  ) %>%
+  mutate(
+    filled = rowSums(!is.na(across(c(taxonname, taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize))))
+  ) %>%
+  group_by(peiidref) %>%
+  arrange(
+    desc(classtype == "Sampled as"),  # prefer sampled-as
+    desc(filled),                    # prefer most complete
+    desc(recwlupdated)               # prefer most recently updated (string, but still works decently)
+  ) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(
+    peiidref,
+    classtype, classdate,
+    taxonname, taxclname,
+    taxorder, taxsuborder, taxgrtgroup, taxsubgrp,
+    taxpartsize, taxpartsizemod,
+    taxtempcl, taxmoistscl, taxtempregime,
+    soiltaxedition
+  )
+taxa_best_cp <- taxa_best %>%
+  filter(peiidref %in% coastal_peiid)
+phorizon_cp_taxa <- phorizon_cp %>%
+  left_join(taxa_best_cp, by = "peiidref")
+
+cat("Rows:", nrow(phorizon_cp_taxa), "\n")
+cat("Unique pedons:", dplyr::n_distinct(phorizon_cp_taxa$peiidref), "\n")
+cat("Pedons with taxonomy:", sum(!is.na(phorizon_cp_taxa$taxorder)), "\n")
+ncss_ped_taxa %>%
+  count(peiidref) %>%
+  summarise(
+    n_pedons = n(),
+    pct_multi = mean(n > 1) * 100,
+    max_rows = max(n)
+  )
+
+
+
+
+#color:
+
+color_best <- ncss_color %>%
+  mutate(
+    colormoistst = str_to_title(str_trim(colormoistst)),
+    colorphysst  = str_to_title(str_trim(colorphysst)),
+    colorpct = as.numeric(colorpct)
+  ) %>%
+  filter(colormoistst == "Moist", colorphysst == "Interior") %>%
+  group_by(phiidref) %>%
+  arrange(desc(replace_na(colorpct, -Inf))) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    phiidref,
+    hue_moist_int   = colorhue,
+    value_moist_int = colorvalue,
+    chroma_moist_int= colorchroma,
+    pct_moist_int   = colorpct
+  )
+
+color_best <- ncss_color %>%
+  mutate(
+    colormoistst = str_to_title(str_trim(colormoistst)),
+    colorphysst  = str_to_title(str_trim(colorphysst)),
+    colorpct = as.numeric(colorpct)
+  ) %>%
+  filter(colormoistst == "Moist", colorphysst == "Interior") %>%
+  group_by(phiidref) %>%
+  arrange(desc(replace_na(colorpct, -Inf))) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    phiidref,
+    hue_moist_int   = colorhue,
+    value_moist_int = colorvalue,
+    chroma_moist_int= colorchroma,
+    pct_moist_int   = colorpct
+  )
+color_best2 <- ncss_color %>%
+  mutate(
+    colormoistst = str_to_title(str_trim(colormoistst)),
+    colorpct = as.numeric(colorpct)
+  ) %>%
+  filter(colormoistst == "Moist") %>%
+  group_by(phiidref) %>%
+  arrange(desc(replace_na(colorpct, -Inf))) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    phiidref,
+    hue_moist   = colorhue,
+    value_moist = colorvalue,
+    chroma_moist= colorchroma,
+    pct_moist   = colorpct
+  )
+
+phorizon_cp_taxa_color <- phorizon_cp_taxa %>%
+  left_join(color_best2, by = c("phiid" = "phiidref"))
+phorizon_cp_taxa_color %>%
+  summarise(
+    n_hz = n(),
+    n_with_color = sum(!is.na(value_moist)),
+    pct_with_color = n_with_color / n_hz * 100
+  )
+#write as csv:
+write.csv(phorizon_cp_taxa_color, "../output/phorizon_cp_taxa_color.csv", row.names = FALSE)
+
+```
+
+```{r}
+#umap of all properties in phorizon_cp_taxa_color
+dat <- phorizon_cp_taxa_color %>%
+  mutate(
+    hz_thk = hzdepb.x - hzdept.x,
+    hz_master = str_to_upper(str_extract(toupper(hzname.x), "^[A-Z]+")),  # crude master
+    hz_master = ifelse(is.na(hz_master) | hz_master == "", "UNK", hz_master),
+    taxorder  = ifelse(is.na(taxorder)  | str_trim(taxorder)  == "", "UNKNOWN", taxorder),
+    taxsubgrp = ifelse(is.na(taxsubgrp) | str_trim(taxsubgrp) == "", "UNKNOWN", taxsubgrp),
+    hue = ifelse(is.na(hue_moist) | str_trim(hue_moist) == "", "UNK", hue_moist)
+  )
+
+# ---- choose numeric features that exist ----
+num_candidates <- c(
+  "hzdept","hzdepb","hz_thk",
+  "value_moist_int","chroma_moist_int",
+  "sandtotmeasured","silttotmeasured","claytotmeasured",
+  "ph1to1h2o","cec7","ecec","carbonorganicpctmeasured",
+  "dbovendry","dbthirdbar","wfifteenbarmeasured"
+)
+
+num_vars <- intersect(num_candidates, names(dat))
+
+num_block <- dat %>%
+  select(all_of(num_vars)) %>%
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.x)))) %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_))) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x))) %>%
+  mutate(across(everything(), ~ as.numeric(scale(.x))))  # scale numeric
+
+# ---- categorical block (keep it small so it doesn’t explode) ----
+cat_block <- dat %>%
+  transmute(
+    hz_master = factor(hz_master),
+    taxorder  = factor(taxorder),
+    # taxsubgrp can have lots of levels; keep it if you want, or comment out:
+    taxsubgrp = factor(taxsubgrp),
+    hue = factor(hue)
+  )
+
+# one-hot using model.matrix (fast)
+X_cat <- model.matrix(~ hz_master + taxorder + taxsubgrp + hue - 1, data = cat_block)
+
+# combine
+X <- cbind(as.matrix(num_block), X_cat)
+
+set.seed(1)
+u <- umap::umap(X)
+
+umap_res <- dat %>%
+  mutate(
+    UMAP1 = u$layout[,1],
+    UMAP2 = u$layout[,2]
+  )
+
+# ---- plot: color by taxorder (or clay, or hue) ----
+ggplot(umap_res, aes(UMAP1, UMAP2, color = taxonname.x )) +
+  geom_point(alpha = 0.7, size = 1.8) +
+  theme_minimal() +
+  labs(color = "Taxorder")
+```
+
+
+```{r}
+#clean up data:
+#keep: horizon, series and all taxa, hz depths, matrix color, clay sand silt, text class, structure
+```
+
+
+
+
