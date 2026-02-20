@@ -662,7 +662,7 @@ u <- uwot::umap(
 
 pedon_umap <- bind_cols(ids, dfp, tibble(UMAP1 = u[,1], UMAP2 = u[,2]))
 
-ggplot(pedon_umap, aes(UMAP1, UMAP2, color = clay_w)) +
+ggplot(pedon_umap, aes(UMAP1, UMAP2, color = taxpartsize)) +
   geom_point(alpha = 0.85, size = 2) +
   theme_minimal() +
   labs(color = "Subgroup", title = "Pedon-level UMAP (0–150 cm packaged)")
