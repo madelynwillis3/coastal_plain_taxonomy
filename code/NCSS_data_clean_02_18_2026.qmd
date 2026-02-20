@@ -14,6 +14,8 @@ library(dplyr)
 library(data.table)
 library(stringr)
 library(tidyverse)
+library(recipes)
+library(uwot)
 ```
 
 ```{r}
@@ -34,7 +36,7 @@ library(tidyverse)
     ncss_mottles <- read.csv("../data/ncss_phmottles.csv") #phiidref is pedon id
     
     #lab data: CEC
-    ncss_labdata <- read.csv("../data/ncss_labdata.csv") #ncsslabdataiidref is pedon id , seq is hz 
+    #ncss_labdata <- read.csv("../data/ncss_labdata.csv") #ncsslabdataiidref is pedon id , seq is hz 
     
     #ped_taxa:
     ncss_ped_taxa <- read.csv("../data/petaxhistory.csv")
@@ -53,8 +55,8 @@ library(tidyverse)
     # # str(ncss_mottles)
     # # str(ncss_labdata)
     # # str(ncss_pedonlabdata)
-    str(ncss_layerlabdata)
-    str(ncss_phsample)
+    # str(ncss_layerlabdata)
+    # str(ncss_phsample)
 ```
 
 ```{r}
@@ -311,6 +313,17 @@ suborder_to_order2 <- function(so) {
     TRUE ~ NA_character_
   )
 }
+
+
+pedon_taxa_fixedranks <- pedon_taxa_globalfilled %>%
+  transmute(
+    siteobsiidref, upedonid,
+    peiid,
+    taxonname, taxonname_key, taxonname_clean,
+    taxclname,
+    taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize,
+    POINT_X, POINT_Y
+  )
 pedon_taxa_fixedranks2 <- pedon_taxa_fixedranks %>%
   mutate(
     taxclname = na_if(str_squish(taxclname), ""),
@@ -430,17 +443,20 @@ write.csv(layerlab_with_taxa_keepall_color, "../outputs/layerlab_with_taxa_keepa
 ```{r}
 
 
-parse_one_side <- function(tok) {
+parse_one_side2 <- function(tok) {
+
   tok0 <- tok %>%
     str_replace_all("\\u00A0", " ") %>%
     str_squish() %>%
-    str_replace_all("\\s+", "")
+    str_replace_all("\\s+", "")     # remove internal spaces (e.g., "1B' t1" -> "1B't1")
 
   if (is.na(tok0) || tok0 == "") {
     return(tibble(
       lith = NA_character_,
-      master = NA_character_,
-      suffix = NA_character_,
+      master = NA_character_,          # SINGLE LETTER: O/A/E/B/C/R
+      trans_master = NA_character_,    # TWO LETTERS for transitions: BA, AE, BC, EB...
+      master_code = NA_character_,     # convenience: first master letter + early suffix (e.g., Bt, Ap)
+      suffix = NA_character_,          # subordinate letters (t, tg, p, w, h, g, etc.)
       zone = NA_integer_,
       sub = NA_integer_,
       has_prime = FALSE
@@ -450,77 +466,115 @@ parse_one_side <- function(tok) {
   has_prime <- str_detect(tok0, "'")
   tok_np <- str_remove_all(tok0, "'")
 
-  # lithologic discontinuity prefix (e.g., 2Bt22)
+  # lithologic discontinuity prefix (e.g., 2Bt, 3C)
   lith <- str_extract(tok_np, "^\\d+")
   rest <- str_remove(tok_np, "^\\d+")
 
-  # master:
-  # - transitional = 2 uppercase letters (AB, BA, AE, EB, BC, etc.)
-  # - otherwise = 1 uppercase + optional lowercase (Bt, Btg, Bw, Ap, etc.)
-  if (str_detect(rest, "^[A-Z]{2}")) {
-    master <- str_sub(rest, 1, 2)
+  # --- MASTER handling ---
+  # Transitional if starts with 2 uppercase letters (BA, AE, EB, BC, etc.)
+  trans_master <- if_else(str_detect(rest, "^[A-Z]{2}"), str_sub(rest, 1, 2), NA_character_)
+  if (!is.na(trans_master)) {
+    master <- str_sub(trans_master, 1, 1)
     rest2  <- str_sub(rest, 3)
-  } else if (str_detect(rest, "^[A-Z]")) {
-    master <- str_extract(rest, "^[A-Z][a-z]*")
-    rest2  <- str_remove(rest, "^[A-Z][a-z]*")
+    early_suffix <- ""   # transitions don't have lowercase master-code letters
+    master_code <- trans_master
   } else {
-    master <- NA_character_
-    rest2  <- rest
+    # Normal: first uppercase letter is the true master (A/B/C/E/O/R)
+    master <- if_else(str_detect(rest, "^[A-Z]"), str_sub(rest, 1, 1), NA_character_)
+    rest2  <- if_else(!is.na(master), str_sub(rest, 2), rest)
+
+    # Lowercase letters immediately after master BEFORE digits are part of suffix (Bt, Ap, Btg, Bw, Bh, Bg, etc.)
+    early_suffix <- str_extract(rest2, "^[a-z]+")
+    early_suffix <- if_else(is.na(early_suffix), "", early_suffix)
+    rest2 <- str_remove(rest2, "^[a-z]+")  # remove those lowercase letters
+
+    master_code <- if_else(is.na(master), NA_character_, paste0(master, early_suffix))
   }
 
+  # --- Numeric subdivision handling (legacy + underscore) ---
   zone <- NA_integer_
   sub  <- NA_integer_
-  suffix <- NA_character_
 
-  # CASE A: underscore form already present (B2_2tg)
+  # CASE A: underscore form already present (e.g., 2_1tg)
   if (str_detect(rest2, "^\\d+_\\d+")) {
     zone <- suppressWarnings(as.integer(str_extract(rest2, "^\\d+(?=_)")))
     sub  <- suppressWarnings(as.integer(str_extract(rest2, "(?<=_)\\d+")))
     tail <- str_replace(rest2, "^\\d+_\\d+", "")
-    suffix <- ifelse(tail == "", NA_character_, tail)
 
   } else if (str_detect(rest2, "^\\d{2,}")) {
     # CASE B: legacy 2+ digits (B22tg, Bt11, Btg12)
     digs <- str_extract(rest2, "^\\d{2,}")
     tail <- str_remove(rest2, "^\\d{2,}")
 
-    # split digits: last digit is sub; preceding digits are zone
+    # split: all but last digit = zone, last digit = sub
     zone_chr <- str_sub(digs, 1, -2)
     sub_chr  <- str_sub(digs, -1)
-
     zone <- suppressWarnings(as.integer(zone_chr))
     sub  <- suppressWarnings(as.integer(sub_chr))
-    suffix <- ifelse(tail == "", NA_character_, tail)
 
   } else if (str_detect(rest2, "^\\d")) {
-    # CASE C: single digit zone only (Bt2, B3, C1)
+    # CASE C: single-digit zone only (Bt2, B3, C1)
     zone <- suppressWarnings(as.integer(str_extract(rest2, "^\\d+")))
     tail <- str_remove(rest2, "^\\d+")
-    suffix <- ifelse(tail == "", NA_character_, tail)
 
   } else {
-    # no numeric subdivision; all remaining is suffix (e.g., "g" in "Bg")
-    suffix <- ifelse(rest2 == "", NA_character_, rest2)
+    tail <- rest2
   }
 
+  # Anything left is suffix AFTER the digits; combine with early suffix
+  tail_suffix <- if_else(is.na(tail) | tail == "", "", tail)
+
+  suffix_full <- paste0(early_suffix, tail_suffix)
+  suffix_full <- if_else(suffix_full == "", NA_character_, suffix_full)
+  # --- POST FIX for transitional masters like BCtx1, BCt2, BCg, BCtv ---
+  # If we have a transitional master and zone/sub are still NA,
+  # try to peel trailing digits off the suffix as zone/subdivision.
+  if (!is.na(trans_master) && is.na(zone) && !is.na(suffix_full)) {
+
+    # e.g., "tx1" -> suf="tx", zone=1
+    #       "t2"  -> suf="t",  zone=2
+    #       "cg"  -> no digits, leave as is
+    #       "tx12" -> zone=1 sub=2 (legacy 2+ digits)
+    suf <- suffix_full
+
+    if (str_detect(suf, "\\d{2,}$")) {
+      digs <- str_extract(suf, "\\d{2,}$")
+      suf2 <- str_remove(suf, "\\d{2,}$")
+
+      zone_chr <- str_sub(digs, 1, -2)
+      sub_chr  <- str_sub(digs, -1)
+      zone <- suppressWarnings(as.integer(zone_chr))
+      sub  <- suppressWarnings(as.integer(sub_chr))
+      suffix_full <- if_else(suf2 == "", NA_character_, suf2)
+
+    } else if (str_detect(suf, "\\d+$")) {
+      zone <- suppressWarnings(as.integer(str_extract(suf, "\\d+$")))
+      suf2 <- str_remove(suf, "\\d+$")
+      suffix_full <- if_else(suf2 == "", NA_character_, suf2)
+    }
+  }
   tibble(
-    lith = ifelse(is.na(lith) || lith == "", NA_character_, lith),
+    lith = if_else(is.na(lith) | lith == "", NA_character_, lith),
     master = master,
-    suffix = suffix,
+    trans_master = trans_master,
+    master_code = master_code,
+    suffix = suffix_full,
     zone = zone,
     sub = sub,
     has_prime = has_prime
   )
 }
 
-parse_hzname <- function(hz) {
+parse_hzname2 <- function(hz) {
+
   hz0 <- hz %>%
     str_replace_all("\\u00A0", " ") %>%
     str_squish()
 
   parts <- str_split(hz0, "\\s*/\\s*", simplify = FALSE)[[1]]
-  left  <- parse_one_side(parts[1])
-  right <- if (length(parts) >= 2) parse_one_side(parts[2]) else NULL
+
+  left  <- parse_one_side2(parts[1])
+  right <- if (length(parts) >= 2) parse_one_side2(parts[2]) else NULL
 
   out <- tibble(
     hzname_clean = hz0,
@@ -530,29 +584,49 @@ parse_hzname <- function(hz) {
     bind_cols(
       if (!is.null(right)) right %>% rename_with(~paste0("R_", .x))
       else tibble(
-        R_lith=NA_character_, R_master=NA_character_, R_suffix=NA_character_,
+        R_lith=NA_character_, R_master=NA_character_, R_trans_master=NA_character_,
+        R_master_code=NA_character_, R_suffix=NA_character_,
         R_zone=NA_integer_, R_sub=NA_integer_, R_has_prime=FALSE
       )
     )
 
   out
 }
-hz_lookup <- tibble(hzname = unique(layerlab_with_taxa_keepall_color$hzname)) %>%
-  mutate(parsed = purrr::map(hzname, parse_hzname)) %>%
-  tidyr::unnest_wider(parsed)
+hz_lookup2 <- tibble(hzname = unique(layerlab_with_taxa_keepall_color$hzname)) %>%
+  mutate(parsed = map(hzname, parse_hzname2)) %>%
+  unnest_wider(parsed)  # no name collision because parsed has hzname_clean, not hzname
 
 layerlab_with_taxa_keepall_color2 <- layerlab_with_taxa_keepall_color %>%
-  left_join(hz_lookup, by = "hzname") %>%
+  left_join(hz_lookup2, by = "hzname") %>%
   mutate(
-    # convenient single-side “base code” for most horizons
-    hz_base = if_else(is.na(L_master), NA_character_, paste0(L_master, coalesce(L_suffix, ""))),
-    # transitional flag
-    hz_is_transitional = !is.na(L_master) & str_detect(L_master, "^[A-Z]{2}$")
+    # transitional flag (left side)
+    hz_is_transitional = !is.na(L_trans_master),
+
+    # Base code you probably want for “horizon type”:
+    # - transitions keep their two-letter master (BC, AE, EB, etc.)
+    # - otherwise master letter + suffix (Bt, Btg, Ap, Bw, Bh, etc.)
+    hz_base = case_when(
+      !is.na(L_trans_master) ~ L_trans_master,
+      !is.na(L_master) ~ paste0(L_master, coalesce(L_suffix, "")),
+      TRUE ~ NA_character_
+    )
   )
 #more parsing to do, such as hot-encoding disturbance, suffix meanings, etc. but this is a good start and we have the base code extracted for most horizons now.
 #save as csv
+layerlab_with_taxa_keepall_color2 <- layerlab_with_taxa_keepall_color2 %>%
+  mutate(
+    is_legacy_B2 = (L_master == "B" & !is.na(L_zone) & !is.na(L_sub) & is.na(L_suffix)),
+    # optional "best guess" interpretation, not taxonomy-true but handy:
+    hz_guess = case_when(
+      is_legacy_B2 ~ "Bw",                 # common modern analog if no other info
+      hz_base == "B" ~ "B",
+      TRUE ~ hz_base
+    )
+  )
 write.csv(layerlab_with_taxa_keepall_color2, "../outputs/layerlab_with_taxa_keepall_color_parsed.csv", row.names = FALSE)
+
 ```
+
 
 ```{r}
 #umap of this data!!! yayyy
@@ -662,10 +736,10 @@ u <- uwot::umap(
 
 pedon_umap <- bind_cols(ids, dfp, tibble(UMAP1 = u[,1], UMAP2 = u[,2]))
 
-ggplot(pedon_umap, aes(UMAP1, UMAP2, color = taxpartsize)) +
+ggplot(pedon_umap, aes(UMAP1, UMAP2, color = sand_w)) +
   geom_point(alpha = 0.85, size = 2) +
   theme_minimal() +
-  labs(color = "Subgroup", title = "Pedon-level UMAP (0–150 cm packaged)")
+  labs(color = "Sand %", title = "Pedon-level UMAP (0–150 cm packaged)")
 ```
 
 
