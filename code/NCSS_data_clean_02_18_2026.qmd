@@ -16,6 +16,8 @@ library(stringr)
 library(tidyverse)
 library(recipes)
 library(uwot)
+library(ggnewscale)
+
 ```
 
 ```{r}
@@ -83,7 +85,7 @@ taxa_best <- ncss_ped_taxa %>%
   ) %>%
   group_by(peiidref) %>%
   arrange(desc(filled), desc(petaxhistoryiid)) %>%  # most complete; then newest history id
-  slice(1) %>%
+  dplyr::slice(1) %>%
   ungroup()
 
 # 2) Left join to your Coastal Plain pedon table
@@ -429,7 +431,7 @@ color_best <- ncss_color %>%
   ) %>%
   arrange(phiidref, moist_rank, phys_rank) %>%
   group_by(phiidref) %>%
-  slice(1) %>%
+  dplyr::slice(1) %>%
   ungroup() %>%
   select(phiidref, colorhue, colorvalue, colorchroma)
 
@@ -627,6 +629,96 @@ write.csv(layerlab_with_taxa_keepall_color2, "../outputs/layerlab_with_taxa_keep
 
 ```
 
+```{r}
+#color:
+library(aqp)
+
+dat <- layerlab_with_taxa_keepall_color2 %>%
+  mutate(
+    munsell = if_else(
+      !is.na(colorhue) & !is.na(colorvalue) & !is.na(colorchroma),
+      paste0(str_squish(colorhue), " ", colorvalue, "/", colorchroma),
+      NA_character_
+    ),
+    munsell_hex = aqp::parseMunsell(munsell)
+  )
+
+# Convert hex -> RGB using base R (NO scales)
+idx <- which(!is.na(dat$munsell_hex) & dat$munsell_hex != "")
+rgb_mat <- matrix(NA_real_, nrow(dat), 3, dimnames = list(NULL, c("R","G","B")))
+
+# col2rgb returns 3 x N; transpose to N x 3, scale 0-255 -> 0-1
+rgb_mat[idx, ] <- t(grDevices::col2rgb(dat$munsell_hex[idx])) / 255
+
+layerlab_with_taxa_keepall_color2 <- dat %>%
+  mutate(
+    R = rgb_mat[, "R"],
+    G = rgb_mat[, "G"],
+    B = rgb_mat[, "B"]
+  )
+```
+
+```{r}
+#depth to Bt and depth to argillic:
+
+max_depth_cm <- 150
+
+hz_indices <- layerlab_with_taxa_keepall_color2 %>%
+  mutate(
+    # overlap with 0–150 for thickness-based summaries
+    top = pmax(hzdept, 0, na.rm = TRUE),
+    bot = pmin(hzdepb, max_depth_cm, na.rm = TRUE),
+    thk_0_150 = pmax(0, bot - top),
+
+    # robust “is this Bt?” using your parsed master code
+    is_Bt = str_to_lower(coalesce(L_master_code, "")) == "bt",
+
+    # argillic-ish: any 't' in suffix (Bt, B't, Btx, Btg, etc.)
+    # NOTE: this is a working rule; later you can refine to true argillic criteria.
+    is_argillic = str_detect(str_to_lower(coalesce(L_suffix, "")), "t"),
+
+    is_E = str_to_lower(coalesce(L_master, "")) == "e" |
+           str_to_lower(coalesce(L_master_code, "")) == "e",
+
+    is_gleyed = str_detect(str_to_lower(coalesce(L_suffix, "")), "g")
+  ) %>%
+  group_by(peiid) %>%
+  summarise(
+    # --- DEPTH-TO (top of first matching horizon) ---
+    depth_to_Bt_cm = if (any(is_Bt & is.finite(hzdept), na.rm = TRUE)) {
+      min(hzdept[is_Bt], na.rm = TRUE)
+    } else NA_real_,
+
+    depth_to_argillic_cm = if (any(is_argillic & is.finite(hzdept), na.rm = TRUE)) {
+      min(hzdept[is_argillic], na.rm = TRUE)
+    } else NA_real_,
+
+    depth_to_E_cm = if (any(is_E & is.finite(hzdept), na.rm = TRUE)) {
+      min(hzdept[is_E], na.rm = TRUE)
+    } else NA_real_,
+
+    depth_to_gley_cm = if (any(is_gleyed & is.finite(hzdept), na.rm = TRUE)) {
+      min(hzdept[is_gleyed], na.rm = TRUE)
+    } else NA_real_,
+
+    # --- THICKNESS WITHIN 0–150 ---
+    bt_thk_0_150_cm = sum(thk_0_150[is_Bt], na.rm = TRUE),
+    argillic_thk_0_150_cm = sum(thk_0_150[is_argillic], na.rm = TRUE),
+
+    # --- FLAGS ---
+    has_Bt_0_150 = any(is_Bt & thk_0_150 > 0, na.rm = TRUE),
+    has_argillic_0_150 = any(is_argillic & thk_0_150 > 0, na.rm = TRUE),
+    has_E_0_150 = any(is_E & thk_0_150 > 0, na.rm = TRUE),
+    has_gley_0_150 = any(is_gleyed & thk_0_150 > 0, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+
+```
+
+
+
 
 ```{r}
 #umap of this data!!! yayyy
@@ -656,9 +748,11 @@ pedon_pack_150 <- layerlab_with_taxa_keepall_color2 %>%
     cec7_w = weighted.mean(cec7, thk, na.rm = TRUE),
 
     # color numeric summaries (0–150)
-    colorvalue_w  = weighted.mean(colorvalue, thk, na.rm = TRUE),
-    colorchroma_w = weighted.mean(colorchroma, thk, na.rm = TRUE),
-
+    # colorvalue_w  = weighted.mean(colorvalue, thk, na.rm = TRUE),
+    # colorchroma_w = weighted.mean(colorchroma, thk, na.rm = TRUE),
+     R_w = weighted.mean(R, thk, na.rm = TRUE),
+     G_w = weighted.mean(G, thk, na.rm = TRUE),
+     B_w = weighted.mean(B, thk, na.rm = TRUE),
     # horizon structure summaries (0–150)
     # n_hz_150   = n(),
     # max_bot_150 = max(bot, na.rm = TRUE),
@@ -696,7 +790,10 @@ hz_props_150 <- layerlab_with_taxa_keepall_color2 %>%
 pedon_pack_150 <- pedon_pack_150 %>%
   left_join(hz_props_150, by = "peiid")
 
-
+pedon_pack_150 <- pedon_pack_150 %>%
+  left_join(hz_indices, by = "peiid")
+#write csv:
+write.csv(pedon_pack_150, "../outputs/pedon_pack_150_02_23_26.csv", row.names = FALSE)
 set.seed(42)
 
 dfp <- pedon_pack_150
@@ -736,11 +833,71 @@ u <- uwot::umap(
 
 pedon_umap <- bind_cols(ids, dfp, tibble(UMAP1 = u[,1], UMAP2 = u[,2]))
 
-ggplot(pedon_umap, aes(UMAP1, UMAP2, color = sand_w)) +
+ggplot(pedon_umap, aes(UMAP1, UMAP2, color = taxgrtgroup)) +
   geom_point(alpha = 0.85, size = 2) +
   theme_minimal() +
-  labs(color = "Sand %", title = "Pedon-level UMAP (0–150 cm packaged)")
+  labs(color = "Clay %", title = "Pedon-level UMAP (0–150 cm packaged)")
 ```
+
+
+```{r}
+#delineate  Ultisols into suborders based on great group name but keep other tax orders constant and plot:
+
+
+pedon_umap3 <- pedon_umap %>%
+  mutate(
+    is_ult = (taxorder == "Ultisols") | str_detect(tolower(coalesce(taxgrtgroup, "")), "ult"),
+    order_group = coalesce(taxorder, "Unknown order"),
+    ult_group   = coalesce(taxgrtgroup, "Unknown GG"),
+    shape_group = if_else(is_ult, "Ultisols (GG)", "Non-Ultisols (Order)")
+  )
+
+ggplot() +
+  # --- NON-ULTISOLS: color by ORDER (palette 1) ---
+  geom_point(
+    data = filter(pedon_umap3, !is_ult),
+    aes(UMAP1, UMAP2, color = order_group, shape = shape_group),
+    alpha = 0.85, size = 2
+  ) +
+  scale_color_brewer(palette = "Set2", name = "Tax order (non-Ultisols)") +
+  scale_shape_manual(
+    values = c("Non-Ultisols (Order)" = 16, "Ultisols (GG)" = 17),
+    name = "Grouping"
+  ) +
+
+  ggnewscale::new_scale_color() +
+
+  # --- ULTISOLS: color by GREAT GROUP (palette 2) ---
+  geom_point(
+    data = filter(pedon_umap3, is_ult),
+    aes(UMAP1, UMAP2, color = ult_group, shape = shape_group),
+    alpha = 0.95, size = 2.2
+  ) +
+  scale_color_viridis_d(option = "D", end = 0.95, name = "Ultisols great group") +
+
+  theme_minimal() +
+  labs(title = "Pedon-level UMAP (0–150 cm): Orders + Ultisols by great group")
+
+  # --- color by RGB:
+ggplot(pedon_umap, aes(UMAP1, UMAP2)) +
+  geom_point(
+    aes(color = B_w),
+    alpha = 0.85, size = 2
+  ) +
+  theme_minimal() +
+  labs(color = "Weighted avg color (0–150 cm)", title = "Pedon-level UMAP colored by RGB") +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+```
+
+```{r}
+)
+
+
+```
+
+ 
+
 
 
 

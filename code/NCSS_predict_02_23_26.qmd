@@ -1,0 +1,829 @@
+---
+title: "NCSS_predict_02_23_26"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(uwot)
+library(forcats)
+library(beepr)
+library(yardstick)
+```
+
+```{r}
+#load dataset:
+#150cm:
+pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_02_23_26.csv")
+
+set.seed(1)
+
+df <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxorder = factor(taxorder)
+  )
+
+# lump rare orders to avoid dropped-level issues in resampling
+min_n <- 15
+df <- df %>%
+  mutate(taxorder = fct_lump_min(taxorder, min = min_n, other_level = "Other"))
+
+count(df, taxorder, sort = TRUE)
+
+df <- df %>% filter(taxorder != "Other")
+df <- df %>% droplevels()
+count(df, taxorder, sort = TRUE)
+
+split <- initial_split(df, prop = 0.8, strata = taxorder)
+train <- training(split)
+test  <- testing(split)
+```
+
+```{r}
+rec <- recipe(taxorder ~ ., data = train) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxsuborder", "taxgrtgroup", "taxsubgrp",
+    "taxpartsize"
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec <- prep(rec)
+
+x_train <- bake(prep_rec, new_data = train) %>% select(-taxorder, -peiid)
+x_test  <- bake(prep_rec, new_data = test)  %>% select(-taxorder, -peiid)
+
+# convert logical predictors to 0/1
+x_train <- x_train %>% mutate(across(where(is.logical), as.integer))
+x_test  <- x_test  %>% mutate(across(where(is.logical), as.integer))
+
+# safety: ensure all numeric
+stopifnot(all(vapply(x_train, is.numeric, logical(1))))
+```
+
+```{r}
+set.seed(2)
+umap_fit <- uwot::umap(
+  as.matrix(x_train),
+  n_components = 10,
+  n_neighbors = 15,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+
+z_train <- as.data.frame(umap_fit$embedding)
+names(z_train) <- paste0("U", seq_len(ncol(z_train)))
+
+z_test <- as.data.frame(uwot::umap_transform(as.matrix(x_test), umap_fit))
+names(z_test) <- names(z_train)
+
+train_umap <- bind_cols(z_train, taxorder = train$taxorder)
+test_umap  <- bind_cols(z_test,  taxorder = test$taxorder)
+```
+
+```{r}
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+rf_fit <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_formula(taxorder ~ .) %>%
+  fit(train_umap)
+
+pred_class <- predict(rf_fit, test_umap, type = "class") %>%
+  bind_cols(test_umap %>% select(taxorder))
+
+conf_mat(pred_class, truth = taxorder, estimate = .pred_class)
+accuracy(pred_class, truth = taxorder, estimate = .pred_class)
+```
+
+```{r}
+rf_spec_tune <- rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_tune <- workflow() %>%
+  add_model(rf_spec_tune) %>%
+  add_formula(taxorder ~ .)
+
+set.seed(3)
+folds <- vfold_cv(train_umap, v = 5, strata = taxorder)
+
+grid <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(2, 25)),
+  levels = 5
+)
+
+tuned <- tune_grid(
+  wf_tune, resamples = folds, grid = grid,
+  metrics = metric_set(accuracy, kap)
+)
+beepr::beep("wilhelm")
+best <- select_best(tuned, metric = "kap")
+rf_final <- finalize_workflow(wf_tune, best) %>%
+  fit(train_umap)
+pred <- predict(rf_final, test_umap, type = "prob") %>%
+  bind_cols(predict(rf_final, test_umap, type = "class")) %>%
+  bind_cols(test_umap %>% select(taxorder))
+
+conf_mat(pred, truth = taxorder, estimate = .pred_class)
+kap(pred, truth = taxorder, estimate = .pred_class)
+
+pred_conf <- pred %>%
+  rowwise() %>%
+  mutate(
+    max_prob = max(c_across(starts_with(".pred_") & !matches("^\\.pred_class$")))
+  ) %>%
+  ungroup() %>%
+  summarise(
+    mean_max_prob = mean(max_prob),
+    pct_low_conf  = mean(max_prob < 0.5)
+  )
+pred_conf
+
+```
+
+```{r}
+conf_mat(pred, truth = taxorder, estimate = .pred_class)
+
+# per-class stats (super important if classes are imbal)
+pred %>% yardstick::precision(truth = taxorder, estimate = .pred_class, estimator = "macro")
+pred %>% yardstick::recall(truth = taxorder, estimate = .pred_class, estimator = "macro")
+pred %>% yardstick::f_meas(truth = taxorder, estimate = .pred_class, estimator = "macro")
+```
+```{r}
+pred <- pred %>%
+  rowwise() %>%
+  mutate(max_prob = max(c_across(where(is.numeric) & starts_with(".pred_")))) %>%
+  ungroup()
+
+pred %>%
+  mutate(low_conf = max_prob < 0.5) %>%
+  count(taxorder, low_conf, sort = TRUE)
+
+pred_class <- pred %>%
+  select(taxorder, .pred_class)
+
+yardstick::bal_accuracy(pred_class, truth = taxorder, estimate = .pred_class)
+
+f_meas(pred_class, truth = taxorder, estimate = .pred_class, estimator = "macro")
+recall(pred_class, truth = taxorder, estimate = .pred_class, estimator = "macro")
+precision(pred_class, truth = taxorder, estimate = .pred_class, estimator = "macro")
+```
+
+
+```{r}
+# 1) Class counts (train + test)
+cat("\n=== FULL DATA COUNTS ===\n")
+print(count(df, taxorder, sort = TRUE))
+
+cat("\n=== TRAIN COUNTS ===\n")
+print(count(train, taxorder, sort = TRUE))
+
+cat("\n=== TEST COUNTS ===\n")
+print(count(test, taxorder, sort = TRUE))
+
+# 2) Confusion matrix (full)
+cat("\n=== CONFUSION MATRIX ===\n")
+print(conf_mat(pred, truth = taxorder, estimate = .pred_class))
+
+# 3) Key metrics (overall + macro)
+cat("\n=== METRICS (overall) ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred, truth = taxorder, estimate = .pred_class))
+
+cat("\n=== MACRO METRICS ===\n")
+print(precision(pred, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+print(recall(pred, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+print(f_meas(pred, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+
+# 4) Per-class performance (this is the most diagnostic)
+cat("\n=== PER-CLASS METRICS ===\n")
+print(precision(pred, truth = taxorder, estimate = .pred_class, estimator = "macro_weighted")) # optional
+print(recall(pred, truth = taxorder, estimate = .pred_class, estimator = "macro_weighted"))   # optional
+
+
+cat("\n=== BY-CLASS SUMMARY ===\n")
+print(summary(conf_mat(pred, truth = taxorder, estimate = .pred_class)))
+
+#So: the model works, but it’s blind to Alfisols.
+```
+
+
+```{r}
+# ============================================================
+# GREAT GROUP MODEL (taxgrtgroup)
+# ============================================================
+
+set.seed(11)
+
+df_gg <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxgrtgroup = factor(taxgrtgroup)
+  ) %>%
+  filter(!is.na(taxgrtgroup), taxgrtgroup != "") %>%
+  droplevels()
+
+# Lump rare great groups (you almost always need this)
+# Start with 10–20; increase if you still see dropped-level warnings in CV
+min_n_gg <- 20
+df_gg <- df_gg %>%
+  mutate(taxgrtgroup = fct_lump_min(taxgrtgroup, min = min_n_gg, other_level = "Other")) %>%
+  filter(taxgrtgroup != "Other") %>%   # you can keep Other if you want, but it’s often messy
+  droplevels()
+
+cat("\n=== GREAT GROUP COUNTS ===\n")
+print(count(df_gg, taxgrtgroup, sort = TRUE))
+
+split_gg <- initial_split(df_gg, prop = 0.8, strata = taxgrtgroup)
+train_gg <- training(split_gg)
+test_gg  <- testing(split_gg)
+
+# --- recipe: drop taxonomy leaks (everything except taxgrtgroup)
+rec_gg <- recipe(taxgrtgroup ~ ., data = train_gg) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder", "taxsubgrp",
+    "taxpartsize"
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_gg <- prep(rec_gg)
+
+x_train_gg <- bake(prep_rec_gg, new_data = train_gg) %>% select(-taxgrtgroup, -peiid)
+x_test_gg  <- bake(prep_rec_gg, new_data = test_gg)  %>% select(-taxgrtgroup, -peiid)
+
+x_train_gg <- x_train_gg %>% mutate(across(where(is.logical), as.integer))
+x_test_gg  <- x_test_gg  %>% mutate(across(where(is.logical), as.integer))
+
+stopifnot(all(vapply(x_train_gg, is.numeric, logical(1))))
+
+# --- UMAP
+set.seed(12)
+umap_fit_gg <- uwot::umap(
+  as.matrix(x_train_gg),
+  n_components = 15,     # often helps for many-class problems
+  n_neighbors = 15,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+
+z_train_gg <- as.data.frame(umap_fit_gg$embedding)
+names(z_train_gg) <- paste0("U", seq_len(ncol(z_train_gg)))
+
+z_test_gg <- as.data.frame(uwot::umap_transform(as.matrix(x_test_gg), umap_fit_gg))
+names(z_test_gg) <- names(z_train_gg)
+
+train_umap_gg <- bind_cols(z_train_gg, taxgrtgroup = train_gg$taxgrtgroup)
+test_umap_gg  <- bind_cols(z_test_gg,  taxgrtgroup = test_gg$taxgrtgroup)
+
+# --- RF tune (recommended for GG)
+rf_spec_tune_gg <- rand_forest(trees = 1500, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_tune_gg <- workflow() %>%
+  add_model(rf_spec_tune_gg) %>%
+  add_formula(taxgrtgroup ~ .)
+
+set.seed(13)
+folds_gg <- vfold_cv(train_umap_gg, v = 5, strata = taxgrtgroup)
+
+# mtry upper bound should not exceed number of UMAP components (here 15)
+grid_gg <- grid_regular(
+  mtry(range = c(2, 15)),
+  min_n(range = c(2, 30)),
+  levels = 5
+)
+
+tuned_gg <- tune_grid(
+  wf_tune_gg, resamples = folds_gg, grid = grid_gg,
+  metrics = metric_set(bal_accuracy, kap)
+)
+beepr::beep("wilhelm")
+
+best_gg <- select_best(tuned_gg, metric = "bal_accuracy")
+
+rf_final_gg <- finalize_workflow(wf_tune_gg, best_gg) %>%
+  fit(train_umap_gg)
+
+pred_gg <- predict(rf_final_gg, test_umap_gg, type = "prob") %>%
+  bind_cols(predict(rf_final_gg, test_umap_gg, type = "class")) %>%
+  bind_cols(test_umap_gg %>% select(taxgrtgroup))
+pred_gg <- pred_gg %>%
+  rowwise() %>%
+  mutate(
+    probs = list(c_across(where(is.numeric) & starts_with(".pred_"))),
+    top1   = max(probs),
+    top2   = sort(probs, decreasing = TRUE)[2],
+    margin = top1 - top2
+  ) %>%
+  ungroup()
+
+pred_gg %>%
+  summarise(
+    mean_top1 = mean(top1),
+    pct_low_top1 = mean(top1 < 0.5),
+    mean_margin = mean(margin),
+    pct_low_margin = mean(margin < 0.15)
+  )
+cat("\n=== GREAT GROUP CONFUSION MATRIX ===\n")
+print(conf_mat(pred_gg, truth = taxgrtgroup, estimate = .pred_class))
+
+cat("\n=== GREAT GROUP METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred_gg, truth = taxgrtgroup, estimate = .pred_class))
+print(f_meas(pred_gg, truth = taxgrtgroup, estimate = .pred_class, estimator = "macro"))
+
+# Confidence summary
+pred_conf_gg <- pred_gg %>%
+  rowwise() %>%
+  mutate(max_prob = max(c_across(where(is.numeric) & starts_with(".pred_")))) %>%
+  ungroup() %>%
+  summarise(
+    mean_max_prob = mean(max_prob),
+    pct_low_conf  = mean(max_prob < 0.5)
+  )
+
+cat("\n=== GREAT GROUP CONFIDENCE ===\n")
+print(pred_conf_gg)
+```
+```{r}
+# ============================================================
+# SUBGROUP MODEL (taxsubgrp) - all orders
+# ============================================================
+
+set.seed(21)
+
+df_sg <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxsubgrp = factor(taxsubgrp)
+  ) %>%
+  filter(!is.na(taxsubgrp), taxsubgrp != "") %>%
+  droplevels()
+
+# Lump rare subgroups HARD (start at 30–50)
+min_n_sg <- 40
+df_sg <- df_sg %>%
+  mutate(taxsubgrp = fct_lump_min(taxsubgrp, min = min_n_sg, other_level = "Other")) %>%
+  filter(taxsubgrp != "Other") %>%
+  droplevels()
+
+cat("\n=== SUBGROUP COUNTS (ALL ORDERS) ===\n")
+print(count(df_sg, taxsubgrp, sort = TRUE))
+
+split_sg <- initial_split(df_sg, prop = 0.8, strata = taxsubgrp)
+train_sg <- training(split_sg)
+test_sg  <- testing(split_sg)
+
+# Drop taxonomy leaks (everything except taxsubgrp)
+rec_sg <- recipe(taxsubgrp ~ ., data = train_sg) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder", "taxgrtgroup",   # <- drop higher levels
+    "taxpartsize"                                # <- drop family info
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_sg <- prep(rec_sg)
+
+x_train_sg <- bake(prep_rec_sg, new_data = train_sg) %>% select(-taxsubgrp, -peiid)
+x_test_sg  <- bake(prep_rec_sg, new_data = test_sg)  %>% select(-taxsubgrp, -peiid)
+
+x_train_sg <- x_train_sg %>% mutate(across(where(is.logical), as.integer))
+x_test_sg  <- x_test_sg  %>% mutate(across(where(is.logical), as.integer))
+
+stopifnot(all(vapply(x_train_sg, is.numeric, logical(1))))
+
+# UMAP: for many classes, bump components
+set.seed(22)
+umap_fit_sg <- uwot::umap(
+  as.matrix(x_train_sg),
+  n_components = 20,
+  n_neighbors = 20,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+
+z_train_sg <- as.data.frame(umap_fit_sg$embedding)
+names(z_train_sg) <- paste0("U", seq_len(ncol(z_train_sg)))
+
+z_test_sg <- as.data.frame(uwot::umap_transform(as.matrix(x_test_sg), umap_fit_sg))
+names(z_test_sg) <- names(z_train_sg)
+
+train_umap_sg <- bind_cols(z_train_sg, taxsubgrp = train_sg$taxsubgrp)
+test_umap_sg  <- bind_cols(z_test_sg,  taxsubgrp = test_sg$taxsubgrp)
+
+# RF tuning
+rf_spec_tune_sg <- rand_forest(trees = 2000, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_tune_sg <- workflow() %>%
+  add_model(rf_spec_tune_sg) %>%
+  add_formula(taxsubgrp ~ .)
+
+set.seed(23)
+folds_sg <- vfold_cv(train_umap_sg, v = 5, strata = taxsubgrp)
+
+grid_sg <- grid_regular(
+  mtry(range = c(2, 20)),
+  min_n(range = c(2, 40)),
+  levels = 5
+)
+
+tuned_sg <- tune_grid(
+  wf_tune_sg, resamples = folds_sg, grid = grid_sg,
+  metrics = metric_set(bal_accuracy, kap)
+)
+beepr::beep("wilhelm")
+
+best_sg <- select_best(tuned_sg, metric = "bal_accuracy")
+
+rf_final_sg <- finalize_workflow(wf_tune_sg, best_sg) %>%
+  fit(train_umap_sg)
+
+pred_sg <- predict(rf_final_sg, test_umap_sg, type = "prob") %>%
+  bind_cols(predict(rf_final_sg, test_umap_sg, type = "class")) %>%
+  bind_cols(test_umap_sg %>% select(taxsubgrp))
+
+cat("\n=== SUBGROUP METRICS (ALL ORDERS) ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred_sg, truth = taxsubgrp, estimate = .pred_class))
+print(f_meas(pred_sg, truth = taxsubgrp, estimate = .pred_class, estimator = "macro"))
+
+# Confidence + margin
+pred_sg <- pred_sg %>%
+  rowwise() %>%
+  mutate(
+    probs  = c_across(where(is.numeric) & starts_with(".pred_")),
+    top1   = max(probs),
+    top2   = sort(probs, decreasing = TRUE)[2],
+    margin = top1 - top2
+  ) %>%
+  ungroup()
+
+cat("\n=== SUBGROUP CONFIDENCE (ALL ORDERS) ===\n")
+print(pred_sg %>% summarise(
+  mean_top1 = mean(top1),
+  pct_low_top1 = mean(top1 < 0.5),
+  mean_margin = mean(margin),
+  pct_low_margin = mean(margin < 0.15)
+))
+```
+
+```{r}
+# ============================================================
+# SUBGROUP MODEL (taxsubgrp) - Ultisols only (recommended)
+# ============================================================
+
+set.seed(31)
+
+df_sg_u <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxorder = factor(taxorder),
+    taxsubgrp = factor(taxsubgrp)
+  ) %>%
+  filter(taxorder == "Ultisols") %>%
+  filter(!is.na(taxsubgrp), taxsubgrp != "") %>%
+  droplevels()
+
+min_n_sg_u <- 30
+df_sg_u <- df_sg_u %>%
+  mutate(taxsubgrp = fct_lump_min(taxsubgrp, min = min_n_sg_u, other_level = "Other")) %>%
+  filter(taxsubgrp != "Other") %>%
+  droplevels()
+
+cat("\n=== SUBGROUP COUNTS (ULTISOLS) ===\n")
+print(count(df_sg_u, taxsubgrp, sort = TRUE))
+
+split_sg_u <- initial_split(df_sg_u, prop = 0.8, strata = taxsubgrp)
+train_sg_u <- training(split_sg_u)
+test_sg_u  <- testing(split_sg_u)
+
+rec_sg_u <- recipe(taxsubgrp ~ ., data = train_sg_u) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder", "taxgrtgroup",
+    "taxpartsize"
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_sg_u <- prep(rec_sg_u)
+
+x_train_sg_u <- bake(prep_rec_sg_u, new_data = train_sg_u) %>% select(-taxsubgrp, -peiid)
+x_test_sg_u  <- bake(prep_rec_sg_u, new_data = test_sg_u)  %>% select(-taxsubgrp, -peiid)
+
+x_train_sg_u <- x_train_sg_u %>% mutate(across(where(is.logical), as.integer))
+x_test_sg_u  <- x_test_sg_u  %>% mutate(across(where(is.logical), as.integer))
+
+set.seed(32)
+umap_fit_sg_u <- uwot::umap(
+  as.matrix(x_train_sg_u),
+  n_components = 20,
+  n_neighbors = 20,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+
+z_train_sg_u <- as.data.frame(umap_fit_sg_u$embedding)
+names(z_train_sg_u) <- paste0("U", seq_len(ncol(z_train_sg_u)))
+
+z_test_sg_u <- as.data.frame(uwot::umap_transform(as.matrix(x_test_sg_u), umap_fit_sg_u))
+names(z_test_sg_u) <- names(z_train_sg_u)
+
+train_umap_sg_u <- bind_cols(z_train_sg_u, taxsubgrp = train_sg_u$taxsubgrp)
+test_umap_sg_u  <- bind_cols(z_test_sg_u,  taxsubgrp = test_sg_u$taxsubgrp)
+
+rf_spec_tune_sg_u <- rand_forest(trees = 2000, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_tune_sg_u <- workflow() %>%
+  add_model(rf_spec_tune_sg_u) %>%
+  add_formula(taxsubgrp ~ .)
+
+set.seed(33)
+folds_sg_u <- vfold_cv(train_umap_sg_u, v = 5, strata = taxsubgrp)
+
+grid_sg_u <- grid_regular(
+  mtry(range = c(2, 20)),
+  min_n(range = c(2, 40)),
+  levels = 5
+)
+
+tuned_sg_u <- tune_grid(
+  wf_tune_sg_u, resamples = folds_sg_u, grid = grid_sg_u,
+  metrics = metric_set(bal_accuracy, kap)
+)
+beepr::beep("wilhelm")
+
+best_sg_u <- select_best(tuned_sg_u, metric = "bal_accuracy")
+
+rf_final_sg_u <- finalize_workflow(wf_tune_sg_u, best_sg_u) %>%
+  fit(train_umap_sg_u)
+
+pred_sg_u <- predict(rf_final_sg_u, test_umap_sg_u, type = "prob") %>%
+  bind_cols(predict(rf_final_sg_u, test_umap_sg_u, type = "class")) %>%
+  bind_cols(test_umap_sg_u %>% select(taxsubgrp))
+
+cat("\n=== SUBGROUP METRICS (ULTISOLS) ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred_sg_u, truth = taxsubgrp, estimate = .pred_class))
+print(f_meas(pred_sg_u, truth = taxsubgrp, estimate = .pred_class, estimator = "macro"))
+```
+
+
+```{r}
+# ============================================================
+# FAMILY PARTICLE-SIZE MODEL (taxpartsize)
+# ============================================================
+
+set.seed(41)
+
+df_ps <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxpartsize = factor(taxpartsize)
+  ) %>%
+  filter(!is.na(taxpartsize), taxpartsize != "") %>%
+  droplevels()
+df_ps <- df_ps %>% filter(taxpartsize != "not used") %>% droplevels() # <- a "not used" category that should be dropped
+# Lump rare particle-size classes (usually only a few, but still)
+min_n_ps <- 10
+df_ps <- df_ps %>%
+  mutate(taxpartsize = fct_lump_min(taxpartsize, min = min_n_ps, other_level = "Other")) %>%
+  filter(taxpartsize != "Other") %>%
+  droplevels()
+
+cat("\n=== PARTSIZE COUNTS ===\n")
+print(count(df_ps, taxpartsize, sort = TRUE))
+
+split_ps <- initial_split(df_ps, prop = 0.8, strata = taxpartsize)
+train_ps <- training(split_ps)
+test_ps  <- testing(split_ps)
+
+rec_ps <- recipe(taxpartsize ~ ., data = train_ps) %>%
+  update_role(peiid, new_role = "id") %>%
+  # drop ALL taxonomy string fields (except target taxpartsize)
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder", "taxgrtgroup", "taxsubgrp"
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_ps <- prep(rec_ps)
+
+x_train_ps <- bake(prep_rec_ps, new_data = train_ps) %>% select(-taxpartsize, -peiid)
+x_test_ps  <- bake(prep_rec_ps, new_data = test_ps)  %>% select(-taxpartsize, -peiid)
+
+x_train_ps <- x_train_ps %>% mutate(across(where(is.logical), as.integer))
+x_test_ps  <- x_test_ps  %>% mutate(across(where(is.logical), as.integer))
+
+set.seed(42)
+umap_fit_ps <- uwot::umap(
+  as.matrix(x_train_ps),
+  n_components = 10,
+  n_neighbors = 15,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+
+z_train_ps <- as.data.frame(umap_fit_ps$embedding)
+names(z_train_ps) <- paste0("U", seq_len(ncol(z_train_ps)))
+
+z_test_ps <- as.data.frame(uwot::umap_transform(as.matrix(x_test_ps), umap_fit_ps))
+names(z_test_ps) <- names(z_train_ps)
+
+train_umap_ps <- bind_cols(z_train_ps, taxpartsize = train_ps$taxpartsize)
+test_umap_ps  <- bind_cols(z_test_ps,  taxpartsize = test_ps$taxpartsize)
+
+rf_spec_tune_ps <- rand_forest(trees = 1500, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_tune_ps <- workflow() %>%
+  add_model(rf_spec_tune_ps) %>%
+  add_formula(taxpartsize ~ .)
+
+set.seed(43)
+folds_ps <- vfold_cv(train_umap_ps, v = 5, strata = taxpartsize)
+
+grid_ps <- grid_regular(
+  mtry(range = c(2, 10)),
+  min_n(range = c(2, 30)),
+  levels = 5
+)
+
+tuned_ps <- tune_grid(
+  wf_tune_ps, resamples = folds_ps, grid = grid_ps,
+  metrics = metric_set(bal_accuracy, kap)
+)
+beepr::beep("wilhelm")
+
+best_ps <- select_best(tuned_ps, metric = "bal_accuracy")
+
+rf_final_ps <- finalize_workflow(wf_tune_ps, best_ps) %>%
+  fit(train_umap_ps)
+
+pred_ps <- predict(rf_final_ps, test_umap_ps, type = "class") %>%
+  bind_cols(test_umap_ps %>% select(taxpartsize))
+
+cat("\n=== PARTSIZE METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred_ps, truth = taxpartsize, estimate = .pred_class))
+```
+```{r}
+# ============================================================
+# PARTSIZE MODEL (NO UMAP): RF on baked predictors
+# ============================================================
+
+set.seed(101)
+
+# Build df_ps (drop "not used" already handled; keep here for safety)
+df_ps <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxpartsize = factor(taxpartsize)
+  ) %>%
+  filter(!is.na(taxpartsize), taxpartsize != "", taxpartsize != "not used") %>%
+  droplevels()
+
+# Optionally lump very rare classes (fine-silty is tiny)
+# Uncomment if you want stability over completeness:
+# df_ps <- df_ps %>%
+#   mutate(taxpartsize = fct_collapse(taxpartsize, Other_ps = c("fine-silty"))) %>%
+#   droplevels()
+
+cat("\n=== PARTSIZE COUNTS (NO UMAP) ===\n")
+print(count(df_ps, taxpartsize, sort = TRUE))
+
+split_ps <- initial_split(df_ps, prop = 0.8, strata = taxpartsize)
+train_ps <- training(split_ps)
+test_ps  <- testing(split_ps)
+
+# Recipe: drop taxonomy leaks, encode/impute/normalize
+rec_ps <- recipe(taxpartsize ~ ., data = train_ps) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder", "taxgrtgroup", "taxsubgrp"
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_ps <- prep(rec_ps)
+
+x_train_ps <- bake(prep_ps, new_data = train_ps) %>% select(-taxpartsize, -peiid)
+x_test_ps  <- bake(prep_ps, new_data = test_ps)  %>% select(-taxpartsize, -peiid)
+
+x_train_ps <- x_train_ps %>% mutate(across(where(is.logical), as.integer))
+x_test_ps  <- x_test_ps  %>% mutate(across(where(is.logical), as.integer))
+
+stopifnot(all(vapply(x_train_ps, is.numeric, logical(1))))
+
+train_rf <- bind_cols(x_train_ps, taxpartsize = train_ps$taxpartsize)
+test_rf  <- bind_cols(x_test_ps,  taxpartsize = test_ps$taxpartsize)
+
+# Class weights (helps minority classes)
+tab_ps <- table(train_rf$taxpartsize)
+cw_ps <- as.numeric(sum(tab_ps) / (length(tab_ps) * tab_ps))
+names(cw_ps) <- names(tab_ps)
+
+# Tunable RF
+rf_spec <- rand_forest(trees = 2000, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger",
+             probability = TRUE,
+             importance = "permutation",
+             class.weights = cw_ps) %>%
+  set_mode("classification")
+
+wf <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_formula(taxpartsize ~ .)
+
+set.seed(102)
+folds <- vfold_cv(train_rf, v = 5, strata = taxpartsize)
+
+# mtry upper bound should relate to # predictors; keep it reasonable
+p <- ncol(x_train_ps)
+mtry_max <- min(50, p)
+
+grid <- grid_regular(
+  mtry(range = c(2, mtry_max)),
+  min_n(range = c(2, 40)),
+  levels = 5
+)
+
+tuned <- tune_grid(
+  wf, resamples = folds, grid = grid,
+  metrics = metric_set(bal_accuracy, kap)
+)
+
+best <- select_best(tuned, metric = "kap")
+rf_final <- finalize_workflow(wf, best) %>% fit(train_rf)
+
+rf_final <- finalize_workflow(wf, best) %>%
+  fit(train_rf)
+
+# Predictions
+pred <- predict(rf_final, test_rf, type = "prob") %>%
+  bind_cols(predict(rf_final, test_rf, type = "class")) %>%
+  bind_cols(test_rf %>% select(taxpartsize))
+
+cat("\n=== PARTSIZE (NO UMAP) METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred, truth = taxpartsize, estimate = .pred_class))
+print(f_meas(pred, truth = taxpartsize, estimate = .pred_class, estimator = "macro"))
+
+cat("\n=== PARTSIZE (NO UMAP) CONFUSION MATRIX ===\n")
+print(conf_mat(pred, truth = taxpartsize, estimate = .pred_class))
+```
+
+
