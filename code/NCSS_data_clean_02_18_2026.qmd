@@ -659,6 +659,13 @@ layerlab_with_taxa_keepall_color2 <- dat %>%
 ```
 
 ```{r}
+#parse out subgroup:
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
+
+```
+
+
+```{r}
 #depth to Bt and depth to argillic:
 
 max_depth_cm <- 150
@@ -891,7 +898,7 @@ ggplot(pedon_umap, aes(UMAP1, UMAP2)) +
 ```
 
 ```{r}
-)
+
 
 
 ```

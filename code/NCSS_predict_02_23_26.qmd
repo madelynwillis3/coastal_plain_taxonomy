@@ -220,6 +220,9 @@ print(summary(conf_mat(pred, truth = taxorder, estimate = .pred_class)))
 
 #So: the model works, but it’s blind to Alfisols.
 ```
+```{r}
+
+```
 
 
 ```{r}
@@ -824,6 +827,111 @@ print(f_meas(pred, truth = taxpartsize, estimate = .pred_class, estimator = "mac
 
 cat("\n=== PARTSIZE (NO UMAP) CONFUSION MATRIX ===\n")
 print(conf_mat(pred, truth = taxpartsize, estimate = .pred_class))
+```
+```{r}
+# ============================================================
+# SUBGROUP (FULL) — NO CV TUNING (fit once)
+# ============================================================
+
+set.seed(501)
+
+df_sg_full <- pedon_pack_150_p %>%
+  mutate(peiid = as.character(peiid),
+         taxsubgrp = factor(taxsubgrp)) %>%
+  filter(!is.na(taxsubgrp), taxsubgrp != "") %>%
+  droplevels()
+
+split_sg <- initial_split(df_sg_full, prop = 0.8, strata = taxsubgrp)
+train_sg <- training(split_sg)
+test_sg  <- testing(split_sg)
+
+rec_sg <- recipe(taxsubgrp ~ ., data = train_sg) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c("taxonname_clean","taxorder","taxsuborder","taxgrtgroup","taxpartsize"))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_sg <- prep(rec_sg)
+
+x_train_sg <- bake(prep_sg, new_data = train_sg) %>% select(-taxsubgrp, -peiid)
+x_test_sg  <- bake(prep_sg, new_data = test_sg)  %>% select(-taxsubgrp, -peiid)
+
+train_rf_sg <- bind_cols(x_train_sg, taxsubgrp = train_sg$taxsubgrp)
+test_rf_sg  <- bind_cols(x_test_sg,  taxsubgrp = test_sg$taxsubgrp)
+
+# Simple strong defaults (no tuning)
+rf_spec_sg <- rand_forest(trees = 2000, mtry = floor(sqrt(ncol(x_train_sg))), min_n = 5) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+rf_fit_sg <- workflow() %>%
+  add_model(rf_spec_sg) %>%
+  add_formula(taxsubgrp ~ .) %>%
+  fit(train_rf_sg)
+
+pred_sg <- predict(rf_fit_sg, test_rf_sg, type = "class") %>%
+  bind_cols(test_rf_sg %>% select(taxsubgrp))
+
+metric_set(accuracy, kap)(pred_sg, truth = taxsubgrp, estimate = .pred_class)
+f_meas(pred_sg, truth = taxsubgrp, estimate = .pred_class, estimator = "macro")
+```
+```{r}
+
+# ============================================================
+# PARTSIZE (FULL) — NO CV TUNING (fit once)
+# ============================================================
+
+set.seed(601)
+
+df_ps_full <- pedon_pack_150_p %>%
+  mutate(peiid = as.character(peiid),
+         taxpartsize = factor(taxpartsize)) %>%
+  filter(!is.na(taxpartsize), taxpartsize != "") %>%
+  droplevels()
+
+split_ps <- initial_split(df_ps_full, prop = 0.8, strata = taxpartsize)
+train_ps <- training(split_ps)
+test_ps  <- testing(split_ps)
+
+rec_ps <- recipe(taxpartsize ~ ., data = train_ps) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c("taxonname_clean","taxorder","taxsuborder","taxgrtgroup","taxsubgrp"))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_ps <- prep(rec_ps)
+
+x_train_ps <- bake(prep_ps, new_data = train_ps) %>% select(-taxpartsize, -peiid)
+x_test_ps  <- bake(prep_ps, new_data = test_ps)  %>% select(-taxpartsize, -peiid)
+
+train_rf_ps <- bind_cols(x_train_ps, taxpartsize = train_ps$taxpartsize)
+test_rf_ps  <- bind_cols(x_test_ps,  taxpartsize = test_ps$taxpartsize)
+
+rf_spec_ps <- rand_forest(trees = 2000, mtry = floor(sqrt(ncol(x_train_ps))), min_n = 5) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+rf_fit_ps <- workflow() %>%
+  add_model(rf_spec_ps) %>%
+  add_formula(taxpartsize ~ .) %>%
+  fit(train_rf_ps)
+
+pred_ps <- predict(rf_fit_ps, test_rf_ps, type = "class") %>%
+  bind_cols(test_rf_ps %>% select(taxpartsize))
+
+metric_set(accuracy, kap)(pred_ps, truth = taxpartsize, estimate = .pred_class)
+f_meas(pred_ps, truth = taxpartsize, estimate = .pred_class, estimator = "macro")
+conf_mat(pred_ps, truth = taxpartsize, estimate = .pred_class)
 ```
 
 
