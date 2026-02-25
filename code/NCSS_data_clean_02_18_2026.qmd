@@ -660,8 +660,72 @@ layerlab_with_taxa_keepall_color2 <- dat %>%
 
 ```{r}
 #parse out subgroup:
-layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
 
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
+  mutate(
+    taxsubgrp_clean = taxsubgrp %>%
+      str_replace_all("\\s+", " ") %>%
+      str_squish(),
+    taxsubgrp_clean = if_else(is.na(taxsubgrp_clean) | taxsubgrp_clean == "", NA_character_, taxsubgrp_clean),
+
+    # Great group is the last "word" in the subgroup phrase
+    subgrp_gg = if_else(
+      !is.na(taxsubgrp_clean),
+      word(taxsubgrp_clean, -1),
+      NA_character_
+    ),
+
+    # Everything before the last word are subgroup modifiers (0..N words)
+    subgrp_mod_phrase = if_else(
+      !is.na(taxsubgrp_clean),
+      str_trim(str_remove(taxsubgrp_clean, paste0("\\s+", subgrp_gg, "\\s*$"))),
+      NA_character_
+    ),
+
+    # count modifiers (for QC)
+    subgrp_n_mod = if_else(
+      is.na(subgrp_mod_phrase) | subgrp_mod_phrase == "",
+      0L,
+      str_count(subgrp_mod_phrase, "\\S+")  # count words
+    )
+  ) %>%
+  # split modifiers into columns (up to 4; add more if you want)
+  separate(
+    col = subgrp_mod_phrase,
+    into = c("subgrp_mod1", "subgrp_mod2", "subgrp_mod3", "subgrp_mod4"),
+    sep = "\\s+",
+    fill = "right",
+    extra = "merge",
+    remove = FALSE
+  ) %>%
+  mutate(
+    across(starts_with("subgrp_mod"), ~ na_if(.x, "")),
+    # convenience flags you mentioned
+    is_arenic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\barenic\\b"),
+    is_typic  = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\btypic\\b"),
+    is_humic  = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bhumic\\b"),
+    is_alfic  = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\balfic\\b"),
+    is_aquic  = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\baquic\\b"),
+    is_plinthic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bplinthic\\b"),
+    is_grossarenic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bgrossarenic\\b"),
+    is_psammentic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bpsammentic\\b"),
+    is_oxyaquic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\boxyaquic\\b"),
+    is_aeric = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\baeric\\b"),
+    is_cumulic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bcumulic\\b"),
+    is_histic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bhistic\\b"),
+    is_umbric = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bumbric\\b"),
+    is_fluvaquentic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bfluvaquentic\\b"),
+    is_fluventic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bfluventic\\b"),
+    is_lamellic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\blamellic\\b"),
+    is_ultic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bultic\\b"),
+    is_entic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bentic\\b"),
+    is_terric = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bterric\\b"),
+    is_plinthaquic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bplinthaquic\\b"),
+    is_chromic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bchromic\\b"),
+    is_pachic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bpachic\\b"),
+    is_vertic = str_detect(tolower(coalesce(taxsubgrp_clean, "")), "\\bvertic\\b")
+  )
+#these are part of taxa, so they are part of flags for suborders, but cannot be used to predict. 
 ```
 
 
