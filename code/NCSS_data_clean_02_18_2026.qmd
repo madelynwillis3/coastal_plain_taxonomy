@@ -365,7 +365,160 @@ pedon_taxa_fixedranks2 %>%
 pedon_taxa_fixedranks3 <- pedon_taxa_fixedranks2 %>%
   filter(!str_detect(taxonname, "SND")) %>%
   filter(!str_detect(taxonname, "Snd"))
+
+
+# --- 0. helper: robust parser (returns exactly the 4 things you want) ---
+parse_subgrp_simple <- function(x, gg_hint = NA_character_) {
+  x0 <- x %>% str_replace_all("\\s+", " ") %>% str_squish() %>% na_if("")
+  if (is.na(x0)) {
+    return(tibble(
+      subgrp_gg = NA_character_,
+      subgrp_mod1 = NA_character_,
+      subgrp_mod2 = NA_character_,
+      subgrp_mod3 = NA_character_
+    ))
+  }
+  toks <- unlist(str_split(x0, "\\s+"))
+  n <- length(toks)
+  # assume last token is great-group (gg); mods are preceding tokens
+  gg <- if (!is.na(gg_hint) && gg_hint != "") gg_hint else toks[n]
+  mods <- if (n >= 2) toks[1:(n-1)] else character(0)
+
+  tibble(
+    subgrp_gg   = gg,
+    subgrp_mod1 = mods[1] %||% NA_character_,
+    subgrp_mod2 = mods[2] %||% NA_character_,
+    subgrp_mod3 = mods[3] %||% NA_character_
+  )
+}
+
+`%||%` <- function(a, b) if (length(a) == 0 || is.na(a)) b else a
+
+# --- 1. build (or re-build) a small pedon-level table with only the subgroup columns ---
+# If you already parsed these on pedon_taxa_fixedranks3, you can skip parsing and just select.
+if (!all(c("subgrp_gg","subgrp_mod1","subgrp_mod2","subgrp_mod3") %in% names(pedon_taxa_fixedranks3))) {
+  pedon_subgrp <- pedon_taxa_fixedranks3 %>%
+    mutate(
+      taxsubgrp_clean = taxsubgrp %>% str_replace_all("\\s+", " ") %>% str_squish()
+    ) %>%
+    mutate(parsed = map2(taxsubgrp_clean, taxgrtgroup, ~ parse_subgrp_simple(.x, .y))) %>%
+    unnest_wider(parsed) %>%
+    select(peiid, subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3)
+} else {
+  pedon_subgrp <- pedon_taxa_fixedranks3 %>%
+    select(peiid, subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3)
+}
+
+# --- 2. sanity: ensure key types match between pedon_subgrp and layerlab table ---
+# Common problem: one peiid is character, other is integer.
+pedon_subgrp <- pedon_subgrp %>% mutate(peiid = as.character(peiid))
+layerlab_with_taxa_keepall_color2 <- layerlab_with_taxa_keepall_color2 %>% mutate(peiid = as.character(peiid))
+
+# --- 3. join the 4 desired columns onto your horizon table ---
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
+  left_join(pedon_subgrp, by = "peiid")
+
+# --- 4. replace taxsubgrp with the parsed fields if you want (optional) ---
+# For example, set taxsubgrp to "subgrp_gg" (or compose a string)
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+  mutate(
+    taxsubgrp_parsed = if_else(!is.na(subgrp_gg),
+                               paste(na.omit(c(subgrp_mod1, subgrp_mod2, subgrp_mod3, subgrp_gg)), collapse = " "),
+                               taxsubgrp),     # fallback to original if parsing failed
+    # if you want to replace original taxsubgrp:
+    taxsubgrp_orig = taxsubgrp,   # keep original in a backup column
+    taxsubgrp = coalesce(taxsubgrp_parsed, taxsubgrp)
+  )
+
+# --- 5. drop everything you don't want to keep (dissolve temporary columns) ---
+keep_cols <- c("peiid","hzname","hzdept","hzdepb","taxonname_clean","taxorder","taxsuborder",
+               "taxgrtgroup","taxsubgrp","taxpartsize",
+               "subgrp_gg","subgrp_mod1","subgrp_mod2","subgrp_mod3",
+               # plus the color/RGB/etc you already had - include as needed:
+               "munsell","munsell_hex","R","G","B")
+
+# keep only intersecting columns to avoid errors
+keep_cols <- intersect(keep_cols, names(layerlab_with_taxa_keepall_color3))
+
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+  select(all_of(keep_cols), everything())  # keep selected first
+
+# --- 6. quick checks ---
+message("Rows in horizon table: ", nrow(layerlab_with_taxa_keepall_color3))
+message("Unique pedons now with subgrp_gg: ", sum(!is.na(unique(layerlab_with_taxa_keepall_color3$peiid) %in% (pedon_subgrp$peiid))))
+#get rid of taxsubgrp and replace subgrp_gg with taxsubgrp:
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+  select(-taxsubgrp, -taxsubgrp_orig, -taxsubgrp_parsed) %>%
+  rename(taxsubgrp = subgrp_gg)
+  
+
+
 ```
+
+```{r}
+
+`%||%` <- function(a, b) if (length(a) == 0 || is.na(a)) b else a
+
+parse_subgrp <- function(x, gg_hint = NA_character_) {
+  x <- x %>% str_replace_all("\\s+", " ") %>% str_squish() %>% na_if("")
+
+  if (is.na(x)) {
+    return(tibble(
+      taxsubgrp_clean = NA_character_,
+      subgrp_n_words  = NA_integer_,
+      subgrp_gg       = NA_character_,
+      subgrp_mod_phrase = NA_character_,
+      subgrp_mod1 = NA_character_,
+      subgrp_mod2 = NA_character_,
+      subgrp_mod3 = NA_character_,
+      subgrp_mod4 = NA_character_,
+      subgrp_mod_extra = NA_character_
+    ))
+  }
+
+  toks <- unlist(str_split(x, "\\s+"))
+  n <- length(toks)
+
+  gg_hint <- gg_hint %>% str_squish() %>% na_if("")
+  gg <- if (!is.na(gg_hint)) gg_hint else toks[n]
+
+  mods <- if (n >= 2) toks[1:(n - 1)] else character(0)
+
+  tibble(
+    taxsubgrp_clean = x,
+    subgrp_n_words  = n,
+    subgrp_gg       = gg,
+    subgrp_mod_phrase = if (length(mods) > 0) paste(mods, collapse = " ") else NA_character_,
+    subgrp_mod1 = mods[1] %||% NA_character_,
+    subgrp_mod2 = mods[2] %||% NA_character_,
+    subgrp_mod3 = mods[3] %||% NA_character_,
+    subgrp_mod4 = mods[4] %||% NA_character_,
+    subgrp_mod_extra = if (length(mods) > 4) paste(mods[5:length(mods)], collapse = " ") else NA_character_
+  ) %>%
+    mutate(across(everything(), ~ na_if(str_squish(as.character(.x)), "")))
+}
+
+# ---- FIX: drop old parsed columns if they already exist ----
+cols_old <- c(
+  "taxsubgrp_clean","subgrp_n_words","subgrp_gg","subgrp_mod_phrase",
+  "subgrp_mod1","subgrp_mod2","subgrp_mod3","subgrp_mod4","subgrp_mod_extra"
+)
+
+pedon_taxa_fixedranks3 <- pedon_taxa_fixedranks3 %>%
+  select(-any_of(cols_old)) %>%   # <- prevents duplicate-name error
+  mutate(
+    taxsubgrp_clean0  = taxsubgrp  %>% str_replace_all("\\s+", " ") %>% str_squish() %>% na_if(""),
+    taxgrtgroup_clean = taxgrtgroup %>% str_replace_all("\\s+", " ") %>% str_squish() %>% na_if("")
+  ) %>%
+  mutate(parsed = pmap(list(taxsubgrp_clean0, taxgrtgroup_clean), parse_subgrp)) %>%
+  unnest_wider(parsed) %>%
+  mutate(
+    # enforce gg = taxgrtgroup when present
+    subgrp_gg = coalesce(taxgrtgroup_clean, subgrp_gg)
+  ) %>%
+  select(-taxsubgrp_clean0, -taxgrtgroup_clean)
+```
+
 
 ```{r}
 #now we have a full pedon database with taxa. yay!
@@ -391,8 +544,9 @@ layerlab_with_pedid <- layerlab_with_peiid %>%
 ped_keep <- pedon_taxa_fixedranks3 %>%
   select(peiid,
          taxonname_clean, taxonname_key, taxclname,
-         taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize,
-         POINT_X, POINT_Y) %>%
+         taxorder, taxsuborder, taxgrtgroup, #taxsubgrp,
+         subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3,
+         taxpartsize,POINT_X, POINT_Y) %>%
   distinct(peiid, .keep_all = TRUE)
 
 # 2) Option A: pedon list drives result -> keeps ALL pedons
@@ -658,10 +812,12 @@ layerlab_with_taxa_keepall_color2 <- dat %>%
   )
 ```
 
+
+
 ```{r}
 #parse out subgroup:
 
-layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
   mutate(
     taxsubgrp_clean = taxsubgrp %>%
       str_replace_all("\\s+", " ") %>%
@@ -734,7 +890,7 @@ layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
 
 max_depth_cm <- 150
 
-hz_indices <- layerlab_with_taxa_keepall_color2 %>%
+hz_indices <- layerlab_with_taxa_keepall_color3 %>%
   mutate(
     # overlap with 0–150 for thickness-based summaries
     top = pmax(hzdept, 0, na.rm = TRUE),
@@ -795,7 +951,7 @@ hz_indices <- layerlab_with_taxa_keepall_color2 %>%
 #umap of this data!!! yayyy
 max_depth_cm <- 150
 
-pedon_pack_150 <- layerlab_with_taxa_keepall_color2 %>%
+pedon_pack_150 <- layerlab_with_taxa_keepall_color3 %>%
   mutate(
     top = pmax(hzdept, 0, na.rm = TRUE),
     bot = pmin(hzdepb, max_depth_cm, na.rm = TRUE),
