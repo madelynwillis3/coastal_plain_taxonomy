@@ -1052,7 +1052,7 @@ pedon_pack_150 <- pedon_pack_150 %>%
   left_join(hz_props_150, by = "peiid") %>%
   left_join(hz_indices, by = "peiid")
 
-write.csv(pedon_pack_150, "../outputs/pedon_pack_150_02_23_26.csv", row.names = FALSE)
+write.csv(pedon_pack_150, "../outputs/pedon_pack_150_02_26_26.csv", row.names = FALSE)
 
 set.seed(42)
 

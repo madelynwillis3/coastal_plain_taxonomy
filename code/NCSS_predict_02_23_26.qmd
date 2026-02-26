@@ -221,9 +221,6 @@ print(summary(conf_mat(pred, truth = taxorder, estimate = .pred_class)))
 
 #So: the model works, but it’s blind to Alfisols.
 ```
-```{r}
-
-```
 
 
 ```{r}
@@ -1185,7 +1182,7 @@ fit_rf_direct <- function(train_df, test_df, outcome, id_col = "peiid",
   pred_conf <- pred %>%
     rowwise() %>%
     mutate(
-      probs  = c_across(starts_with(".pred_") & !matches("^\\.pred_class$")),
+      probs = list(c_across(starts_with(".pred_") & !matches("^\\.pred_class$"))),
       top1   = max(probs),
       top2   = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
       margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
@@ -1208,6 +1205,7 @@ fit_rf_direct <- function(train_df, test_df, outcome, id_col = "peiid",
   )
 }
 ```
+
 ```{r}
 # ============================================================
 # ALL ORDERS: taxorder prediction (NO UMAP)
@@ -1252,7 +1250,7 @@ res_order <- fit_rf_direct(
   outcome  = "taxorder",
   id_col   = "peiid"
 )
-
+beepr::beep("wilhelm")
 cat("\n=== TAXORDER FINAL METRICS ===\n")
 print(res_order$metrics)
 print(res_order$f_meas)
@@ -1314,6 +1312,7 @@ res_gg <- fit_rf_direct(
   outcome  = "taxgrtgroup",
   id_col   = "peiid"
 )
+beepr::beep("wilhelm")
 
 cat("\n=== GREAT GROUP FINAL METRICS ===\n")
 print(res_gg$metrics)
@@ -1377,6 +1376,7 @@ res_mod1 <- fit_rf_direct(
   outcome  = "taxsubgrp_mod1",
   id_col   = "peiid"
 )
+beepr::beep("wilhelm")
 
 cat("\n=== MOD1 FINAL METRICS ===\n")
 print(res_mod1$metrics)
@@ -1442,6 +1442,7 @@ res_mod1_u <- fit_rf_direct(
   outcome  = "taxsubgrp_mod1",
   id_col   = "peiid"
 )
+beepr::beep("wilhelm")
 
 cat("\n=== ULTISOLS ONLY: MOD1 FINAL METRICS ===\n")
 print(res_mod1_u$metrics)
@@ -1504,6 +1505,7 @@ res_ps <- fit_rf_direct(
   outcome  = "taxpartsize",
   id_col   = "peiid"
 )
+beepr::beep("wilhelm")
 
 cat("\n=== TAXPARTSIZE FINAL METRICS ===\n")
 print(res_ps$metrics)
