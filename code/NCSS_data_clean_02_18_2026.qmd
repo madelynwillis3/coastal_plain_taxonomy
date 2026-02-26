@@ -367,89 +367,6 @@ pedon_taxa_fixedranks3 <- pedon_taxa_fixedranks2 %>%
   filter(!str_detect(taxonname, "Snd"))
 
 
-# --- 0. helper: robust parser (returns exactly the 4 things you want) ---
-parse_subgrp_simple <- function(x, gg_hint = NA_character_) {
-  x0 <- x %>% str_replace_all("\\s+", " ") %>% str_squish() %>% na_if("")
-  if (is.na(x0)) {
-    return(tibble(
-      subgrp_gg = NA_character_,
-      subgrp_mod1 = NA_character_,
-      subgrp_mod2 = NA_character_,
-      subgrp_mod3 = NA_character_
-    ))
-  }
-  toks <- unlist(str_split(x0, "\\s+"))
-  n <- length(toks)
-  # assume last token is great-group (gg); mods are preceding tokens
-  gg <- if (!is.na(gg_hint) && gg_hint != "") gg_hint else toks[n]
-  mods <- if (n >= 2) toks[1:(n-1)] else character(0)
-
-  tibble(
-    subgrp_gg   = gg,
-    subgrp_mod1 = mods[1] %||% NA_character_,
-    subgrp_mod2 = mods[2] %||% NA_character_,
-    subgrp_mod3 = mods[3] %||% NA_character_
-  )
-}
-
-`%||%` <- function(a, b) if (length(a) == 0 || is.na(a)) b else a
-
-# --- 1. build (or re-build) a small pedon-level table with only the subgroup columns ---
-# If you already parsed these on pedon_taxa_fixedranks3, you can skip parsing and just select.
-if (!all(c("subgrp_gg","subgrp_mod1","subgrp_mod2","subgrp_mod3") %in% names(pedon_taxa_fixedranks3))) {
-  pedon_subgrp <- pedon_taxa_fixedranks3 %>%
-    mutate(
-      taxsubgrp_clean = taxsubgrp %>% str_replace_all("\\s+", " ") %>% str_squish()
-    ) %>%
-    mutate(parsed = map2(taxsubgrp_clean, taxgrtgroup, ~ parse_subgrp_simple(.x, .y))) %>%
-    unnest_wider(parsed) %>%
-    select(peiid, subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3)
-} else {
-  pedon_subgrp <- pedon_taxa_fixedranks3 %>%
-    select(peiid, subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3)
-}
-
-# --- 2. sanity: ensure key types match between pedon_subgrp and layerlab table ---
-# Common problem: one peiid is character, other is integer.
-pedon_subgrp <- pedon_subgrp %>% mutate(peiid = as.character(peiid))
-layerlab_with_taxa_keepall_color2 <- layerlab_with_taxa_keepall_color2 %>% mutate(peiid = as.character(peiid))
-
-# --- 3. join the 4 desired columns onto your horizon table ---
-layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
-  left_join(pedon_subgrp, by = "peiid")
-
-# --- 4. replace taxsubgrp with the parsed fields if you want (optional) ---
-# For example, set taxsubgrp to "subgrp_gg" (or compose a string)
-layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
-  mutate(
-    taxsubgrp_parsed = if_else(!is.na(subgrp_gg),
-                               paste(na.omit(c(subgrp_mod1, subgrp_mod2, subgrp_mod3, subgrp_gg)), collapse = " "),
-                               taxsubgrp),     # fallback to original if parsing failed
-    # if you want to replace original taxsubgrp:
-    taxsubgrp_orig = taxsubgrp,   # keep original in a backup column
-    taxsubgrp = coalesce(taxsubgrp_parsed, taxsubgrp)
-  )
-
-# --- 5. drop everything you don't want to keep (dissolve temporary columns) ---
-keep_cols <- c("peiid","hzname","hzdept","hzdepb","taxonname_clean","taxorder","taxsuborder",
-               "taxgrtgroup","taxsubgrp","taxpartsize",
-               "subgrp_gg","subgrp_mod1","subgrp_mod2","subgrp_mod3",
-               # plus the color/RGB/etc you already had - include as needed:
-               "munsell","munsell_hex","R","G","B")
-
-# keep only intersecting columns to avoid errors
-keep_cols <- intersect(keep_cols, names(layerlab_with_taxa_keepall_color3))
-
-layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
-  select(all_of(keep_cols), everything())  # keep selected first
-
-# --- 6. quick checks ---
-message("Rows in horizon table: ", nrow(layerlab_with_taxa_keepall_color3))
-message("Unique pedons now with subgrp_gg: ", sum(!is.na(unique(layerlab_with_taxa_keepall_color3$peiid) %in% (pedon_subgrp$peiid))))
-#get rid of taxsubgrp and replace subgrp_gg with taxsubgrp:
-layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
-  select(-taxsubgrp, -taxsubgrp_orig, -taxsubgrp_parsed) %>%
-  rename(taxsubgrp = subgrp_gg)
   
 
 
@@ -784,10 +701,117 @@ write.csv(layerlab_with_taxa_keepall_color2, "../outputs/layerlab_with_taxa_keep
 ```
 
 ```{r}
+
+# --- 0. helper: robust parser (returns exactly the 4 things you want) ---
+parse_subgrp_simple <- function(x, gg_hint = NA_character_) {
+  x0 <- x %>% str_replace_all("\\s+", " ") %>% str_squish() %>% na_if("")
+  if (is.na(x0)) {
+    return(tibble(
+      subgrp_gg = NA_character_,
+      subgrp_mod1 = NA_character_,
+      subgrp_mod2 = NA_character_,
+      subgrp_mod3 = NA_character_
+    ))
+  }
+  toks <- unlist(str_split(x0, "\\s+"))
+  n <- length(toks)
+  # assume last token is great-group (gg); mods are preceding tokens
+  gg <- if (!is.na(gg_hint) && gg_hint != "") gg_hint else toks[n]
+  mods <- if (n >= 2) toks[1:(n-1)] else character(0)
+
+  tibble(
+    subgrp_gg   = gg,
+    subgrp_mod1 = mods[1] %||% NA_character_,
+    subgrp_mod2 = mods[2] %||% NA_character_,
+    subgrp_mod3 = mods[3] %||% NA_character_
+  )
+}
+
+`%||%` <- function(a, b) if (length(a) == 0 || is.na(a)) b else a
+
+# --- 1. build (or re-build) a small pedon-level table with only the subgroup columns ---
+# If you already parsed these on pedon_taxa_fixedranks3, you can skip parsing and just select.
+if (!all(c("subgrp_gg","subgrp_mod1","subgrp_mod2","subgrp_mod3") %in% names(pedon_taxa_fixedranks3))) {
+  pedon_subgrp <- pedon_taxa_fixedranks3 %>%
+    mutate(
+      taxsubgrp_clean = taxsubgrp %>% str_replace_all("\\s+", " ") %>% str_squish()
+    ) %>%
+    mutate(parsed = map2(taxsubgrp_clean, taxgrtgroup, ~ parse_subgrp_simple(.x, .y))) %>%
+    unnest_wider(parsed) %>%
+    select(peiid, subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3)
+} else {
+  pedon_subgrp <- pedon_taxa_fixedranks3 %>%
+    select(peiid, subgrp_gg, subgrp_mod1, subgrp_mod2, subgrp_mod3)
+}
+
+# --- 2. sanity: ensure key types match between pedon_subgrp and layerlab table ---
+# Common problem: one peiid is character, other is integer.
+pedon_subgrp <- pedon_subgrp %>% mutate(peiid = as.character(peiid))
+layerlab_with_taxa_keepall_color2 <- layerlab_with_taxa_keepall_color2 %>% mutate(peiid = as.character(peiid))
+
+# --- 3. join the 4 desired columns onto your horizon table ---
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color2 %>%
+  left_join(pedon_subgrp, by = "peiid")
+
+
+#subgroups got merged and created .x and .y versions; if you already have the parsed columns, you can skip this step. If you have both, you can compare and decide which to keep (e.g., prefer parsed if available, otherwise original taxsubgrp).
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+  mutate(
+    subgrp_gg = coalesce(subgrp_gg.x, subgrp_gg.y),
+    subgrp_mod1 = coalesce(subgrp_mod1.x, subgrp_mod1.y),
+    subgrp_mod2 = coalesce(subgrp_mod2.x, subgrp_mod2.y),
+    subgrp_mod3 = coalesce(subgrp_mod3.x, subgrp_mod3.y)
+  ) %>%
+  select(-ends_with(".x"), -ends_with(".y")) %>%
+  #Rename subgroup_mod1 to taxsubgroup_mod1, etc. if you want to keep them as separate columns instead of merging back into taxsubgrp:
+  rename(
+    taxsubgrp_gg = subgrp_gg,
+    taxsubgrp_mod1 = subgrp_mod1,
+    taxsubgrp_mod2 = subgrp_mod2,
+    taxsubgrp_mod3 = subgrp_mod3
+  ) %>%
+#remove taxsubgrp_gg for now:
+  select(-taxsubgrp_gg)
+# --- 4. replace taxsubgrp with the parsed fields if you want (optional) ---
+# For example, set taxsubgrp to "subgrp_gg" (or compose a string)
+# layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+#   mutate(
+#     taxsubgrp_parsed = if_else(!is.na(taxsubgrp_gg),
+#                                paste(na.omit(c(taxsubgrp_mod1, taxsubgrp_mod2, taxsubgrp_mod3, taxsubgrp_gg)), collapse = " "),
+#                                taxsubgrp),     # fallback to original if parsing failed
+#     # if you want to replace original taxsubgrp:
+#     taxsubgrp_orig = taxsubgrp,   # keep original in a backup column
+#     taxsubgrp = coalesce(taxsubgrp_parsed, taxsubgrp)
+#   )
+
+# --- 5. drop everything you don't want to keep (dissolve temporary columns) ---
+# keep_cols <- c("peiid","hzname","hzdept","hzdepb","taxonname_clean","taxorder","taxsuborder",
+#                "taxgrtgroup",#"taxsubgrp",
+#                "taxpartsize","taxsubgrp_gg","taxsubgrp_mod1","taxsubgrp_mod2","taxsubgrp_mod3",
+#                # plus the color/RGB/etc you already had - include as needed:
+#                "munsell","munsell_hex","hzdepthb","sandtotmeasured","silttotmeasured","claytotmeasured","R","G","B")
+
+# keep only intersecting columns to avoid errors
+# keep_cols <- intersect(keep_cols, names(layerlab_with_taxa_keepall_color3))
+# 
+# layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+#   select(all_of(keep_cols), everything())  # keep selected first
+
+# --- 6. quick checks ---
+message("Rows in horizon table: ", nrow(layerlab_with_taxa_keepall_color3))
+message("Unique pedons now with subgrp_gg: ", sum(!is.na(unique(layerlab_with_taxa_keepall_color3$peiid) %in% (pedon_subgrp$peiid))))
+# #get rid of taxsubgrp and replace subgrp_gg with taxsubgrp:
+# layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+#   select(-taxsubgrp, -taxsubgrp_orig, -taxsubgrp_parsed) %>%
+#   rename(taxsubgrp = subgrp_gg)
+```
+
+
+```{r}
 #color:
 library(aqp)
 
-dat <- layerlab_with_taxa_keepall_color2 %>%
+dat <- layerlab_with_taxa_keepall_color3 %>%
   mutate(
     munsell = if_else(
       !is.na(colorhue) & !is.na(colorvalue) & !is.na(colorchroma),
@@ -804,7 +828,7 @@ rgb_mat <- matrix(NA_real_, nrow(dat), 3, dimnames = list(NULL, c("R","G","B")))
 # col2rgb returns 3 x N; transpose to N x 3, scale 0-255 -> 0-1
 rgb_mat[idx, ] <- t(grDevices::col2rgb(dat$munsell_hex[idx])) / 255
 
-layerlab_with_taxa_keepall_color2 <- dat %>%
+layerlab_with_taxa_keepall_color3 <- dat %>%
   mutate(
     R = rgb_mat[, "R"],
     G = rgb_mat[, "G"],
@@ -814,7 +838,7 @@ layerlab_with_taxa_keepall_color2 <- dat %>%
 
 
 
-```{r}
+```{r, eval=FALSE}
 #parse out subgroup:
 
 layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
@@ -949,40 +973,51 @@ hz_indices <- layerlab_with_taxa_keepall_color3 %>%
 
 ```{r}
 #umap of this data!!! yayyy
+# helper functions
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & x != ""]
+  if (length(y) == 0) NA else y[1]
+}
+
+wmean_safe <- function(x, w) {
+  ok <- !is.na(x) & !is.na(w)
+  if (!any(ok)) NA_real_ else weighted.mean(x[ok], w[ok])
+}
+
 max_depth_cm <- 150
+
+layerlab_with_taxa_keepall_color3 <- layerlab_with_taxa_keepall_color3 %>%
+  mutate(peiid = as.character(peiid))
+
+hz_indices <- hz_indices %>%
+  mutate(peiid = as.character(peiid))
 
 pedon_pack_150 <- layerlab_with_taxa_keepall_color3 %>%
   mutate(
-    top = pmax(hzdept, 0, na.rm = TRUE),
-    bot = pmin(hzdepb, max_depth_cm, na.rm = TRUE),
+    top = pmax(hzdept, 0),
+    bot = pmin(hzdepb, max_depth_cm),
     thk = pmax(0, bot - top)
   ) %>%
-  filter(thk > 0) %>%              # only horizons overlapping 0–150
+  filter(thk > 0) %>%
   group_by(peiid) %>%
   summarise(
-    # taxonomy (keep as strings for later dummy)
-    taxonname_clean = first(na.omit(taxonname_clean)),
-    taxorder        = first(na.omit(taxorder)),
-    taxsuborder     = first(na.omit(taxsuborder)),
-    taxgrtgroup     = first(na.omit(taxgrtgroup)),
-    taxsubgrp       = first(na.omit(taxsubgrp)),
-    taxpartsize     = first(na.omit(taxpartsize)),
+    taxonname_clean = first_non_na(taxonname_clean),
+    taxorder        = first_non_na(taxorder),
+    taxsuborder     = first_non_na(taxsuborder),
+    taxgrtgroup     = first_non_na(taxgrtgroup),
+    taxsubgrp_mod1  = first_non_na(taxsubgrp_mod1),
+    taxsubgrp_mod2  = first_non_na(taxsubgrp_mod2),
+    taxsubgrp_mod3  = first_non_na(taxsubgrp_mod3),
+    taxpartsize     = first_non_na(taxpartsize),
 
-    # depth-weighted lab summaries (0–150)
-    sand_w = weighted.mean(sandtotmeasured, thk, na.rm = TRUE),
-    silt_w = weighted.mean(silttotmeasured, thk, na.rm = TRUE),
-    clay_w = weighted.mean(claytotmeasured, thk, na.rm = TRUE),
-    cec7_w = weighted.mean(cec7, thk, na.rm = TRUE),
+    sand_w = wmean_safe(sandtotmeasured, thk),
+    silt_w = wmean_safe(silttotmeasured, thk),
+    clay_w = wmean_safe(claytotmeasured, thk),
+    cec7_w = wmean_safe(cec7, thk),
 
-    # color numeric summaries (0–150)
-    # colorvalue_w  = weighted.mean(colorvalue, thk, na.rm = TRUE),
-    # colorchroma_w = weighted.mean(colorchroma, thk, na.rm = TRUE),
-     R_w = weighted.mean(R, thk, na.rm = TRUE),
-     G_w = weighted.mean(G, thk, na.rm = TRUE),
-     B_w = weighted.mean(B, thk, na.rm = TRUE),
-    # horizon structure summaries (0–150)
-    # n_hz_150   = n(),
-    # max_bot_150 = max(bot, na.rm = TRUE),
+    R_w = wmean_safe(R, thk),
+    G_w = wmean_safe(G, thk),
+    B_w = wmean_safe(B, thk),
 
     any_argillic  = any(str_detect(coalesce(L_suffix, ""), "t"), na.rm = TRUE),
     any_gleyed    = any(str_detect(coalesce(L_suffix, ""), "g"), na.rm = TRUE),
@@ -992,11 +1027,10 @@ pedon_pack_150 <- layerlab_with_taxa_keepall_color3 %>%
     .groups = "drop"
   )
 
-# optional: horizon-type composition (proportions) within 0–150
-hz_props_150 <- layerlab_with_taxa_keepall_color2 %>%
+hz_props_150 <- layerlab_with_taxa_keepall_color3 %>%
   mutate(
-    top = pmax(hzdept, 0, na.rm = TRUE),
-    bot = pmin(hzdepb, max_depth_cm, na.rm = TRUE),
+    top = pmax(hzdept, 0),
+    bot = pmin(hzdepb, max_depth_cm),
     thk = pmax(0, bot - top),
     hz_base2 = if_else(is.na(hz_base) | hz_base == "", "Unknown", hz_base)
   ) %>%
@@ -1015,33 +1049,44 @@ hz_props_150 <- layerlab_with_taxa_keepall_color2 %>%
   )
 
 pedon_pack_150 <- pedon_pack_150 %>%
-  left_join(hz_props_150, by = "peiid")
-
-pedon_pack_150 <- pedon_pack_150 %>%
+  left_join(hz_props_150, by = "peiid") %>%
   left_join(hz_indices, by = "peiid")
-#write csv:
+
 write.csv(pedon_pack_150, "../outputs/pedon_pack_150_02_23_26.csv", row.names = FALSE)
+
 set.seed(42)
 
 dfp <- pedon_pack_150
-
-# keep ID aside
 ids <- dfp %>% select(peiid)
 
-# IMPORTANT: drop taxclname to avoid dummy-name collisions
 feat <- dfp %>%
-  select(-peiid)
+  select(-peiid) %>%
+  mutate(across(where(is.character), ~ str_squish(.x))) %>%
+  mutate(across(where(is.character), ~ if_else(is.na(.x) | .x == "", "Unknown", .x))) %>%
+  mutate(across(where(is.logical), as.integer))
 
 # drop all-NA columns
 all_na <- vapply(feat, function(x) all(is.na(x)), logical(1))
 feat <- feat[, !all_na, drop = FALSE]
 
-# clean categoricals BEFORE recipe
-feat <- feat %>%
-  mutate(across(where(is.character), ~ str_squish(.x))) %>%
-  mutate(across(where(is.character), ~ if_else(is.na(.x) | .x == "", "Unknown", .x)))
+# drop columns with only one unique non-NA value
+one_val <- vapply(
+  feat,
+  function(x) dplyr::n_distinct(x[!is.na(x)]) <= 1,
+  logical(1)
+)
+feat <- feat[, !one_val, drop = FALSE]
+
+# sanity checks
+cat("Rows in dfp:", nrow(dfp), "\n")
+cat("Unique pedons:", dplyr::n_distinct(dfp$peiid), "\n")
+cat("Columns in feat after filtering:", ncol(feat), "\n")
+
+if (nrow(feat) < 3) stop("Too few pedons for UMAP after summarising.")
+if (ncol(feat) < 2) stop("Too few informative columns for UMAP after filtering.")
 
 rec <- recipe(~ ., data = feat) %>%
+  step_string2factor(all_nominal_predictors()) %>%
   step_impute_median(all_numeric_predictors()) %>%
   step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
   step_zv(all_predictors()) %>%
@@ -1050,9 +1095,16 @@ rec <- recipe(~ ., data = feat) %>%
 prep_rec <- prep(rec, training = feat, retain = TRUE)
 X <- bake(prep_rec, new_data = NULL) %>% as.matrix()
 
+cat("Dimensions of X:", dim(X)[1], "rows x", dim(X)[2], "cols\n")
+
+if (ncol(X) < 2) stop("X still has fewer than 2 columns after recipe.")
+if (nrow(X) < 3) stop("X still has too few rows for UMAP.")
+
+nn <- min(25, nrow(X) - 1)
+
 u <- uwot::umap(
   X,
-  n_neighbors = 25,
+  n_neighbors = nn,
   min_dist = 0.1,
   metric = "cosine",
   n_threads = 0
@@ -1060,10 +1112,10 @@ u <- uwot::umap(
 
 pedon_umap <- bind_cols(ids, dfp, tibble(UMAP1 = u[,1], UMAP2 = u[,2]))
 
-ggplot(pedon_umap, aes(UMAP1, UMAP2, color = taxgrtgroup)) +
+ggplot(pedon_umap, aes(UMAP1, UMAP2, color = taxsubgrp_mod1)) +
   geom_point(alpha = 0.85, size = 2) +
   theme_minimal() +
-  labs(color = "Clay %", title = "Pedon-level UMAP (0–150 cm packaged)")
+  labs(color = "taxsubgrp_mod1", title = "Pedon-level UMAP (0–150 cm packaged)")
 ```
 
 
