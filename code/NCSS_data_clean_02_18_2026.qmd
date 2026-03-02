@@ -925,7 +925,7 @@ hz_indices <- layerlab_with_taxa_keepall_color3 %>%
     is_Bt = str_to_lower(coalesce(L_master_code, "")) == "bt",
 
     # argillic-ish: any 't' in suffix (Bt, B't, Btx, Btg, etc.)
-    # NOTE: this is a working rule; later you can refine to true argillic criteria.
+    # NOTE: this is a working rule; later ; can refine to true argillic criteria.
     is_argillic = str_detect(str_to_lower(coalesce(L_suffix, "")), "t"),
 
     is_E = str_to_lower(coalesce(L_master, "")) == "e" |
@@ -965,6 +965,144 @@ hz_indices <- layerlab_with_taxa_keepall_color3 %>%
     .groups = "drop"
   )
 
+
+```
+
+```{r}
+#what to add:
+#Arenic, Grossarenic, and Psammentic:
+    # sandy_mantle_cm
+    # 
+    # depth_to_first_nonsandy_hz
+    # 
+    # pct_sandy_hz_in_pscs
+    # 
+    # mean_sand_in_pscs
+    # 
+    # abrupt_sand_to_bt_transition
+
+#Aquic, Aeric, Oxyaquic:
+    # min_depth_redox_depletions
+    # 
+    # min_depth_redox_concentrations
+    # 
+    # pct_low_chroma_matrix_by_depth
+    # 
+    # gleyed_hz_present
+    # 
+    # seasonal_wetness_proxy_score
+    # 
+    # aquic_upper50cm_flag
+    # 
+    # aquic_upper75cm_flag
+
+#Albic, Albic-like
+    # albic_hz_present
+    # 
+    # depth_to_albic
+    # 
+    # albic_bt_interfingering_flag
+    # 
+    # E_tongue_count
+    # 
+    # E_bt_boundary_irregularity
+    # 
+    # combine with wetness/redox index above.
+
+#Plinthite index:
+    #plinthite_flag
+    #
+    # top_depth_plinthite
+    # 
+    # plinthite_thickness_cm
+    # 
+    # pct_plinthite_by_hz
+    # 
+    # plinthite_within_150cm_flag
+
+#Organic-surface / organic-matter index
+    #organic_surface_thickness_cm
+
+    # O_horizon_total_cm
+    # 
+    # dark_surface_thickness_cm
+    # 
+    # surface_value_chroma_score
+    # 
+    # OC_surface
+    # 
+    # OC_25_125_pattern
+    # 
+    # mineral_vs_organic_upper80cm
+
+#Aggradation / stratification index
+
+    #strata_count
+
+    # texture_break_count
+    # 
+    # buried_A_count
+    # 
+    # lamination_flag
+    # 
+    # irregular_OC_with_depth_flag
+    # 
+    # epipedon_thickness_cm
+    # 
+    # OC_at_125cm
+    # 
+    # cumulic_proxy_score
+
+#Rhodic, Chromic
+    # dominant_subsoil_hue
+    # 
+    # dominant_subsoil_value
+    # 
+    # dominant_subsoil_chroma
+    # 
+    # pct_subsoil_2_5YR_or_redder
+    # 
+    # pct_subsoil_high_chroma
+    # 
+    # redness_index_weighted_by_thickness
+
+#Lamellic, Lamellic-like
+    # lamellae_count
+
+    # lamellae_total_thickness_cm
+    # 
+    # top_depth_first_lamella
+    # 
+    # max_lamella_thickness
+    # 
+    # lamellae_density_per_50cm
+    # 
+    # E_and_Bt_combination_hz_flag
+
+#Terric:
+    # depth_to_first_mineral_below_organic
+    # 
+    # organic_over_mineral_flag
+    # 
+    # buried_organic_flag
+    # 
+    # mineral_substratum_within_control_depth
+
+
+#Argillic:
+    #depth to % clay increase (e.g., 20% increase over previous horizon)
+    #depth of high relative clay
+
+
+#Kandic and Paleudults:
+
+    # CECs of clay fraction
+  
+    # Depth to any CECs that are below 16 cmol in the clay fraction if present
+
+#Alfic/Ultic
+
+    # Use CEC somehow
 
 ```
 
@@ -1168,6 +1306,35 @@ ggplot(pedon_umap, aes(UMAP1, UMAP2)) +
   guides(color = guide_legend(override.aes = list(size = 4)))
 
 ```
+```{r}
+#ultisols suborder only UMAP:
+ultisols_umap <- pedon_umap %>%
+  filter(taxorder == "Ultisols")
+
+
+ggplot(ultisols_umap, aes(UMAP1, UMAP2, color = taxsuborder)) +
+  geom_point(alpha = 0.85, size = 2) +
+  theme_minimal() +
+  labs(color = "Ultisols suborder", title = "UMAP of Ultisols only, colored by suborder") +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+
+#just udults in suborder, colored by great group:
+
+ultisols_udults_umap <- pedon_umap %>%
+  filter(taxorder == "Ultisols", str_detect(tolower(coalesce(taxsuborder, "")), "ult")) %>%
+  mutate(
+    gg_group = coalesce(taxgrtgroup, "Unknown GG")
+  )
+
+ggplot(ultisols_udults_umap, aes(UMAP1, UMAP2, color = gg_group)) +
+  geom_point(alpha = 0.85, size = 2) +
+  theme_minimal() +
+  labs(color = "Great group", title = "UMAP of Ultisols, colored by great group") +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+```
+
 
 ```{r}
 

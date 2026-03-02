@@ -1,0 +1,640 @@
+---
+title: "NCSS_predict_03_02_26"
+format: html
+---
+
+
+###  Packages
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(forcats)
+library(yardstick)
+library(beepr)
+library(rlang)
+library(xgboost)
+library(vip)
+library(Ckmeans.1d.dp)
+# if your setup needs it for xgboost via tidymodels:
+# library(bonsai)
+
+```
+### Data prep and split
+```{r}
+#load dataset:
+#150cm:
+pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_02_26_26.csv")
+
+set.seed(1)
+
+df <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxorder = factor(taxorder)
+  )
+
+# lump rare orders to avoid dropped-level issues in resampling
+min_n <- 15
+df <- df %>%
+  mutate(taxorder = fct_lump_min(taxorder, min = min_n, other_level = "Other"))
+#there is only 4 lol...
+count(df, taxorder, sort = TRUE)
+
+df <- df %>% filter(taxorder != "Other")
+df <- df %>% droplevels()
+count(df, taxorder, sort = TRUE)
+
+split <- initial_split(df, prop = 0.8, strata = taxorder)
+train <- training(split)
+test  <- testing(split)
+```
+
+### Helpers:
+
+```{r}
+#XGBOOST
+# ============================================================
+# HELPERS
+# ============================================================
+
+drop_bad_predictors <- function(train_df, test_df, outcome, id_col = "peiid", drop_cols = NULL) {
+  train_df <- train_df %>% select(-any_of(drop_cols))
+  test_df  <- test_df  %>% select(-any_of(drop_cols))
+  
+  # logical -> integer
+  train_df <- train_df %>% mutate(across(where(is.logical), as.integer))
+  test_df  <- test_df  %>% mutate(across(where(is.logical), as.integer))
+  
+  # drop leftover character predictors except id/outcome
+  char_preds <- names(train_df)[vapply(train_df, is.character, logical(1))]
+  char_preds <- setdiff(char_preds, c(id_col, outcome))
+  
+  if (length(char_preds) > 0) {
+    cat("\nDropping remaining character predictors:\n")
+    print(char_preds)
+    train_df <- train_df %>% select(-all_of(char_preds))
+    test_df  <- test_df  %>% select(-all_of(char_preds))
+  }
+  
+  # drop one-value predictors based on training set
+  pred_names <- setdiff(names(train_df), c(id_col, outcome))
+  
+  one_val <- pred_names[
+    vapply(train_df[pred_names], function(x) {
+      length(unique(x[!is.na(x)])) <= 1
+    }, logical(1))
+  ]
+  
+  if (length(one_val) > 0) {
+    cat("\nDropping one-value predictors:\n")
+    print(one_val)
+    train_df <- train_df %>% select(-all_of(one_val))
+    test_df  <- test_df  %>% select(-all_of(one_val))
+  }
+  
+  list(train = train_df, test = test_df)
+}
+
+
+confidence_summary_tbl <- function(pred_tbl, model_name = "model") {
+  pred_tbl %>%
+    rowwise() %>%
+    mutate(
+      probs  = list(c_across(starts_with(".pred_") & !matches("^\\.pred_class$"))),
+      top1   = max(probs),
+      top2   = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup() %>%
+    summarise(
+      model          = model_name,
+      mean_top1      = mean(top1, na.rm = TRUE),
+      pct_low_top1   = mean(top1 < 0.5, na.rm = TRUE),
+      mean_margin    = mean(margin, na.rm = TRUE),
+      pct_low_margin = mean(margin < 0.15, na.rm = TRUE)
+    )
+}
+
+
+metric_extract_tbl <- function(pred_tbl, outcome, model_name) {
+  outcome_sym <- rlang::sym(outcome)
+  
+  met <- metric_set(accuracy, kap, bal_accuracy)(
+    pred_tbl,
+    truth = !!outcome_sym,
+    estimate = .pred_class
+  )
+  
+  f1 <- f_meas(
+    pred_tbl,
+    truth = !!outcome_sym,
+    estimate = .pred_class,
+    estimator = "macro"
+  )
+  
+  conf <- confidence_summary_tbl(pred_tbl, model_name)
+  
+  tibble(
+    model = model_name,
+    accuracy = met$.estimate[met$.metric == "accuracy"],
+    kap = met$.estimate[met$.metric == "kap"],
+    bal_accuracy = met$.estimate[met$.metric == "bal_accuracy"],
+    f_meas_macro = f1$.estimate,
+    mean_top1 = conf$mean_top1,
+    pct_low_top1 = conf$pct_low_top1,
+    mean_margin = conf$mean_margin,
+    pct_low_margin = conf$pct_low_margin
+  )
+}
+
+
+fit_xgb_direct <- function(train_df, test_df, outcome, id_col = "peiid",
+                           grid_size = 25,
+                           metric_for_best = "bal_accuracy",
+                           trees_range = c(500L, 2500L),
+                           seed_base = 1) {
+  
+  outcome_sym <- rlang::sym(outcome)
+  
+  rec <- recipe(as.formula(paste(outcome, "~ .")), data = train_df) %>%
+    update_role(all_of(id_col), new_role = "id") %>%
+    step_zv(all_predictors()) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+  
+  prep_rec <- prep(rec, training = train_df, retain = TRUE)
+  
+  x_train <- bake(prep_rec, new_data = train_df) %>%
+    select(-all_of(c(outcome, id_col)))
+  
+  x_test <- bake(prep_rec, new_data = test_df) %>%
+    select(-all_of(c(outcome, id_col)))
+  
+  p <- ncol(x_train)
+  if (p < 1) stop("No usable predictor columns remain.")
+  
+  min_class_n <- train_df %>%
+    count(!!outcome_sym) %>%
+    summarise(min_n = min(n)) %>%
+    pull(min_n)
+  
+  v <- min(5, min_class_n)
+  if (v < 2) stop("At least one class has <2 training samples.")
+  
+  xgb_spec <- boost_tree(
+    trees = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    min_n = tune(),
+    sample_size = tune(),
+    mtry = tune(),
+    stop_iter = 25
+  ) %>%
+    set_engine("xgboost") %>%
+    set_mode("classification")
+  
+  wf <- workflow() %>%
+    add_model(xgb_spec) %>%
+    add_recipe(rec)
+  
+  set.seed(seed_base + 1)
+  folds <- vfold_cv(train_df, v = v, strata = !!outcome_sym)
+  
+  xgb_params <- parameters(
+    trees(range = trees_range),
+    tree_depth(range = c(2L, 8L)),
+    learn_rate(range = c(-3, -0.5)),
+    loss_reduction(range = c(-3, 1)),
+    min_n(range = c(2L, 20L)),
+    sample_prop(range = c(0.5, 1.0)),
+    finalize(mtry(), x_train)
+  )
+  
+  set.seed(seed_base + 2)
+  grid <- grid_latin_hypercube(
+    xgb_params,
+    size = grid_size
+  )
+  
+  set.seed(seed_base + 3)
+  tuned <- tune_grid(
+    wf,
+    resamples = folds,
+    grid = grid,
+    metrics = metric_set(bal_accuracy, kap, accuracy)
+  )
+  
+  best <- select_best(tuned, metric = metric_for_best)
+  
+  final_fit <- finalize_workflow(wf, best) %>%
+    fit(train_df)
+  
+  pred <- predict(final_fit, test_df, type = "prob") %>%
+    bind_cols(predict(final_fit, test_df, type = "class")) %>%
+    bind_cols(test_df %>% select(all_of(outcome)))
+  
+  pred_conf <- pred %>%
+    rowwise() %>%
+    mutate(
+      probs = list(c_across(starts_with(".pred_") & !matches("^\\.pred_class$"))),
+      top1   = max(probs),
+      top2   = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup()
+  
+  xgb_fit_obj <- final_fit %>%
+    extract_fit_parsnip() %>%
+    purrr::pluck("fit")
+  
+  importance <- xgboost::xgb.importance(
+    feature_names = names(x_train),
+    model = xgb_fit_obj
+  )
+  
+  list(
+    recipe = rec,
+    prep = prep_rec,
+    x_train = x_train,
+    x_test = x_test,
+    tuned = tuned,
+    best = best,
+    final_fit = final_fit,
+    xgb_fit_obj = xgb_fit_obj,
+    pred = pred_conf,
+    conf_mat = conf_mat(pred_conf, truth = !!outcome_sym, estimate = .pred_class),
+    metrics = metric_set(accuracy, kap, bal_accuracy)(
+      pred_conf, truth = !!outcome_sym, estimate = .pred_class
+    ),
+    f_meas = f_meas(
+      pred_conf, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    importance = importance
+  )
+}
+
+
+report_xgb_results <- function(res, outcome, label, top_n = 20) {
+  cat("\n=== ", label, " BEST XGBOOST SETTINGS ===\n", sep = "")
+  print(res$best)
+  
+  cat("\n=== ", label, " FINAL METRICS ===\n", sep = "")
+  print(res$metrics)
+  print(res$f_meas)
+  
+  cat("\n=== ", label, " CONFUSION MATRIX ===\n", sep = "")
+  print(res$conf_mat)
+  
+  cat("\n=== ", label, " CONFUSION MATRIX SUMMARY ===\n", sep = "")
+  print(summary(res$conf_mat))
+  
+  cat("\n=== ", label, " TOP ", top_n, " XGBOOST PREDICTORS (GAIN) ===\n", sep = "")
+  print(res$importance %>% as_tibble() %>% slice_max(Gain, n = top_n))
+  
+  cat("\n=== ", label, " CONFIDENCE ===\n", sep = "")
+  print(confidence_summary_tbl(res$pred, label))
+}
+
+
+plot_xgb_vip <- function(res, top_n = 20, title = NULL) {
+  p <- vip::vip(res$xgb_fit_obj, num_features = top_n)
+  if (!is.null(title)) p <- p + ggplot2::labs(title = title)
+  p
+}
+
+
+plot_xgb_gain <- function(res, top_n = 20, measure = "Gain", title = NULL) {
+  p <- xgboost::xgb.ggplot.importance(
+    importance_matrix = res$importance,
+    top_n = top_n,
+    measure = measure
+  )
+  if (!is.null(title)) p <- p + ggplot2::labs(title = title)
+  p
+}
+```
+
+### Taxorder
+
+```{r}
+# ============================================================
+# TAXORDER: PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+set.seed(1)
+
+min_n_order <- 15
+
+df_order <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxorder = factor(taxorder)
+  ) %>%
+  mutate(taxorder = forcats::fct_lump_min(taxorder, min = min_n_order, other_level = "Other")) %>%
+  filter(taxorder != "Other") %>%
+  droplevels()
+
+cat("\n=== TAXORDER COUNTS ===\n")
+print(count(df_order, taxorder, sort = TRUE))
+
+split_order <- initial_split(df_order, prop = 0.8, strata = taxorder)
+train_order <- training(split_order)
+test_order  <- testing(split_order)
+
+clean_order <- drop_bad_predictors(
+  train_df = train_order,
+  test_df  = test_order,
+  outcome  = "taxorder",
+  id_col   = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxsuborder", "taxgrtgroup",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  )
+)
+
+res_order_xgb <- fit_xgb_direct(
+  train_df = clean_order$train,
+  test_df  = clean_order$test,
+  outcome  = "taxorder",
+  id_col   = "peiid",
+  grid_size = 25,
+  seed_base = 100
+)
+
+report_xgb_results(res_order_xgb, "taxorder", "TAXORDER XGB", top_n = 20)
+
+plot_xgb_vip(res_order_xgb, top_n = 20, title = "Taxorder XGBoost VIP")
+plot_xgb_gain(res_order_xgb, top_n = 20, title = "Taxorder XGBoost Gain Importance")
+
+beepr::beep("wilhelm")
+```
+
+### Taxsuborder
+
+```{r}
+# ============================================================
+# TAXSUBORDER: PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+set.seed(2)
+
+min_n_so <- 15
+
+df_so <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxsuborder = str_squish(as.character(taxsuborder)),
+    taxsuborder = na_if(taxsuborder, "")
+  ) %>%
+  filter(!is.na(taxsuborder)) %>%
+  mutate(taxsuborder = factor(taxsuborder)) %>%
+  mutate(taxsuborder = forcats::fct_lump_min(taxsuborder, min = min_n_so, other_level = "Other")) %>%
+  filter(taxsuborder != "Other") %>%
+  droplevels()
+
+cat("\n=== TAXSUBORDER COUNTS ===\n")
+print(count(df_so, taxsuborder, sort = TRUE))
+
+split_so <- initial_split(df_so, prop = 0.8, strata = taxsuborder)
+train_so <- training(split_so)
+test_so  <- testing(split_so)
+
+clean_so <- drop_bad_predictors(
+  train_df = train_so,
+  test_df  = test_so,
+  outcome  = "taxsuborder",
+  id_col   = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder",              # drop parent to avoid leakage
+    "taxgrtgroup",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  )
+)
+
+res_so_xgb <- fit_xgb_direct(
+  train_df = clean_so$train,
+  test_df  = clean_so$test,
+  outcome  = "taxsuborder",
+  id_col   = "peiid",
+  grid_size = 25,
+  seed_base = 200
+)
+
+report_xgb_results(res_so_xgb, "taxsuborder", "TAXSUBORDER XGB", top_n = 20)
+
+plot_xgb_vip(res_so_xgb, top_n = 20, title = "Taxsuborder XGBoost VIP")
+plot_xgb_gain(res_so_xgb, top_n = 20, title = "Taxsuborder XGBoost Gain Importance")
+
+beepr::beep("wilhelm")
+```
+
+### Taxgrtgroup
+
+```{r}
+# ============================================================
+# GREAT GROUP: PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+set.seed(11)
+
+min_n_gg <- 20
+
+df_gg <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxgrtgroup = factor(taxgrtgroup)
+  ) %>%
+  filter(!is.na(taxgrtgroup), taxgrtgroup != "") %>%
+  mutate(taxgrtgroup = forcats::fct_lump_min(taxgrtgroup, min = min_n_gg, other_level = "Other")) %>%
+  filter(taxgrtgroup != "Other") %>%
+  droplevels()
+
+cat("\n=== GREAT GROUP COUNTS ===\n")
+print(count(df_gg, taxgrtgroup, sort = TRUE))
+
+split_gg <- initial_split(df_gg, prop = 0.8, strata = taxgrtgroup)
+train_gg <- training(split_gg)
+test_gg  <- testing(split_gg)
+
+clean_gg <- drop_bad_predictors(
+  train_df = train_gg,
+  test_df  = test_gg,
+  outcome  = "taxgrtgroup",
+  id_col   = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxsuborder",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  )
+)
+
+res_gg_xgb <- fit_xgb_direct(
+  train_df = clean_gg$train,
+  test_df  = clean_gg$test,
+  outcome  = "taxgrtgroup",
+  id_col   = "peiid",
+  grid_size = 25,
+  seed_base = 300
+)
+
+report_xgb_results(res_gg_xgb, "taxgrtgroup", "GREAT GROUP XGB", top_n = 20)
+
+plot_xgb_vip(res_gg_xgb, top_n = 20, title = "Great Group XGBoost VIP")
+plot_xgb_gain(res_gg_xgb, top_n = 20, title = "Great Group XGBoost Gain Importance")
+
+beepr::beep("wilhelm")
+```
+
+
+### Taxsubgrp1
+
+```{r}
+# ============================================================
+# SUBGROUP MODIFIER 1: PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+set.seed(21)
+
+min_n_mod1 <- 8
+
+df_mod1 <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxsubgrp_mod1 = str_squish(as.character(taxsubgrp_mod1)),
+    taxsubgrp_mod1 = na_if(taxsubgrp_mod1, "")
+  ) %>%
+  filter(!is.na(taxsubgrp_mod1)) %>%
+  add_count(taxsubgrp_mod1, name = "class_n") %>%
+  filter(class_n >= min_n_mod1) %>%
+  select(-class_n) %>%
+  mutate(taxsubgrp_mod1 = factor(taxsubgrp_mod1)) %>%
+  droplevels()
+
+cat("\n=== MOD1 COUNTS ===\n")
+print(count(df_mod1, taxsubgrp_mod1, sort = TRUE))
+
+split_mod1 <- initial_split(df_mod1, prop = 0.8, strata = taxsubgrp_mod1)
+train_mod1 <- training(split_mod1)
+test_mod1  <- testing(split_mod1)
+
+clean_mod1 <- drop_bad_predictors(
+  train_df = train_mod1,
+  test_df  = test_mod1,
+  outcome  = "taxsubgrp_mod1",
+  id_col   = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxsuborder", "taxgrtgroup",
+    "taxpartsize",
+    "taxsubgrp_mod2", "taxsubgrp_mod3"
+  )
+)
+
+res_mod1_xgb <- fit_xgb_direct(
+  train_df = clean_mod1$train,
+  test_df  = clean_mod1$test,
+  outcome  = "taxsubgrp_mod1",
+  id_col   = "peiid",
+  grid_size = 25,
+  seed_base = 400
+)
+
+report_xgb_results(res_mod1_xgb, "taxsubgrp_mod1", "MOD1 XGB", top_n = 20)
+
+plot_xgb_vip(res_mod1_xgb, top_n = 20, title = "Subgroup Modifier 1 XGBoost VIP")
+plot_xgb_gain(res_mod1_xgb, top_n = 20, title = "Subgroup Modifier 1 XGBoost Gain Importance")
+
+beepr::beep("wilhelm")
+```
+
+### Taxpartsize
+
+```{r}
+# ============================================================
+# TAXPARTSIZE: PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+set.seed(41)
+
+min_n_ps <- 8
+
+df_ps <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxpartsize = str_squish(as.character(taxpartsize)),
+    taxpartsize = na_if(taxpartsize, "")
+  ) %>%
+  filter(!is.na(taxpartsize), taxpartsize != "not used") %>%
+  add_count(taxpartsize, name = "class_n") %>%
+  filter(class_n >= min_n_ps) %>%
+  select(-class_n) %>%
+  mutate(taxpartsize = factor(taxpartsize)) %>%
+  droplevels()
+
+cat("\n=== TAXPARTSIZE COUNTS ===\n")
+print(count(df_ps, taxpartsize, sort = TRUE))
+
+split_ps <- initial_split(df_ps, prop = 0.8, strata = taxpartsize)
+train_ps <- training(split_ps)
+test_ps  <- testing(split_ps)
+
+clean_ps <- drop_bad_predictors(
+  train_df = train_ps,
+  test_df  = test_ps,
+  outcome  = "taxpartsize",
+  id_col   = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxsuborder", "taxgrtgroup",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3"
+  )
+)
+
+res_ps_xgb <- fit_xgb_direct(
+  train_df = clean_ps$train,
+  test_df  = clean_ps$test,
+  outcome  = "taxpartsize",
+  id_col   = "peiid",
+  grid_size = 25,
+  seed_base = 500
+)
+
+report_xgb_results(res_ps_xgb, "taxpartsize", "TAXPARTSIZE XGB", top_n = 20)
+
+plot_xgb_vip(res_ps_xgb, top_n = 20, title = "Tax Part Size XGBoost VIP")
+plot_xgb_gain(res_ps_xgb, top_n = 20, title = "Tax Part Size XGBoost Gain Importance")
+
+beepr::beep("wilhelm")
+```
+
+### Summary
+
+
+```{r}
+# ============================================================
+# SUMMARY TABLE
+# ============================================================
+
+xgb_summary_all <- bind_rows(
+  metric_extract_tbl(res_order_xgb$pred, "taxorder", "taxorder_xgb"),
+  metric_extract_tbl(res_so_xgb$pred, "taxsuborder", "taxsuborder_xgb"),
+  metric_extract_tbl(res_gg_xgb$pred, "taxgrtgroup", "greatgroup_xgb"),
+  metric_extract_tbl(res_mod1_xgb$pred, "taxsubgrp_mod1", "mod1_xgb"),
+  metric_extract_tbl(res_ps_xgb$pred, "taxpartsize", "taxpartsize_xgb")
+) %>%
+  arrange(desc(bal_accuracy), desc(f_meas_macro), desc(accuracy))
+
+cat("\n=== XGBOOST SUMMARY ACROSS TAXA ===\n")
+print(xgb_summary_all)
+
+#Tuned XGBoost models showed strong variation in predictive performance across taxonomic levels. Taxsuborder was the most predictable target (accuracy = 0.947, balanced accuracy = 0.946, macro F1 = 0.895), followed by taxorder (accuracy = 0.892, balanced accuracy = 0.814). Great group prediction was moderate but still substantial (accuracy = 0.729, balanced accuracy = 0.805, macro F1 = 0.693), indicating that profile-derived predictors retained useful information at finer taxonomic levels. Performance declined further for subgroup modifier 1 and tax particle-size class, suggesting that these targets were more difficult to distinguish from the available predictor set and were more affected by class overlap and imbalance.
+```
+

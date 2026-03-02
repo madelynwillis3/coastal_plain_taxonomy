@@ -2,6 +2,7 @@
 title: "NCSS_predict_02_23_26"
 format: html
 ---
+###  Packages
 
 ```{r}
 library(tidyverse)
@@ -11,8 +12,11 @@ library(uwot)
 library(forcats)
 library(beepr)
 library(yardstick)
-```
+library(dbscan)
+library(rlang)
 
+```
+### Data prep and split
 ```{r}
 #load dataset:
 #150cm:
@@ -30,7 +34,7 @@ df <- pedon_pack_150_p %>%
 min_n <- 15
 df <- df %>%
   mutate(taxorder = fct_lump_min(taxorder, min = min_n, other_level = "Other"))
-
+#there is only 4 lol...
 count(df, taxorder, sort = TRUE)
 
 df <- df %>% filter(taxorder != "Other")
@@ -41,6 +45,10 @@ split <- initial_split(df, prop = 0.8, strata = taxorder)
 train <- training(split)
 test  <- testing(split)
 ```
+
+#Taxorder:
+
+### Recipe + TAXORDER UMAP: 
 
 ```{r}
 rec <- recipe(taxorder ~ ., data = train) %>%
@@ -70,7 +78,196 @@ x_test  <- x_test  %>% mutate(across(where(is.logical), as.integer))
 
 # safety: ensure all numeric
 stopifnot(all(vapply(x_train, is.numeric, logical(1))))
+
+
+#HDBSCAN PREP:
+library(dbscan)
+library(rlang)
+
+# ------------------------------------------------------------
+# Add HDBSCAN-derived features to a train/test UMAP pair
+# ------------------------------------------------------------
+add_hdbscan_features <- function(train_umap, test_umap, outcome, minPts = 10) {
+  
+  x_train <- train_umap %>% select(-all_of(outcome))
+  x_test  <- test_umap  %>% select(-all_of(outcome))
+  
+  hdb_fit <- dbscan::hdbscan(
+    as.matrix(x_train),
+    minPts = minPts
+  )
+  
+  test_cluster <- predict(
+    hdb_fit,
+    newdata = as.matrix(x_test),
+    data    = as.matrix(x_train)
+  )
+  
+  levs <- sort(unique(c(hdb_fit$cluster, test_cluster)))
+  
+  train_hdb <- train_umap %>%
+    mutate(
+      hdb_cluster = factor(hdb_fit$cluster, levels = levs),
+      hdb_noise   = factor(if_else(hdb_fit$cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+  
+  test_hdb <- test_umap %>%
+    mutate(
+      hdb_cluster = factor(test_cluster, levels = levs),
+      hdb_noise   = factor(if_else(test_cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+  
+  list(
+    train = train_hdb,
+    test  = test_hdb,
+    fit   = hdb_fit
+  )
+}
+
+# ------------------------------------------------------------
+# Fit tuned RF on any train/test set with a single outcome
+# ------------------------------------------------------------
+fit_tuned_rf_classifier <- function(train_dat,
+                                    test_dat,
+                                    outcome,
+                                    trees = 1500,
+                                    metric_select = "bal_accuracy",
+                                    grid_levels = 4,
+                                    mtry_max = NULL,
+                                    min_n_max = 20,
+                                    seed_cv = 1) {
+  
+  outcome_sym <- rlang::sym(outcome)
+  
+  n_pred <- ncol(train_dat) - 1
+  if (is.null(mtry_max)) {
+    mtry_max <- min(10, n_pred)
+  } else {
+    mtry_max <- min(mtry_max, n_pred)
+  }
+  
+  if (mtry_max < 2) stop("Not enough predictors for tuning mtry.")
+  
+  min_class_train <- train_dat %>%
+    count(!!outcome_sym) %>%
+    summarise(min_n = min(n)) %>%
+    pull(min_n)
+  
+  v <- min(5, min_class_train)
+  if (v < 2) stop("At least one class has <2 training samples.")
+  
+  set.seed(seed_cv)
+  folds <- vfold_cv(train_dat, v = v, strata = !!outcome_sym)
+  
+  rf_spec <- rand_forest(
+    trees = trees,
+    mtry  = tune(),
+    min_n = tune()
+  ) %>%
+    set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+    set_mode("classification")
+  
+  wf <- workflow() %>%
+    add_model(rf_spec) %>%
+    add_formula(as.formula(paste(outcome, "~ .")))
+  
+  grid <- grid_regular(
+    mtry(range = c(2, mtry_max)),
+    min_n(range = c(2, min_n_max)),
+    levels = grid_levels
+  )
+  
+  tuned <- tune_grid(
+    wf,
+    resamples = folds,
+    grid = grid,
+    metrics = metric_set(accuracy, kap, bal_accuracy)
+  )
+  
+  best <- select_best(tuned, metric = metric_select)
+  
+  final_fit <- finalize_workflow(wf, best) %>%
+    fit(train_dat)
+  
+  pred <- predict(final_fit, test_dat, type = "prob") %>%
+    bind_cols(predict(final_fit, test_dat, type = "class")) %>%
+    bind_cols(test_dat %>% select(all_of(outcome)))
+  
+  list(
+    tuned = tuned,
+    best  = best,
+    fit   = final_fit,
+    pred  = pred
+  )
+}
+
+# ------------------------------------------------------------
+# Compare baseline vs HDBSCAN-augmented RF
+# ------------------------------------------------------------
+metric_compare_tbl <- function(pred_base, pred_hdb, outcome) {
+  outcome_sym <- rlang::sym(outcome)
+  
+  base_tbl <- bind_rows(
+    metric_set(accuracy, kap, bal_accuracy)(
+      pred_base, truth = !!outcome_sym, estimate = .pred_class
+    ),
+    precision(
+      pred_base, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    recall(
+      pred_base, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    f_meas(
+      pred_base, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    )
+  ) %>%
+    mutate(model = "baseline", .before = 1)
+  
+  hdb_tbl <- bind_rows(
+    metric_set(accuracy, kap, bal_accuracy)(
+      pred_hdb, truth = !!outcome_sym, estimate = .pred_class
+    ),
+    precision(
+      pred_hdb, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    recall(
+      pred_hdb, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    f_meas(
+      pred_hdb, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    )
+  ) %>%
+    mutate(model = "hdbscan", .before = 1)
+  
+  bind_rows(base_tbl, hdb_tbl)
+}
+
+# ------------------------------------------------------------
+# Confidence summary helper
+# ------------------------------------------------------------
+confidence_summary_tbl <- function(pred_tbl, model_name = "model") {
+  pred_tbl %>%
+    rowwise() %>%
+    mutate(
+      probs  = list(c_across(starts_with(".pred_") & !matches("^\\.pred_class$"))),
+      top1   = max(probs),
+      top2   = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup() %>%
+    summarise(
+      model          = model_name,
+      mean_top1      = mean(top1, na.rm = TRUE),
+      pct_low_top1   = mean(top1 < 0.5, na.rm = TRUE),
+      mean_margin    = mean(margin, na.rm = TRUE),
+      pct_low_margin = mean(margin < 0.15, na.rm = TRUE)
+    )
+}
 ```
+
+### TAXORDER UMAP and DBSCAN
 
 ```{r}
 set.seed(2)
@@ -91,7 +288,141 @@ names(z_test) <- names(z_train)
 
 train_umap <- bind_cols(z_train, taxorder = train$taxorder)
 test_umap  <- bind_cols(z_test,  taxorder = test$taxorder)
+
+
+
+#UMap is a non-linear dimensionality reduction technique that can help capture complex relationships in the data. By reducing the dimensionality of the predictor space, it can make it easier for models like random forests to learn patterns, especially when dealing with many predictors or complex interactions. However, it’s important to note that UMAP is unsupervised and may not always improve performance, so it’s worth comparing results with and without UMAP as part of your modeling workflow.
+
+
 ```
+
+### TAXORDER HDBSCAN
+
+```{r}
+#HDBSCAN:
+
+
+set.seed(4)
+
+# fit HDBSCAN on training UMAP coordinates only
+hdb_fit <- dbscan::hdbscan(
+  as.matrix(z_train),
+  minPts = 10
+)
+
+# predict cluster IDs for test UMAP coordinates
+# 0 = noise
+test_hdb_cluster <- predict(
+  hdb_fit,
+  newdata = as.matrix(z_test),
+  data    = as.matrix(z_train)
+)
+
+# make sure train/test use the same factor levels
+hdb_levels <- sort(unique(c(hdb_fit$cluster, test_hdb_cluster)))
+
+train_umap_hdb <- train_umap %>%
+  mutate(
+    hdb_cluster = factor(hdb_fit$cluster, levels = hdb_levels),
+    hdb_noise   = factor(if_else(hdb_fit$cluster == 0, "noise", "cluster"),
+                         levels = c("cluster", "noise"))
+  )
+
+test_umap_hdb <- test_umap %>%
+  mutate(
+    hdb_cluster = factor(test_hdb_cluster, levels = hdb_levels),
+    hdb_noise   = factor(if_else(test_hdb_cluster == 0, "noise", "cluster"),
+                         levels = c("cluster", "noise"))
+  )
+
+count(train_umap_hdb, hdb_cluster, taxorder, sort = TRUE)
+count(test_umap_hdb,  hdb_cluster, taxorder, sort = TRUE)
+
+rf_spec <- rand_forest(trees = 1000) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+rf_fit_hdb <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_formula(taxorder ~ .) %>%
+  fit(train_umap_hdb)
+
+pred_class_hdb <- predict(rf_fit_hdb, test_umap_hdb, type = "class") %>%
+  bind_cols(test_umap_hdb %>% select(taxorder))
+
+conf_mat(pred_class_hdb, truth = taxorder, estimate = .pred_class)
+accuracy(pred_class_hdb, truth = taxorder, estimate = .pred_class)
+
+rf_spec_tune <- rand_forest(
+  trees = 1000,
+  mtry  = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_tune_hdb <- workflow() %>%
+  add_model(rf_spec_tune) %>%
+  add_formula(taxorder ~ .)
+
+set.seed(3)
+folds_hdb <- vfold_cv(train_umap_hdb, v = 5, strata = taxorder)
+
+p <- ncol(train_umap_hdb) - 1   # minus outcome column
+
+grid_hdb <- grid_regular(
+  mtry(range = c(2, min(12, p))),
+  min_n(range = c(2, 25)),
+  levels = 5
+)
+
+tuned_hdb <- tune_grid(
+  wf_tune_hdb,
+  resamples = folds_hdb,
+  grid = grid_hdb,
+  metrics = metric_set(accuracy, kap)
+)
+
+best_hdb <- select_best(tuned_hdb, metric = "kap")
+
+rf_final_hdb <- finalize_workflow(wf_tune_hdb, best_hdb) %>%
+  fit(train_umap_hdb)
+
+pred_hdb <- predict(rf_final_hdb, test_umap_hdb, type = "prob") %>%
+  bind_cols(predict(rf_final_hdb, test_umap_hdb, type = "class")) %>%
+  bind_cols(test_umap_hdb %>% select(taxorder))
+
+conf_mat(pred_hdb, truth = taxorder, estimate = .pred_class)
+accuracy(pred_hdb, truth = taxorder, estimate = .pred_class)
+kap(pred_hdb, truth = taxorder, estimate = .pred_class)
+bal_accuracy(pred_hdb, truth = taxorder, estimate = .pred_class)
+
+pred_hdb %>%
+  precision(truth = taxorder, estimate = .pred_class, estimator = "macro")
+
+pred_hdb %>%
+  recall(truth = taxorder, estimate = .pred_class, estimator = "macro")
+
+pred_hdb %>%
+  f_meas(truth = taxorder, estimate = .pred_class, estimator = "macro")
+
+pred_conf_hdb <- pred_hdb %>%
+  rowwise() %>%
+  mutate(
+    max_prob = max(c_across(starts_with(".pred_") & !matches("^\\.pred_class$")))
+  ) %>%
+  ungroup() %>%
+  summarise(
+    mean_max_prob = mean(max_prob),
+    pct_low_conf  = mean(max_prob < 0.5)
+  )
+
+pred_conf_hdb
+
+
+```
+
+### TAXORDER RF on UMAP only (no HDBSCAN features)
 
 ```{r}
 rf_spec <- rand_forest(trees = 1000) %>%
@@ -110,6 +441,8 @@ conf_mat(pred_class, truth = taxorder, estimate = .pred_class)
 accuracy(pred_class, truth = taxorder, estimate = .pred_class)
 ```
 
+### TAXORDER RF with UMAP + HDBSCAN features (tuned)
+
 ```{r}
 rf_spec_tune <- rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>%
   set_engine("ranger", probability = TRUE, importance = "permutation") %>%
@@ -119,7 +452,7 @@ wf_tune <- workflow() %>%
   add_model(rf_spec_tune) %>%
   add_formula(taxorder ~ .)
 
-set.seed(3)
+set.seed(4)
 folds <- vfold_cv(train_umap, v = 5, strata = taxorder)
 
 grid <- grid_regular(
@@ -157,6 +490,8 @@ pred_conf
 
 ```
 
+### TAXORDER Model eval
+
 ```{r}
 conf_mat(pred, truth = taxorder, estimate = .pred_class)
 
@@ -185,6 +520,7 @@ recall(pred_class, truth = taxorder, estimate = .pred_class, estimator = "macro"
 precision(pred_class, truth = taxorder, estimate = .pred_class, estimator = "macro")
 ```
 
+### TAXORDER performance
 
 ```{r}
 # 1) Class counts (train + test)
@@ -221,6 +557,248 @@ print(summary(conf_mat(pred, truth = taxorder, estimate = .pred_class)))
 
 #So: the model works, but it’s blind to Alfisols.
 ```
+
+```{r}
+#hdbscan vs raw umap:
+cat("\n=== BASELINE RF (UMAP only) ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred, truth = taxorder, estimate = .pred_class))
+print(precision(pred, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+print(recall(pred, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+print(f_meas(pred, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+
+cat("\n=== RF + HDBSCAN FEATURES ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(pred_hdb, truth = taxorder, estimate = .pred_class))
+print(precision(pred_hdb, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+print(recall(pred_hdb, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+print(f_meas(pred_hdb, truth = taxorder, estimate = .pred_class, estimator = "macro"))
+```
+
+### Taxsuborder:
+
+```{r}
+# ============================================================
+# TAXSUBORDER MODEL (taxsuborder)
+# ============================================================
+
+set.seed(51)
+
+min_n_so <- 15   # bump to 20 if CV gets unstable
+
+df_so <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxsuborder = str_squish(as.character(taxsuborder)),
+    taxsuborder = na_if(taxsuborder, "")
+  ) %>%
+  filter(!is.na(taxsuborder)) %>%
+  mutate(taxsuborder = factor(taxsuborder))
+
+# lump rare classes
+df_so <- df_so %>%
+  mutate(
+    taxsuborder = fct_lump_min(
+      taxsuborder,
+      min = min_n_so,
+      other_level = "Other"
+    )
+  ) %>%
+  filter(taxsuborder != "Other") %>%
+  droplevels()
+
+cat("\n=== TAXSUBORDER COUNTS ===\n")
+print(count(df_so, taxsuborder, sort = TRUE))
+
+split_so <- initial_split(df_so, prop = 0.8, strata = taxsuborder)
+train_so <- training(split_so)
+test_so  <- testing(split_so)
+rec_so <- recipe(taxsuborder ~ ., data = train_so) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder",       # important: remove parent class
+    "taxgrtgroup",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  ))) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_so <- prep(rec_so)
+
+x_train_so <- bake(prep_rec_so, new_data = train_so) %>%
+  select(-taxsuborder, -peiid)
+
+x_test_so <- bake(prep_rec_so, new_data = test_so) %>%
+  select(-taxsuborder, -peiid)
+
+x_train_so <- x_train_so %>% mutate(across(where(is.logical), as.integer))
+x_test_so  <- x_test_so  %>% mutate(across(where(is.logical), as.integer))
+
+stopifnot(all(vapply(x_train_so, is.numeric, logical(1))))
+
+cat("\nTrain rows:", nrow(x_train_so), "\n")
+cat("Train cols:", ncol(x_train_so), "\n")
+set.seed(52)
+
+n_neighbors_so  <- min(15, nrow(x_train_so) - 1)
+n_components_so <- min(12, ncol(x_train_so))
+
+umap_fit_so <- uwot::umap(
+  as.matrix(x_train_so),
+  n_components = n_components_so,
+  n_neighbors = n_neighbors_so,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+
+z_train_so <- as.data.frame(umap_fit_so$embedding)
+names(z_train_so) <- paste0("U", seq_len(ncol(z_train_so)))
+
+z_test_so <- as.data.frame(uwot::umap_transform(as.matrix(x_test_so), umap_fit_so))
+names(z_test_so) <- names(z_train_so)
+
+train_umap_so <- bind_cols(z_train_so, taxsuborder = train_so$taxsuborder)
+test_umap_so  <- bind_cols(z_test_so,  taxsuborder = test_so$taxsuborder)
+# ------------------------------------------------------------
+# TAXSUBORDER BASELINE RF
+# ------------------------------------------------------------
+rf_so_base <- fit_tuned_rf_classifier(
+  train_dat      = train_umap_so,
+  test_dat       = test_umap_so,
+  outcome        = "taxsuborder",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 5,
+  mtry_max       = min(12, ncol(train_umap_so) - 1),
+  min_n_max      = 25,
+  seed_cv        = 53
+)
+
+pred_so <- rf_so_base$pred
+
+cat("\n=== TAXSUBORDER BASELINE METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(
+  pred_so,
+  truth = taxsuborder,
+  estimate = .pred_class
+))
+
+print(precision(
+  pred_so,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+print(recall(
+  pred_so,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+print(f_meas(
+  pred_so,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+cat("\n=== TAXSUBORDER BASELINE CONFUSION MATRIX ===\n")
+print(conf_mat(pred_so, truth = taxsuborder, estimate = .pred_class))
+
+cat("\n=== TAXSUBORDER BASELINE CONFUSION MATRIX SUMMARY ===\n")
+print(summary(conf_mat(pred_so, truth = taxsuborder, estimate = .pred_class)))
+
+cat("\n=== TAXSUBORDER BASELINE CONFIDENCE ===\n")
+print(confidence_summary_tbl(pred_so, "baseline"))
+# ------------------------------------------------------------
+# TAXSUBORDER HDBSCAN + RF
+# ------------------------------------------------------------
+hdb_so <- add_hdbscan_features(
+  train_umap = train_umap_so,
+  test_umap  = test_umap_so,
+  outcome    = "taxsuborder",
+  minPts     = 10
+)
+
+cat("\n=== TAXSUBORDER HDBSCAN CLUSTER COUNTS (TRAIN) ===\n")
+print(count(hdb_so$train, hdb_cluster, taxsuborder, sort = TRUE))
+
+rf_so_hdb <- fit_tuned_rf_classifier(
+  train_dat      = hdb_so$train,
+  test_dat       = hdb_so$test,
+  outcome        = "taxsuborder",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 5,
+  mtry_max       = min(12, ncol(hdb_so$train) - 1),
+  min_n_max      = 25,
+  seed_cv        = 54
+)
+
+pred_so_hdb <- rf_so_hdb$pred
+
+cat("\n=== TAXSUBORDER HDBSCAN METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(
+  pred_so_hdb,
+  truth = taxsuborder,
+  estimate = .pred_class
+))
+
+print(precision(
+  pred_so_hdb,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+print(recall(
+  pred_so_hdb,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+print(f_meas(
+  pred_so_hdb,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+cat("\n=== TAXSUBORDER HDBSCAN CONFUSION MATRIX ===\n")
+print(conf_mat(pred_so_hdb, truth = taxsuborder, estimate = .pred_class))
+
+cat("\n=== TAXSUBORDER HDBSCAN CONFUSION MATRIX SUMMARY ===\n")
+print(summary(conf_mat(pred_so_hdb, truth = taxsuborder, estimate = .pred_class)))
+
+cat("\n=== TAXSUBORDER HDBSCAN CONFIDENCE ===\n")
+print(confidence_summary_tbl(pred_so_hdb, "hdbscan"))
+cat("\n=== TAXSUBORDER: BASELINE VS HDBSCAN ===\n")
+print(metric_compare_tbl(pred_so, pred_so_hdb, outcome = "taxsuborder"))
+
+cat("\n=== TAXSUBORDER CONFIDENCE: BASELINE VS HDBSCAN ===\n")
+print(bind_rows(
+  confidence_summary_tbl(pred_so, "baseline"),
+  confidence_summary_tbl(pred_so_hdb, "hdbscan")
+))
+
+cat("\n=== TAXSUBORDER TRUTH VS PREDICTED COUNTS (BASELINE) ===\n")
+print(pred_so %>% count(taxsuborder, .pred_class, sort = TRUE))
+
+cat("\n=== TAXSUBORDER TRUTH VS PREDICTED COUNTS (HDBSCAN) ===\n")
+print(pred_so_hdb %>% count(taxsuborder, .pred_class, sort = TRUE))
+```
+
+#GreatGroup:
+
 
 
 ```{r}
@@ -363,9 +941,754 @@ pred_conf_gg <- pred_gg %>%
     pct_low_conf  = mean(max_prob < 0.5)
   )
 
-cat("\n=== GREAT GROUP CONFIDENCE ===\n")
-print(pred_conf_gg)
+# cat("\n=== GREAT GROUP CONFIDENCE ===\n")
+# print(pred_conf_gg)
+
+# ------------------------------------------------------------
+# GREAT GROUP: HDBSCAN + RF
+# ------------------------------------------------------------
+hdb_gg <- add_hdbscan_features(
+  train_umap = train_umap_gg,
+  test_umap  = test_umap_gg,
+  outcome    = "taxgrtgroup",
+  minPts     = 10
+)
+
+cat("\n=== GREAT GROUP HDBSCAN CLUSTER COUNTS (TRAIN) ===\n")
+print(count(hdb_gg$train, hdb_cluster, taxgrtgroup, sort = TRUE))
+
+rf_gg_hdb <- fit_tuned_rf_classifier(
+  train_dat      = hdb_gg$train,
+  test_dat       = hdb_gg$test,
+  outcome        = "taxgrtgroup",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 5,
+  mtry_max       = min(15, ncol(hdb_gg$train) - 1),
+  min_n_max      = 30,
+  seed_cv        = 113
+)
+
+pred_gg_hdb <- rf_gg_hdb$pred
+
+cat("\n=== GREAT GROUP: BASELINE VS HDBSCAN ===\n")
+print(metric_compare_tbl(pred_gg, pred_gg_hdb, outcome = "taxgrtgroup"))
+
+cat("\n=== GREAT GROUP CONFIDENCE: BASELINE VS HDBSCAN ===\n")
+print(bind_rows(
+  confidence_summary_tbl(pred_gg,     "baseline"),
+  confidence_summary_tbl(pred_gg_hdb, "hdbscan")
+))
+
+cat("\n=== GREAT GROUP HDBSCAN CONFUSION MATRIX ===\n")
+print(conf_mat(pred_gg_hdb, truth = taxgrtgroup, estimate = .pred_class))
+
 ```
+### Hyp. Tuning Test for GG:
+
+```{r}
+#hyperparameter tuning for GG
+# ------------------------------------------------------------
+# Extract one-row metric summary for easy comparison
+# ------------------------------------------------------------
+metric_extract_tbl <- function(pred_tbl, outcome, model_name) {
+  outcome_sym <- rlang::sym(outcome)
+  
+  met <- metric_set(accuracy, kap, bal_accuracy)(
+    pred_tbl,
+    truth = !!outcome_sym,
+    estimate = .pred_class
+  )
+  
+  f1 <- f_meas(
+    pred_tbl,
+    truth = !!outcome_sym,
+    estimate = .pred_class,
+    estimator = "macro"
+  )
+  
+  conf <- confidence_summary_tbl(pred_tbl, model_name)
+  
+  tibble(
+    model = model_name,
+    accuracy = met$.estimate[met$.metric == "accuracy"],
+    kap = met$.estimate[met$.metric == "kap"],
+    bal_accuracy = met$.estimate[met$.metric == "bal_accuracy"],
+    f_meas_macro = f1$.estimate,
+    mean_top1 = conf$mean_top1,
+    pct_low_top1 = conf$pct_low_top1,
+    mean_margin = conf$mean_margin,
+    pct_low_margin = conf$pct_low_margin
+  )
+}
+
+# ============================================================
+# GREAT GROUP: SMALL TUNING SCREEN FOR UMAP + HDBSCAN + RF
+# ============================================================
+
+set.seed(120)
+
+# -----------------------------
+# 1) Inner train/validation split from the existing training set
+# -----------------------------
+split_gg_inner <- initial_split(train_gg, prop = 0.8, strata = taxgrtgroup)
+train_gg_inner <- training(split_gg_inner)
+val_gg_inner   <- testing(split_gg_inner)
+
+# same preprocessing logic as your main GG workflow
+rec_gg_inner <- recipe(taxgrtgroup ~ ., data = train_gg_inner) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  ))) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_gg_inner <- prep(rec_gg_inner)
+
+x_train_gg_inner <- bake(prep_rec_gg_inner, new_data = train_gg_inner) %>%
+  select(-taxgrtgroup, -peiid)
+
+x_val_gg_inner <- bake(prep_rec_gg_inner, new_data = val_gg_inner) %>%
+  select(-taxgrtgroup, -peiid)
+
+x_train_gg_inner <- x_train_gg_inner %>% mutate(across(where(is.logical), as.integer))
+x_val_gg_inner   <- x_val_gg_inner   %>% mutate(across(where(is.logical), as.integer))
+
+stopifnot(all(vapply(x_train_gg_inner, is.numeric, logical(1))))
+
+# -----------------------------
+# 2) Small screening grid
+# -----------------------------
+grid_umap_hdb_gg <- tidyr::crossing(
+  n_components = c(10, 15),
+  n_neighbors  = c(10, 30),
+  min_dist     = c(0.01, 0.10),
+  minPts       = c(5, 10)
+)
+
+cat("\n=== GREAT GROUP SCREEN GRID ===\n")
+print(grid_umap_hdb_gg)
+
+# -----------------------------
+# 3) Screen combinations on inner validation set
+# -----------------------------
+screen_gg <- purrr::pmap_dfr(
+  grid_umap_hdb_gg,
+  function(n_components, n_neighbors, min_dist, minPts) {
+    
+    tryCatch({
+      set.seed(1000 + n_components + n_neighbors + round(min_dist * 100) + minPts)
+      
+      umap_fit_inner <- uwot::umap(
+        as.matrix(x_train_gg_inner),
+        n_components = n_components,
+        n_neighbors  = min(n_neighbors, nrow(x_train_gg_inner) - 1),
+        min_dist     = min_dist,
+        metric       = "euclidean",
+        ret_model    = TRUE
+      )
+      
+      z_train_inner <- as.data.frame(umap_fit_inner$embedding)
+      names(z_train_inner) <- paste0("U", seq_len(ncol(z_train_inner)))
+      
+      z_val_inner <- as.data.frame(
+        uwot::umap_transform(as.matrix(x_val_gg_inner), umap_fit_inner)
+      )
+      names(z_val_inner) <- names(z_train_inner)
+      
+      train_umap_inner <- bind_cols(
+        z_train_inner,
+        taxgrtgroup = train_gg_inner$taxgrtgroup
+      )
+      
+      val_umap_inner <- bind_cols(
+        z_val_inner,
+        taxgrtgroup = val_gg_inner$taxgrtgroup
+      )
+      
+      hdb_inner <- add_hdbscan_features(
+        train_umap = train_umap_inner,
+        test_umap  = val_umap_inner,
+        outcome    = "taxgrtgroup",
+        minPts     = minPts
+      )
+      
+      rf_inner <- fit_tuned_rf_classifier(
+        train_dat      = hdb_inner$train,
+        test_dat       = hdb_inner$test,
+        outcome        = "taxgrtgroup",
+        trees          = 1500,
+        metric_select  = "bal_accuracy",
+        grid_levels    = 4,
+        mtry_max       = min(ncol(hdb_inner$train) - 1, 12),
+        min_n_max      = 30,
+        seed_cv        = 200 + n_components + n_neighbors + minPts
+      )
+      
+      pred_val <- rf_inner$pred
+      
+      met <- metric_set(accuracy, kap, bal_accuracy)(
+        pred_val,
+        truth = taxgrtgroup,
+        estimate = .pred_class
+      )
+      
+      f1 <- f_meas(
+        pred_val,
+        truth = taxgrtgroup,
+        estimate = .pred_class,
+        estimator = "macro"
+      )
+      
+      conf <- confidence_summary_tbl(pred_val, "screen")
+      
+      tibble(
+        n_components = n_components,
+        n_neighbors  = n_neighbors,
+        min_dist     = min_dist,
+        minPts       = minPts,
+        accuracy     = met$.estimate[met$.metric == "accuracy"],
+        kap          = met$.estimate[met$.metric == "kap"],
+        bal_accuracy = met$.estimate[met$.metric == "bal_accuracy"],
+        f_meas_macro = f1$.estimate,
+        mean_top1    = conf$mean_top1,
+        pct_low_top1 = conf$pct_low_top1,
+        mean_margin  = conf$mean_margin,
+        pct_low_margin = conf$pct_low_margin,
+        rf_mtry      = rf_inner$best$mtry,
+        rf_min_n     = rf_inner$best$min_n,
+        status       = "ok"
+      )
+      
+    }, error = function(e) {
+      tibble(
+        n_components = n_components,
+        n_neighbors  = n_neighbors,
+        min_dist     = min_dist,
+        minPts       = minPts,
+        accuracy     = NA_real_,
+        kap          = NA_real_,
+        bal_accuracy = NA_real_,
+        f_meas_macro = NA_real_,
+        mean_top1    = NA_real_,
+        pct_low_top1 = NA_real_,
+        mean_margin  = NA_real_,
+        pct_low_margin = NA_real_,
+        rf_mtry      = NA_integer_,
+        rf_min_n     = NA_integer_,
+        status       = conditionMessage(e)
+      )
+    })
+  }
+)
+beepr::beep("wilhelm")
+cat("\n=== GREAT GROUP SCREEN RESULTS ===\n")
+print(
+  screen_gg %>%
+    arrange(desc(bal_accuracy), desc(f_meas_macro), desc(accuracy))
+)
+
+best_screen_gg <- screen_gg %>%
+  filter(status == "ok") %>%
+  arrange(desc(bal_accuracy), desc(f_meas_macro), desc(accuracy)) %>%
+  dplyr::slice(1)
+
+cat("\n=== BEST SCREENED SETTINGS ===\n")
+print(best_screen_gg)
+
+# -----------------------------
+# 4) Refit best combo on FULL train_gg, score on test_gg
+# -----------------------------
+best_n_components <- best_screen_gg$n_components[[1]]
+best_n_neighbors  <- best_screen_gg$n_neighbors[[1]]
+best_min_dist     <- best_screen_gg$min_dist[[1]]
+best_minPts       <- best_screen_gg$minPts[[1]]
+
+set.seed(130)
+
+umap_fit_gg_tuned <- uwot::umap(
+  as.matrix(x_train_gg),
+  n_components = best_n_components,
+  n_neighbors  = min(best_n_neighbors, nrow(x_train_gg) - 1),
+  min_dist     = best_min_dist,
+  metric       = "euclidean",
+  ret_model    = TRUE
+)
+
+z_train_gg_tuned <- as.data.frame(umap_fit_gg_tuned$embedding)
+names(z_train_gg_tuned) <- paste0("U", seq_len(ncol(z_train_gg_tuned)))
+
+z_test_gg_tuned <- as.data.frame(
+  uwot::umap_transform(as.matrix(x_test_gg), umap_fit_gg_tuned)
+)
+names(z_test_gg_tuned) <- names(z_train_gg_tuned)
+
+train_umap_gg_tuned <- bind_cols(
+  z_train_gg_tuned,
+  taxgrtgroup = train_gg$taxgrtgroup
+)
+
+test_umap_gg_tuned <- bind_cols(
+  z_test_gg_tuned,
+  taxgrtgroup = test_gg$taxgrtgroup
+)
+
+hdb_gg_tuned <- add_hdbscan_features(
+  train_umap = train_umap_gg_tuned,
+  test_umap  = test_umap_gg_tuned,
+  outcome    = "taxgrtgroup",
+  minPts     = best_minPts
+)
+
+rf_gg_hdb_tuned <- fit_tuned_rf_classifier(
+  train_dat      = hdb_gg_tuned$train,
+  test_dat       = hdb_gg_tuned$test,
+  outcome        = "taxgrtgroup",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 5,
+  mtry_max       = min(ncol(hdb_gg_tuned$train) - 1, 15),
+  min_n_max      = 30,
+  seed_cv        = 131
+)
+
+pred_gg_hdb_tuned <- rf_gg_hdb_tuned$pred
+
+cat("\n=== TUNED GREAT GROUP HDBSCAN CONFUSION MATRIX ===\n")
+print(conf_mat(pred_gg_hdb_tuned, truth = taxgrtgroup, estimate = .pred_class))
+
+cat("\n=== TUNED GREAT GROUP HDBSCAN METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(
+  pred_gg_hdb_tuned,
+  truth = taxgrtgroup,
+  estimate = .pred_class
+))
+print(f_meas(
+  pred_gg_hdb_tuned,
+  truth = taxgrtgroup,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+cat("\n=== GREAT GROUP MODEL COMPARISON ===\n")
+print(bind_rows(
+  metric_extract_tbl(pred_gg,           "taxgrtgroup", "umap_rf_baseline"),
+  metric_extract_tbl(pred_gg_hdb,       "taxgrtgroup", "umap_hdb_rf_baseline"),
+  metric_extract_tbl(pred_gg_hdb_tuned, "taxgrtgroup", "umap_hdb_rf_tuned"),
+  metric_extract_tbl(res_gg$pred,       "taxgrtgroup", "rf_no_umap")
+) %>%
+  arrange(desc(bal_accuracy), desc(f_meas_macro), desc(accuracy)))
+```
+
+### XGBOOST GG
+
+```{r}
+library(xgboost)
+#XGBOOST hypertune hdbscan umap for GG:
+# ------------------------------------------------------------
+# ============================================================
+# GREAT GROUP: TUNED UMAP + HDBSCAN + XGBOOST
+# ============================================================
+
+# If needed on your machine:
+# library(bonsai)
+
+set.seed(140)
+
+# ------------------------------------------------------------
+# 1) Reuse best UMAP + HDBSCAN settings from your tuning screen
+# ------------------------------------------------------------
+best_n_components <- 15
+best_n_neighbors  <- 10
+best_min_dist     <- 0.01
+best_minPts       <- 5
+
+# rebuild tuned UMAP on full train/test
+umap_fit_gg_xgb <- uwot::umap(
+  as.matrix(x_train_gg),
+  n_components = best_n_components,
+  n_neighbors  = min(best_n_neighbors, nrow(x_train_gg) - 1),
+  min_dist     = best_min_dist,
+  metric       = "euclidean",
+  ret_model    = TRUE
+)
+
+z_train_gg_xgb <- as.data.frame(umap_fit_gg_xgb$embedding)
+names(z_train_gg_xgb) <- paste0("U", seq_len(ncol(z_train_gg_xgb)))
+
+z_test_gg_xgb <- as.data.frame(
+  uwot::umap_transform(as.matrix(x_test_gg), umap_fit_gg_xgb)
+)
+names(z_test_gg_xgb) <- names(z_train_gg_xgb)
+
+train_umap_gg_xgb <- bind_cols(
+  z_train_gg_xgb,
+  taxgrtgroup = train_gg$taxgrtgroup
+)
+
+test_umap_gg_xgb <- bind_cols(
+  z_test_gg_xgb,
+  taxgrtgroup = test_gg$taxgrtgroup
+)
+
+# add tuned HDBSCAN features
+hdb_gg_xgb <- add_hdbscan_features(
+  train_umap = train_umap_gg_xgb,
+  test_umap  = test_umap_gg_xgb,
+  outcome    = "taxgrtgroup",
+  minPts     = best_minPts
+)
+
+cat("\n=== GREAT GROUP HDBSCAN CLUSTER COUNTS FOR XGBOOST (TRAIN) ===\n")
+print(count(hdb_gg_xgb$train, hdb_cluster, taxgrtgroup, sort = TRUE))
+
+# ------------------------------------------------------------
+# 2) XGBoost specification
+# ------------------------------------------------------------
+xgb_spec_gg <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  stop_iter = 25
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf_gg <- workflow() %>%
+  add_model(xgb_spec_gg) %>%
+  add_formula(taxgrtgroup ~ .)
+
+# ------------------------------------------------------------
+# 3) CV folds
+# ------------------------------------------------------------
+set.seed(141)
+folds_gg_xgb <- vfold_cv(hdb_gg_xgb$train, v = 5, strata = taxgrtgroup)
+
+# ------------------------------------------------------------
+# 4) Tuning grid
+# ------------------------------------------------------------
+p_xgb <- ncol(hdb_gg_xgb$train) - 1
+
+xgb_params_gg <- parameters(
+  trees(range = c(500L, 2500L)),
+  tree_depth(range = c(2L, 8L)),
+  learn_rate(range = c(-3, -0.5)),         # log10 scale
+  loss_reduction(range = c(-3, 1)),        # log10 scale
+  min_n(range = c(2L, 20L)),
+  sample_prop(range = c(0.5, 1.0)),
+  finalize(mtry(), hdb_gg_xgb$train %>% select(-taxgrtgroup))
+)
+
+set.seed(142)
+grid_xgb_gg <- grid_latin_hypercube(
+  xgb_params_gg,
+  size = 25
+)
+
+cat("\n=== XGBOOST GRID (first rows) ===\n")
+print(head(grid_xgb_gg))
+
+# ------------------------------------------------------------
+# 5) Tune XGBoost
+# ------------------------------------------------------------
+set.seed(143)
+tuned_xgb_gg <- tune_grid(
+  xgb_wf_gg,
+  resamples = folds_gg_xgb,
+  grid = grid_xgb_gg,
+  metrics = metric_set(bal_accuracy, kap, accuracy)
+)
+
+cat("\n=== XGBOOST TUNING METRICS ===\n")
+print(collect_metrics(tuned_xgb_gg))
+
+cat("\n=== XGBOOST TUNING NOTES ===\n")
+print(collect_notes(tuned_xgb_gg))
+
+best_xgb_gg <- select_best(tuned_xgb_gg, metric = "bal_accuracy")
+
+cat("\n=== BEST XGBOOST SETTINGS ===\n")
+print(best_xgb_gg)
+
+# ------------------------------------------------------------
+# 6) Final fit on full training data
+# ------------------------------------------------------------
+xgb_final_gg <- finalize_workflow(xgb_wf_gg, best_xgb_gg) %>%
+  fit(hdb_gg_xgb$train)
+
+pred_gg_hdb_xgb <- predict(xgb_final_gg, hdb_gg_xgb$test, type = "prob") %>%
+  bind_cols(predict(xgb_final_gg, hdb_gg_xgb$test, type = "class")) %>%
+  bind_cols(hdb_gg_xgb$test %>% select(taxgrtgroup))
+
+cat("\n=== GREAT GROUP UMAP + HDBSCAN + XGBOOST CONFUSION MATRIX ===\n")
+print(conf_mat(pred_gg_hdb_xgb, truth = taxgrtgroup, estimate = .pred_class))
+
+cat("\n=== GREAT GROUP UMAP + HDBSCAN + XGBOOST METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(
+  pred_gg_hdb_xgb,
+  truth = taxgrtgroup,
+  estimate = .pred_class
+))
+print(f_meas(
+  pred_gg_hdb_xgb,
+  truth = taxgrtgroup,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+cat("\n=== GREAT GROUP UMAP + HDBSCAN + XGBOOST CONFIDENCE ===\n")
+print(confidence_summary_tbl(pred_gg_hdb_xgb, "umap_hdb_xgb_tuned"))
+
+# ------------------------------------------------------------
+# 7) Compare to your other great-group models
+# ------------------------------------------------------------
+cat("\n=== GREAT GROUP FULL MODEL COMPARISON ===\n")
+print(
+  bind_rows(
+    metric_extract_tbl(pred_gg,               "taxgrtgroup", "umap_rf_baseline"),
+    metric_extract_tbl(pred_gg_hdb,           "taxgrtgroup", "umap_hdb_rf_baseline"),
+    metric_extract_tbl(pred_gg_hdb_tuned,     "taxgrtgroup", "umap_hdb_rf_tuned"),
+    metric_extract_tbl(pred_gg_hdb_xgb,       "taxgrtgroup", "umap_hdb_xgb_tuned"),
+    metric_extract_tbl(res_gg$pred,           "taxgrtgroup", "rf_no_umap")
+  ) %>%
+    arrange(desc(bal_accuracy), desc(f_meas_macro), desc(accuracy))
+)
+
+```
+### XGBOOST GG plain
+
+```{r}
+# ============================================================
+# GREAT GROUP: PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+# If needed on your machine:
+# library(bonsai)
+
+set.seed(150)
+
+# ------------------------------------------------------------
+# 1) Use the exact same cleaned train/test data as RF no UMAP
+# ------------------------------------------------------------
+train_gg_xgb <- clean_gg$train
+test_gg_xgb  <- clean_gg$test
+
+# same preprocessing style as fit_rf_direct()
+rec_gg_xgb <- recipe(taxgrtgroup ~ ., data = train_gg_xgb) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_gg_xgb <- prep(rec_gg_xgb, training = train_gg_xgb, retain = TRUE)
+
+x_train_gg_xgb <- bake(prep_gg_xgb, new_data = train_gg_xgb) %>%
+  select(-taxgrtgroup, -peiid)
+
+x_test_gg_xgb <- bake(prep_gg_xgb, new_data = test_gg_xgb) %>%
+  select(-taxgrtgroup, -peiid)
+
+p_xgb <- ncol(x_train_gg_xgb)
+if (p_xgb < 1) stop("No usable predictor columns remain for XGBoost.")
+
+# ------------------------------------------------------------
+# 2) XGBoost spec
+# ------------------------------------------------------------
+xgb_spec_gg_no_umap <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  stop_iter = 25
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf_gg_no_umap <- workflow() %>%
+  add_model(xgb_spec_gg_no_umap) %>%
+  add_recipe(rec_gg_xgb)
+
+# ------------------------------------------------------------
+# 3) CV folds
+# ------------------------------------------------------------
+set.seed(151)
+folds_gg_xgb_no_umap <- vfold_cv(train_gg_xgb, v = 5, strata = taxgrtgroup)
+
+# ------------------------------------------------------------
+# 4) Tune over a Latin hypercube grid
+# ------------------------------------------------------------
+xgb_params_gg_no_umap <- parameters(
+  trees(range = c(500L, 2500L)),
+  tree_depth(range = c(2L, 8L)),
+  learn_rate(range = c(-3, -0.5)),      # log10 scale
+  loss_reduction(range = c(-3, 1)),     # log10 scale
+  min_n(range = c(2L, 20L)),
+  sample_prop(range = c(0.5, 1.0)),
+  finalize(mtry(), x_train_gg_xgb)
+)
+
+set.seed(152)
+grid_gg_xgb_no_umap <- grid_latin_hypercube(
+  xgb_params_gg_no_umap,
+  size = 25
+)
+
+cat("\n=== NO-UMAP XGBOOST GRID (first rows) ===\n")
+print(head(grid_gg_xgb_no_umap))
+
+# ------------------------------------------------------------
+# 5) Tune XGBoost
+# ------------------------------------------------------------
+set.seed(153)
+tuned_gg_xgb_no_umap <- tune_grid(
+  xgb_wf_gg_no_umap,
+  resamples = folds_gg_xgb_no_umap,
+  grid = grid_gg_xgb_no_umap,
+  metrics = metric_set(bal_accuracy, kap, accuracy)
+)
+
+cat("\n=== NO-UMAP XGBOOST TUNING METRICS ===\n")
+print(collect_metrics(tuned_gg_xgb_no_umap))
+
+cat("\n=== NO-UMAP XGBOOST TUNING NOTES ===\n")
+print(collect_notes(tuned_gg_xgb_no_umap))
+
+best_gg_xgb_no_umap <- select_best(tuned_gg_xgb_no_umap, metric = "bal_accuracy")
+
+cat("\n=== BEST NO-UMAP XGBOOST SETTINGS ===\n")
+print(best_gg_xgb_no_umap)
+
+# ------------------------------------------------------------
+# 6) Final fit on full training data
+# ------------------------------------------------------------
+xgb_final_gg_no_umap <- finalize_workflow(
+  xgb_wf_gg_no_umap,
+  best_gg_xgb_no_umap
+) %>%
+  fit(train_gg_xgb)
+
+pred_gg_xgb_no_umap <- predict(xgb_final_gg_no_umap, test_gg_xgb, type = "prob") %>%
+  bind_cols(predict(xgb_final_gg_no_umap, test_gg_xgb, type = "class")) %>%
+  bind_cols(test_gg_xgb %>% select(taxgrtgroup))
+
+cat("\n=== GREAT GROUP PLAIN XGBOOST (NO UMAP) CONFUSION MATRIX ===\n")
+print(conf_mat(pred_gg_xgb_no_umap, truth = taxgrtgroup, estimate = .pred_class))
+
+cat("\n=== GREAT GROUP PLAIN XGBOOST (NO UMAP) METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(
+  pred_gg_xgb_no_umap,
+  truth = taxgrtgroup,
+  estimate = .pred_class
+))
+print(f_meas(
+  pred_gg_xgb_no_umap,
+  truth = taxgrtgroup,
+  estimate = .pred_class,
+  estimator = "macro"
+))
+
+cat("\n=== GREAT GROUP PLAIN XGBOOST (NO UMAP) CONFIDENCE ===\n")
+print(confidence_summary_tbl(pred_gg_xgb_no_umap, "xgb_no_umap"))
+
+# ------------------------------------------------------------
+# 7) Compare against your existing great-group models
+# ------------------------------------------------------------
+cat("\n=== GREAT GROUP: SAME TEST ROWS FOR RF NO UMAP VS XGB NO UMAP? ===\n")
+print(same_truth_check(res_gg$pred, pred_gg_xgb_no_umap, "taxgrtgroup"))
+
+cat("\n=== GREAT GROUP FULL MODEL COMPARISON (+ XGB NO UMAP) ===\n")
+print(
+  bind_rows(
+    metric_extract_tbl(res_gg$pred,           "taxgrtgroup", "rf_no_umap"),
+    metric_extract_tbl(pred_gg_xgb_no_umap,   "taxgrtgroup", "xgb_no_umap"),
+    metric_extract_tbl(pred_gg_hdb_tuned,     "taxgrtgroup", "umap_hdb_rf_tuned"),
+    metric_extract_tbl(pred_gg_hdb,           "taxgrtgroup", "umap_hdb_rf_baseline"),
+    metric_extract_tbl(pred_gg,               "taxgrtgroup", "umap_rf_baseline"),
+    metric_extract_tbl(pred_gg_hdb_xgb,       "taxgrtgroup", "umap_hdb_xgb_tuned")
+  ) %>%
+    arrange(desc(bal_accuracy), desc(f_meas_macro), desc(accuracy))
+)
+```
+```{r}
+#top predictors?
+# ============================================================
+# GREAT GROUP: TOP PREDICTORS FROM PLAIN XGBOOST (NO UMAP)
+# ============================================================
+
+library(xgboost)
+
+# pull out fitted xgboost booster from workflow
+xgb_fit_obj <- xgb_final_gg_no_umap %>%
+  extract_fit_parsnip() %>%
+  pluck("fit")
+
+# feature names after recipe baking
+feature_names_gg <- bake(prep_gg_xgb, new_data = train_gg_xgb) %>%
+  select(-taxgrtgroup, -peiid) %>%
+  names()
+
+# xgboost importance
+imp_gg_xgb <- xgboost::xgb.importance(
+  feature_names = feature_names_gg,
+  model = xgb_fit_obj
+)
+
+cat("\n=== TOP 20 XGBOOST PREDICTORS (GAIN) ===\n")
+print(imp_gg_xgb %>% as_tibble() %>% slice_max(Gain, n = 20))
+
+
+
+imp_gg_xgb %>%
+  as_tibble() %>%
+  slice_max(Gain, n = 20) %>%
+  mutate(Feature = forcats::fct_reorder(Feature, Gain)) %>%
+  ggplot(aes(x = Gain, y = Feature)) +
+  geom_col() +
+  labs(
+    title = "Top 20 predictors for great-group XGBoost model",
+    x = "Gain",
+    y = NULL
+  ) +
+  theme_minimal()
+
+library(vip)
+
+set.seed(160)
+
+
+pred_fun_multiclass <- function(object, newdata) {
+  predict(object, new_data = newdata, type = "class")$.pred_class
+}
+
+vi_perm_gg <- vip::vi_permute(
+  object = xgb_final_gg_no_umap,
+  feature_names = names(train_gg_xgb %>% select(-taxgrtgroup)),
+  train = train_gg_xgb %>% select(-taxgrtgroup),
+  target = train_gg_xgb$taxgrtgroup,
+  metric = "accuracy",
+  pred_wrapper = pred_fun_multiclass,
+  nsim = 10
+)
+
+vip::vip(vi_perm_gg, num_features = 20)
+
+# The top predictors in the no-UMAP XGBoost great-group model were dominated by profile texture and subsurface horizon architecture. Variables describing silt, clay, and sand content, together with the presence, thickness, and depth of Bt/argillic horizons, contributed most strongly to model gain. Additional importance was associated with overall horizon composition (e.g., C, E, Bw, and Btg proportions) and wetness-related indicators such as gley features, suggesting that great-group prediction was driven primarily by whole-profile morphological organization rather than by any single chemical attribute.
+```
+
+
+### Taxsubgrp1:
 
 ```{r}
 # ============================================================
@@ -578,7 +1901,51 @@ print(
       pct_low_margin = mean(margin < 0.15, na.rm = TRUE)
     )
 )
+
+# ------------------------------------------------------------
+# MOD1 (ALL ORDERS): HDBSCAN + RF
+# ------------------------------------------------------------
+hdb_sg1 <- add_hdbscan_features(
+  train_umap = train_umap_sg1,
+  test_umap  = test_umap_sg1,
+  outcome    = "taxsubgrp_mod1",
+  minPts     = 10
+)
+
+cat("\n=== MOD1 HDBSCAN CLUSTER COUNTS (TRAIN) ===\n")
+print(count(hdb_sg1$train, hdb_cluster, taxsubgrp_mod1, sort = TRUE))
+
+rf_sg1_hdb <- fit_tuned_rf_classifier(
+  train_dat      = hdb_sg1$train,
+  test_dat       = hdb_sg1$test,
+  outcome        = "taxsubgrp_mod1",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 4,
+  mtry_max       = min(10, ncol(hdb_sg1$train) - 1),
+  min_n_max      = 20,
+  seed_cv        = 223
+)
+
+pred_sg1_hdb <- rf_sg1_hdb$pred
+
+cat("\n=== MOD1 (ALL ORDERS): BASELINE VS HDBSCAN ===\n")
+print(metric_compare_tbl(pred_sg1, pred_sg1_hdb, outcome = "taxsubgrp_mod1"))
+
+cat("\n=== MOD1 (ALL ORDERS) CONFIDENCE: BASELINE VS HDBSCAN ===\n")
+print(bind_rows(
+  confidence_summary_tbl(pred_sg1,     "baseline"),
+  confidence_summary_tbl(pred_sg1_hdb, "hdbscan")
+))
+
+cat("\n=== MOD1 (ALL ORDERS) HDBSCAN CONFUSION MATRIX ===\n")
+print(conf_mat(pred_sg1_hdb, truth = taxsubgrp_mod1, estimate = .pred_class))
 ```
+
+
+
+### Taxsubgrp1: Ultisols only
+
 
 ```{r}
 # ============================================================
@@ -814,7 +2181,48 @@ print(
       pct_low_margin = mean(margin < 0.15, na.rm = TRUE)
     )
 )
+
+# ------------------------------------------------------------
+# ULTISOLS ONLY MOD1: HDBSCAN + RF
+# ------------------------------------------------------------
+hdb_u <- add_hdbscan_features(
+  train_umap = train_umap_u,
+  test_umap  = test_umap_u,
+  outcome    = "taxsubgrp_mod1",
+  minPts     = 10
+)
+
+cat("\n=== ULTISOLS ONLY MOD1 HDBSCAN CLUSTER COUNTS (TRAIN) ===\n")
+print(count(hdb_u$train, hdb_cluster, taxsubgrp_mod1, sort = TRUE))
+
+rf_u_hdb <- fit_tuned_rf_classifier(
+  train_dat      = hdb_u$train,
+  test_dat       = hdb_u$test,
+  outcome        = "taxsubgrp_mod1",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 4,
+  mtry_max       = min(10, ncol(hdb_u$train) - 1),
+  min_n_max      = 20,
+  seed_cv        = 323
+)
+
+pred_u_hdb <- rf_u_hdb$pred
+
+cat("\n=== ULTISOLS ONLY MOD1: BASELINE VS HDBSCAN ===\n")
+print(metric_compare_tbl(pred_u, pred_u_hdb, outcome = "taxsubgrp_mod1"))
+
+cat("\n=== ULTISOLS ONLY MOD1 CONFIDENCE: BASELINE VS HDBSCAN ===\n")
+print(bind_rows(
+  confidence_summary_tbl(pred_u,     "baseline"),
+  confidence_summary_tbl(pred_u_hdb, "hdbscan")
+))
+
+cat("\n=== ULTISOLS ONLY MOD1 HDBSCAN CONFUSION MATRIX ===\n")
+print(conf_mat(pred_u_hdb, truth = taxsubgrp_mod1, estimate = .pred_class))
 ```
+
+### Taxpartsize:
 
 
 ```{r}
@@ -1049,6 +2457,45 @@ print(
       pct_low_margin = mean(margin < 0.15, na.rm = TRUE)
     )
 )
+
+# ------------------------------------------------------------
+# TAXPARTSIZE: HDBSCAN + RF
+# ------------------------------------------------------------
+hdb_ps <- add_hdbscan_features(
+  train_umap = train_umap_ps,
+  test_umap  = test_umap_ps,
+  outcome    = "taxpartsize",
+  minPts     = 10
+)
+
+cat("\n=== TAXPARTSIZE HDBSCAN CLUSTER COUNTS (TRAIN) ===\n")
+print(count(hdb_ps$train, hdb_cluster, taxpartsize, sort = TRUE))
+
+rf_ps_hdb <- fit_tuned_rf_classifier(
+  train_dat      = hdb_ps$train,
+  test_dat       = hdb_ps$test,
+  outcome        = "taxpartsize",
+  trees          = 1500,
+  metric_select  = "bal_accuracy",
+  grid_levels    = 4,
+  mtry_max       = min(10, ncol(hdb_ps$train) - 1),
+  min_n_max      = 20,
+  seed_cv        = 423
+)
+
+pred_ps_hdb <- rf_ps_hdb$pred
+
+cat("\n=== TAXPARTSIZE: BASELINE VS HDBSCAN ===\n")
+print(metric_compare_tbl(pred_ps, pred_ps_hdb, outcome = "taxpartsize"))
+
+cat("\n=== TAXPARTSIZE CONFIDENCE: BASELINE VS HDBSCAN ===\n")
+print(bind_rows(
+  confidence_summary_tbl(pred_ps,     "baseline"),
+  confidence_summary_tbl(pred_ps_hdb, "hdbscan")
+))
+
+cat("\n=== TAXPARTSIZE HDBSCAN CONFUSION MATRIX ===\n")
+print(conf_mat(pred_ps_hdb, truth = taxpartsize, estimate = .pred_class))
 ```
 ### NO UMAPS:
 ```{r}
@@ -1204,6 +2651,58 @@ fit_rf_direct <- function(train_df, test_df, outcome, id_col = "peiid",
     )
   )
 }
+
+# ============================================================
+# COMPARISON HELPERS
+# ============================================================
+
+compare_models_tbl <- function(pred_a, pred_b, outcome,
+                               model_a = "rf_no_umap",
+                               model_b = "rf_umap_hdbscan") {
+  outcome_sym <- rlang::sym(outcome)
+  
+  a_tbl <- bind_rows(
+    metric_set(accuracy, kap, bal_accuracy)(
+      pred_a, truth = !!outcome_sym, estimate = .pred_class
+    ),
+    precision(
+      pred_a, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    recall(
+      pred_a, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    f_meas(
+      pred_a, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    )
+  ) %>%
+    mutate(model = model_a, .before = 1)
+  
+  b_tbl <- bind_rows(
+    metric_set(accuracy, kap, bal_accuracy)(
+      pred_b, truth = !!outcome_sym, estimate = .pred_class
+    ),
+    precision(
+      pred_b, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    recall(
+      pred_b, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    ),
+    f_meas(
+      pred_b, truth = !!outcome_sym, estimate = .pred_class, estimator = "macro"
+    )
+  ) %>%
+    mutate(model = model_b, .before = 1)
+  
+  bind_rows(a_tbl, b_tbl)
+}
+
+same_truth_check <- function(pred_a, pred_b, outcome) {
+  all(
+    as.character(pred_a[[outcome]]) ==
+      as.character(pred_b[[outcome]])
+  )
+}
+
 ```
 
 ```{r}
@@ -1263,6 +2762,24 @@ print(summary(res_order$conf_mat))
 
 cat("\n=== TAXORDER TRUTH VS PREDICTED COUNTS ===\n")
 print(res_order$pred %>% count(taxorder, .pred_class, sort = TRUE))
+
+cat("\n=== TAXORDER: SAME TEST ROWS? ===\n")
+print(same_truth_check(res_order$pred, pred_hdb, "taxorder"))
+
+cat("\n=== TAXORDER: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(compare_models_tbl(
+  pred_a = res_order$pred,
+  pred_b = pred_hdb,
+  outcome = "taxorder",
+  model_a = "rf_no_umap",
+  model_b = "rf_umap_hdbscan"
+))
+
+cat("\n=== TAXORDER CONFIDENCE: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(bind_rows(
+  confidence_summary_tbl(res_order$pred, "rf_no_umap"),
+  confidence_summary_tbl(pred_hdb,      "rf_umap_hdbscan")
+))
 ```
 
 
@@ -1326,6 +2843,24 @@ print(summary(res_gg$conf_mat))
 
 cat("\n=== GREAT GROUP TRUTH VS PREDICTED COUNTS ===\n")
 print(res_gg$pred %>% count(taxgrtgroup, .pred_class, sort = TRUE))
+
+cat("\n=== GREAT GROUP: SAME TEST ROWS? ===\n")
+print(same_truth_check(res_gg$pred, pred_gg_hdb, "taxgrtgroup"))
+
+cat("\n=== GREAT GROUP: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(compare_models_tbl(
+  pred_a = res_gg$pred,
+  pred_b = pred_gg_hdb,
+  outcome = "taxgrtgroup",
+  model_a = "rf_no_umap",
+  model_b = "rf_umap_hdbscan"
+))
+
+cat("\n=== GREAT GROUP CONFIDENCE: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(bind_rows(
+  confidence_summary_tbl(res_gg$pred,    "rf_no_umap"),
+  confidence_summary_tbl(pred_gg_hdb,    "rf_umap_hdbscan")
+))
 ```
 
 ```{r}
@@ -1390,6 +2925,24 @@ print(summary(res_mod1$conf_mat))
 
 cat("\n=== MOD1 TRUTH VS PREDICTED COUNTS ===\n")
 print(res_mod1$pred %>% count(taxsubgrp_mod1, .pred_class, sort = TRUE))
+
+cat("\n=== MOD1 (ALL ORDERS): SAME TEST ROWS? ===\n")
+print(same_truth_check(res_mod1$pred, pred_sg1_hdb, "taxsubgrp_mod1"))
+
+cat("\n=== MOD1 (ALL ORDERS): RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(compare_models_tbl(
+  pred_a = res_mod1$pred,
+  pred_b = pred_sg1_hdb,
+  outcome = "taxsubgrp_mod1",
+  model_a = "rf_no_umap",
+  model_b = "rf_umap_hdbscan"
+))
+
+cat("\n=== MOD1 (ALL ORDERS) CONFIDENCE: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(bind_rows(
+  confidence_summary_tbl(res_mod1$pred,  "rf_no_umap"),
+  confidence_summary_tbl(pred_sg1_hdb,   "rf_umap_hdbscan")
+))
 ```
 
 ```{r}
@@ -1456,6 +3009,24 @@ print(summary(res_mod1_u$conf_mat))
 
 cat("\n=== ULTISOLS ONLY: MOD1 TRUTH VS PREDICTED COUNTS ===\n")
 print(res_mod1_u$pred %>% count(taxsubgrp_mod1, .pred_class, sort = TRUE))
+
+cat("\n=== ULTISOLS ONLY MOD1: SAME TEST ROWS? ===\n")
+print(same_truth_check(res_mod1_u$pred, pred_u_hdb, "taxsubgrp_mod1"))
+
+cat("\n=== ULTISOLS ONLY MOD1: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(compare_models_tbl(
+  pred_a = res_mod1_u$pred,
+  pred_b = pred_u_hdb,
+  outcome = "taxsubgrp_mod1",
+  model_a = "rf_no_umap",
+  model_b = "rf_umap_hdbscan"
+))
+
+cat("\n=== ULTISOLS ONLY MOD1 CONFIDENCE: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(bind_rows(
+  confidence_summary_tbl(res_mod1_u$pred, "rf_no_umap"),
+  confidence_summary_tbl(pred_u_hdb,      "rf_umap_hdbscan")
+))
 ```
 
 ```{r}
@@ -1519,117 +3090,26 @@ print(summary(res_ps$conf_mat))
 
 cat("\n=== TAXPARTSIZE TRUTH VS PREDICTED COUNTS ===\n")
 print(res_ps$pred %>% count(taxpartsize, .pred_class, sort = TRUE))
+
+cat("\n=== TAXPARTSIZE: SAME TEST ROWS? ===\n")
+print(same_truth_check(res_ps$pred, pred_ps_hdb, "taxpartsize"))
+
+cat("\n=== TAXPARTSIZE: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(compare_models_tbl(
+  pred_a = res_ps$pred,
+  pred_b = pred_ps_hdb,
+  outcome = "taxpartsize",
+  model_a = "rf_no_umap",
+  model_b = "rf_umap_hdbscan"
+))
+
+cat("\n=== TAXPARTSIZE CONFIDENCE: RF (NO UMAP) VS UMAP + HDBSCAN + RF ===\n")
+print(bind_rows(
+  confidence_summary_tbl(res_ps$pred,   "rf_no_umap"),
+  confidence_summary_tbl(pred_ps_hdb,   "rf_umap_hdbscan")
+))
 ```
 
 
 
-```{r}
-# ============================================================
-# PARTSIZE MODEL (NO UMAP): RF on baked predictors
-# ============================================================
 
-set.seed(101)
-
-# Build df_ps (drop "not used" already handled; keep here for safety)
-df_ps <- pedon_pack_150_p %>%
-  mutate(
-    peiid = as.character(peiid),
-    taxpartsize = factor(taxpartsize)
-  ) %>%
-  filter(!is.na(taxpartsize), taxpartsize != "", taxpartsize != "not used") %>%
-  droplevels()
-
-# Optionally lump very rare classes (fine-silty is tiny)
-# Uncomment if you want stability over completeness:
-# df_ps <- df_ps %>%
-#   mutate(taxpartsize = fct_collapse(taxpartsize, Other_ps = c("fine-silty"))) %>%
-#   droplevels()
-
-cat("\n=== PARTSIZE COUNTS (NO UMAP) ===\n")
-print(count(df_ps, taxpartsize, sort = TRUE))
-
-split_ps <- initial_split(df_ps, prop = 0.8, strata = taxpartsize)
-train_ps <- training(split_ps)
-test_ps  <- testing(split_ps)
-
-# Recipe: drop taxonomy leaks, encode/impute/normalize
-rec_ps <- recipe(taxpartsize ~ ., data = train_ps) %>%
-  update_role(peiid, new_role = "id") %>%
-  step_rm(any_of(c(
-    "taxonname_clean",
-    "taxorder", "taxsuborder", "taxgrtgroup", "taxsubgrp"
-  ))) %>%
-  step_string2factor(all_nominal_predictors()) %>%
-  step_unknown(all_nominal_predictors()) %>%
-  step_other(all_nominal_predictors(), threshold = 0.01) %>%
-  step_dummy(all_nominal_predictors()) %>%
-  step_zv(all_predictors()) %>%
-  step_impute_median(all_numeric_predictors()) %>%
-  step_normalize(all_numeric_predictors())
-
-prep_ps <- prep(rec_ps)
-
-x_train_ps <- bake(prep_ps, new_data = train_ps) %>% select(-taxpartsize, -peiid)
-x_test_ps  <- bake(prep_ps, new_data = test_ps)  %>% select(-taxpartsize, -peiid)
-
-x_train_ps <- x_train_ps %>% mutate(across(where(is.logical), as.integer))
-x_test_ps  <- x_test_ps  %>% mutate(across(where(is.logical), as.integer))
-
-stopifnot(all(vapply(x_train_ps, is.numeric, logical(1))))
-
-train_rf <- bind_cols(x_train_ps, taxpartsize = train_ps$taxpartsize)
-test_rf  <- bind_cols(x_test_ps,  taxpartsize = test_ps$taxpartsize)
-
-# Class weights (helps minority classes)
-tab_ps <- table(train_rf$taxpartsize)
-cw_ps <- as.numeric(sum(tab_ps) / (length(tab_ps) * tab_ps))
-names(cw_ps) <- names(tab_ps)
-
-# Tunable RF
-rf_spec <- rand_forest(trees = 2000, mtry = tune(), min_n = tune()) %>%
-  set_engine("ranger",
-             probability = TRUE,
-             importance = "permutation",
-             class.weights = cw_ps) %>%
-  set_mode("classification")
-
-wf <- workflow() %>%
-  add_model(rf_spec) %>%
-  add_formula(taxpartsize ~ .)
-
-set.seed(102)
-folds <- vfold_cv(train_rf, v = 5, strata = taxpartsize)
-
-# mtry upper bound should relate to # predictors; keep it reasonable
-p <- ncol(x_train_ps)
-mtry_max <- min(50, p)
-
-grid <- grid_regular(
-  mtry(range = c(2, mtry_max)),
-  min_n(range = c(2, 40)),
-  levels = 5
-)
-
-tuned <- tune_grid(
-  wf, resamples = folds, grid = grid,
-  metrics = metric_set(bal_accuracy, kap)
-)
-
-best <- select_best(tuned, metric = "kap")
-rf_final <- finalize_workflow(wf, best) %>% fit(train_rf)
-
-rf_final <- finalize_workflow(wf, best) %>%
-  fit(train_rf)
-
-# Predictions
-pred <- predict(rf_final, test_rf, type = "prob") %>%
-  bind_cols(predict(rf_final, test_rf, type = "class")) %>%
-  bind_cols(test_rf %>% select(taxpartsize))
-
-cat("\n=== PARTSIZE (NO UMAP) METRICS ===\n")
-print(metric_set(accuracy, kap, bal_accuracy)(pred, truth = taxpartsize, estimate = .pred_class))
-print(f_meas(pred, truth = taxpartsize, estimate = .pred_class, estimator = "macro"))
-
-cat("\n=== PARTSIZE (NO UMAP) CONFUSION MATRIX ===\n")
-print(conf_mat(pred, truth = taxpartsize, estimate = .pred_class))
-```
