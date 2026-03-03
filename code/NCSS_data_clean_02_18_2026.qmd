@@ -1305,6 +1305,14 @@ ggplot(pedon_umap, aes(UMAP1, UMAP2)) +
   labs(color = "Weighted avg color (0–150 cm)", title = "Pedon-level UMAP colored by RGB") +
   guides(color = guide_legend(override.aes = list(size = 4)))
 
+# --- color by sand content:
+ggplot(pedon_umap, aes(UMAP1, UMAP2)) +
+  geom_point(
+    aes(color = sand_w),
+    alpha = 0.85, size = 2) +
+  theme_minimal() +
+  labs(color = "Weighted avg sand content (0–150 cm)", title = "Pedon-level UMAP colored by sand content") +
+  guides(color = guide_legend(override.aes = list(size = 4)))
 ```
 ```{r}
 #ultisols suborder only UMAP:
@@ -1337,9 +1345,22 @@ ggplot(ultisols_udults_umap, aes(UMAP1, UMAP2, color = gg_group)) +
 
 
 ```{r}
-
-
-
+#limit to just paleudults and hapludults and color by sub group mod 1:
+ultisols_pale_hap_umap <- pedon_umap %>%
+  filter(
+    taxorder == "Ultisols",
+    str_detect(tolower(coalesce(taxsuborder, "")), "ult"),
+    taxgrtgroup %in% c("Paleudults", "Hapludults")
+  ) %>%
+  mutate(
+    subgrp_mod1_group = coalesce(taxsubgrp_mod1, "Unknown mod1")
+  )
+ggplot(ultisols_pale_hap_umap, aes(UMAP1, UMAP2, color = subgrp_mod1_group)) +
+  #triangle point if halpludult, circle if paleudult:
+  geom_point(aes(shape = taxgrtgroup), alpha = 0.85, size = 2) +
+  theme_minimal() +
+  labs(color = "Subgroup modifier 1", title = "UMAP of Paleudults and Hapludults, colored by subgroup modifier") +
+  guides(color = guide_legend(override.aes = list(size = 4)))
 ```
 
  
