@@ -1,0 +1,654 @@
+---
+title: "NCSS_predict_02_23_26"
+format: html
+---
+###  Packages
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(uwot)
+library(forcats)
+library(beepr)
+library(yardstick)
+library(dbscan)
+library(rlang)
+library(parsnip)
+library(workflows)
+library(tune)
+library(dials)
+library(xgboost)
+```
+### Data prep and split
+```{r}
+#load dataset:
+#150cm:
+pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_03_05_2026.csv")
+
+set.seed(1)
+
+df <- pedon_pack_150_p %>%
+  mutate(
+    peiid = as.character(peiid),
+    taxorder = factor(taxorder)
+  )
+
+# lump rare orders to avoid dropped-level issues in resampling
+min_n <- 15
+df <- df %>%
+  mutate(taxorder = fct_lump_min(taxorder, min = min_n, other_level = "Other"))
+#there is only 4 lol...
+count(df, taxorder, sort = TRUE)
+
+df <- df %>% filter(taxorder != "Other")
+df <- df %>% droplevels()
+count(df, taxorder, sort = TRUE)
+
+split <- initial_split(df, prop = 0.8, strata = taxorder)
+train <- training(split)
+test  <- testing(split)
+```
+
+#Taxorder:
+
+### Recipe:
+
+```{r}
+make_tax_recipe <- function(train, outcome) {
+
+  tax_cols <- names(train)[stringr::str_detect(names(train), "^tax")]
+  tax_rm   <- setdiff(tax_cols, outcome)
+
+  cec_cols <- intersect(
+    c("cec7_w", "pct_hz_with_cec7", "min_cec_per_kg_clay_0_150", "median_cec_per_kg_clay_bt_zone"),
+    names(train)
+  )
+
+  log_cols <- intersect(
+    c("sandy_mantle_cm",
+      "plinthite_thickness_cm", "plinthite_overlap_0_150_cm",
+      "bt_thickness_cm", "argillic_thickness_cm", "argillic_contiguous_max_cm"),
+    names(train)
+  )
+
+  # ---- KEY FIX: leakage list but never remove the outcome ----
+  leakage_rm <- c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxsubgrp", "taxsubgrp_clean",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxsubgrp_mod_group", "taxgrtgroup_mod_group", "taxsuborder_mod_group"
+  )
+  leakage_rm <- setdiff(leakage_rm, outcome)
+
+  rec <- recipe(stats::as.formula(paste(outcome, "~ .")), data = train) %>%
+    update_role(peiid, new_role = "id") %>%
+
+    step_rm(any_of(leakage_rm)) %>%
+    step_rm(any_of(tax_rm)) %>%
+    step_rm(starts_with("mod_"), starts_with("is_")) %>%
+
+    step_string2factor(all_nominal_predictors()) %>%
+    step_unknown(all_nominal_predictors()) %>%
+    step_other(all_nominal_predictors(), threshold = 0.01)
+
+  if (length(cec_cols) > 0) {
+    rec <- rec %>% step_indicate_na(all_of(cec_cols), prefix = "na2")
+  }
+
+  rec <- rec %>%
+    step_dummy(all_nominal_predictors()) %>%
+    step_zv(all_predictors()) %>%
+    step_impute_median(all_numeric_predictors())
+
+  if (length(log_cols) > 0) {
+    clamp_exprs <- rlang::set_names(
+      lapply(log_cols, function(nm) rlang::expr(pmax(.data[[!!nm]], 0))),
+      log_cols
+    )
+
+    rec <- rec %>%
+      step_mutate(!!!clamp_exprs) %>%
+      step_log(all_of(log_cols), offset = 1)
+  }
+
+  rec %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+}
+
+```
+
+### Bake:
+```{r}
+bake_xy <- function(train, test, outcome) {
+  rec <- make_tax_recipe(train, outcome)
+  prep_rec <- prep(rec, training = train)
+
+  x_train <- bake(prep_rec, new_data = train) %>% select(-all_of(outcome), -peiid)
+  x_test  <- bake(prep_rec, new_data = test)  %>% select(-all_of(outcome), -peiid)
+
+  y_train <- train[[outcome]]
+  y_test  <- test[[outcome]]
+
+  # UMAP safety (no NA/Inf)
+  x_train <- x_train %>% mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+  x_test  <- x_test  %>% mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+  x_train[is.na(x_train)] <- 0
+  x_test[is.na(x_test)] <- 0
+
+  list(prep = prep_rec, x_train = x_train, x_test = x_test, y_train = y_train, y_test = y_test)
+}
+```
+
+### UMAP:
+
+```{r}
+make_umap_sets <- function(x_train, x_test, y_train, y_test,
+                           n_components = 10, n_neighbors = 15, min_dist = 0.1,
+                           minPts = 10, add_hdb = TRUE, seed = 2) {
+
+  set.seed(seed)
+  umap_fit <- uwot::umap(
+    as.matrix(x_train),
+    n_components = n_components,
+    n_neighbors = n_neighbors,
+    min_dist = min_dist,
+    metric = "euclidean",
+    ret_model = TRUE
+  )
+
+  z_train <- as.data.frame(umap_fit$embedding)
+  names(z_train) <- paste0("U", seq_len(ncol(z_train)))
+
+  z_test <- as.data.frame(uwot::umap_transform(as.matrix(x_test), umap_fit))
+  names(z_test) <- names(z_train)
+
+  train_umap <- bind_cols(z_train, outcome = y_train)
+  test_umap  <- bind_cols(z_test,  outcome = y_test)
+
+  if (!add_hdb) {
+    return(list(plain = list(train = train_umap, test = test_umap), umap_fit = umap_fit))
+  }
+
+  # HDBSCAN on UMAP space
+  hdb_fit <- dbscan::hdbscan(as.matrix(z_train), minPts = minPts)
+  test_cluster <- predict(hdb_fit, newdata = as.matrix(z_test), data = as.matrix(z_train))
+  levs <- sort(unique(c(hdb_fit$cluster, test_cluster)))
+
+  train_hdb <- train_umap %>%
+    mutate(
+      hdb_cluster = factor(hdb_fit$cluster, levels = levs),
+      hdb_noise   = factor(if_else(hdb_fit$cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+
+  test_hdb <- test_umap %>%
+    mutate(
+      hdb_cluster = factor(test_cluster, levels = levs),
+      hdb_noise   = factor(if_else(test_cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+
+  list(
+    plain = list(train = train_umap, test = test_umap),
+    hdb   = list(train = train_hdb,  test = test_hdb),
+    umap_fit = umap_fit,
+    hdb_fit  = hdb_fit
+  )
+}
+```
+
+### RF or XGBOOST:
+
+```{r}
+fit_rf <- function(train_dat, test_dat, trees = 1200, seed = 1) {
+  set.seed(seed)
+
+  train_dat <- train_dat %>% rename(y = outcome)
+  test_dat  <- test_dat  %>% rename(y = outcome)
+
+  v <- min(5, min(count(train_dat, y)$n))
+  folds <- vfold_cv(train_dat, v = v, strata = y)
+
+  rf_spec <- rand_forest(trees = trees, mtry = tune(), min_n = tune()) %>%
+    set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+    set_mode("classification")
+
+  wf <- workflow() %>% add_model(rf_spec) %>% add_formula(y ~ .)
+
+  p <- ncol(train_dat) - 1
+  grid <- grid_regular(
+    mtry(range = c(2, min(12, p))),
+    min_n(range = c(2, 25)),
+    levels = 4
+  )
+
+  tuned <- tune_grid(wf, resamples = folds, grid = grid,
+                     metrics = metric_set(accuracy, kap, bal_accuracy))
+
+  best <- select_best(tuned, metric = "bal_accuracy")
+  final_fit <- finalize_workflow(wf, best) %>% fit(train_dat)
+
+  pred <- predict(final_fit, test_dat, type = "prob") %>%
+    bind_cols(predict(final_fit, test_dat, type = "class")) %>%
+    bind_cols(test_dat %>% select(y))
+
+  list(fit = final_fit, tuned = tuned, best = best, pred = pred)
+}
+```
+
+### plain XGBOOST:
+
+```{r}
+fit_xgb <- function(train_dat, test_dat, seed = 1) {
+  set.seed(seed)
+
+  train_dat <- train_dat %>% rename(y = outcome)
+  test_dat  <- test_dat  %>% rename(y = outcome)
+
+  v <- min(5, min(count(train_dat, y)$n))
+  folds <- vfold_cv(train_dat, v = v, strata = y)
+
+  xgb_spec <- boost_tree(
+    trees = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    min_n = tune(),
+    loss_reduction = tune(),
+    sample_size = tune(),
+    mtry = tune()
+  ) %>%
+    set_engine("xgboost") %>%
+    set_mode("classification")
+
+  wf <- workflow() %>% add_model(xgb_spec) %>% add_formula(y ~ .)
+
+  p <- ncol(train_dat) - 1
+  grid <- grid_space_filling(
+    trees(range = c(200L, 2000L)),
+    tree_depth(),
+    learn_rate(range = c(-4, -1)),   # log10 scale
+    min_n(),
+    loss_reduction(),
+    sample_size = sample_prop(),
+    mtry(range = c(2L, min(30L, p))),
+    size = 30
+  )
+
+  tuned <- tune_grid(
+    wf, resamples = folds, grid = grid,
+    metrics = metric_set(accuracy, kap, bal_accuracy)
+  )
+
+  best <- select_best(tuned, metric = "bal_accuracy")
+  final_fit <- finalize_workflow(wf, best) %>% fit(train_dat)
+
+  pred <- predict(final_fit, test_dat, type = "prob") %>%
+    bind_cols(predict(final_fit, test_dat, type = "class")) %>%
+    bind_cols(test_dat %>% select(y))
+
+  list(fit = final_fit, tuned = tuned, best = best, pred = pred)
+}
+```
+
+### RUN
+
+
+```{r}
+run_all_models_one_outcome <- function(train, test, outcome_name, min_n = 10) {
+
+  stopifnot(outcome_name %in% names(train), outcome_name %in% names(test))
+
+  train2 <- train %>%
+    filter(!is.na(.data[[outcome_name]])) %>%
+    mutate(!!outcome_name := factor(.data[[outcome_name]])) %>%
+    mutate(!!outcome_name := forcats::fct_lump_min(.data[[outcome_name]], min = min_n, other_level = "Other")) %>%
+    filter(.data[[outcome_name]] != "Other") %>%
+    droplevels()
+
+  test2 <- test %>%
+    filter(!is.na(.data[[outcome_name]])) %>%
+    mutate(!!outcome_name := factor(.data[[outcome_name]], levels = levels(train2[[outcome_name]]))) %>%
+    filter(!is.na(.data[[outcome_name]])) %>%  # drop outcomes not in train after lumping
+    droplevels()
+
+  baked <- bake_xy(train2, test2, outcome_name)
+
+  train_plain <- dplyr::bind_cols(baked$x_train, outcome = baked$y_train)
+  test_plain  <- dplyr::bind_cols(baked$x_test,  outcome = baked$y_test)
+
+  um <- make_umap_sets(
+    baked$x_train, baked$x_test, baked$y_train, baked$y_test,
+    n_components = 10, n_neighbors = 15, min_dist = 0.1,
+    minPts = 10, add_hdb = TRUE
+  )
+
+  fits <- list(
+    rf_plain      = fit_rf(train_plain, test_plain, seed = 1),
+    xgb_plain     = fit_xgb(train_plain, test_plain, seed = 1),
+    rf_umap       = fit_rf(um$plain$train, um$plain$test, seed = 1),
+    xgb_umap      = fit_xgb(um$plain$train, um$plain$test, seed = 1),
+    rf_umap_hdb   = fit_rf(um$hdb$train, um$hdb$test, seed = 1),
+    xgb_umap_hdb  = fit_xgb(um$hdb$train, um$hdb$test, seed = 1)
+  )
+
+  metric_fn <- function(pred_tbl, model_name) {
+    pred_tbl <- pred_tbl %>% rename(truth = y)
+    tibble(
+      outcome = outcome_name,
+      model = model_name,
+      accuracy = yardstick::accuracy(pred_tbl, truth = truth, estimate = .pred_class)$.estimate,
+      kap = yardstick::kap(pred_tbl, truth = truth, estimate = .pred_class)$.estimate,
+      bal_accuracy = yardstick::bal_accuracy(pred_tbl, truth = truth, estimate = .pred_class)$.estimate,
+      f_meas_macro = yardstick::f_meas(pred_tbl, truth = truth, estimate = .pred_class, estimator = "macro")$.estimate
+    )
+  }
+
+  metrics <- dplyr::bind_rows(
+    metric_fn(fits$rf_plain$pred, "RF_plain"),
+    metric_fn(fits$xgb_plain$pred, "XGB_plain"),
+    metric_fn(fits$rf_umap$pred, "RF_umap"),
+    metric_fn(fits$xgb_umap$pred, "XGB_umap"),
+    metric_fn(fits$rf_umap_hdb$pred, "RF_umap_hdb"),
+    metric_fn(fits$xgb_umap_hdb$pred, "XGB_umap_hdb")
+  )
+
+  list(fits = fits, metrics = metrics)
+}
+
+candidate_outcomes <- c("taxorder", "taxsuborder", "taxgrtgroup", "taxsubgrp_mod1", "taxpartsize")
+outcomes <- intersect(candidate_outcomes, names(train))
+outcomes
+
+min_n_map <- c(
+  taxorder = 15,
+  taxsuborder = 10,
+  taxgrtgroup = 10,
+  taxsubgrp_mod1 = 20,
+  taxpartsize = 20
+)
+min_n_map <- min_n_map[outcomes]
+
+
+all_runs <- purrr::map(
+  outcomes,
+  ~ run_all_models_one_outcome(train, test, .x, min_n = unname(min_n_map[.x]))
+)
+
+all_results_metrics <- dplyr::bind_rows(purrr::map(all_runs, "metrics"))
+all_results_metrics %>% arrange(outcome, desc(bal_accuracy), desc(kap))
+
+#best model:
+best_by_outcome <- all_results_metrics %>%
+  group_by(outcome) %>%
+  slice_max(bal_accuracy, n = 1, with_ties = TRUE) %>%
+  #descending accuracy:
+  arrange(desc(bal_accuracy))
+
+best_by_outcome
+```
+
+```{r}
+
+# 1) choose best plain model per outcome
+best_plain_by_outcome <- all_results_metrics %>%
+  filter(model %in% c("RF_plain", "XGB_plain")) %>%
+  group_by(outcome) %>%
+  arrange(desc(bal_accuracy), desc(kap)) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+
+# map outcome -> index in all_runs (must match your outcomes vector order)
+run_lookup <- setNames(seq_along(outcomes), outcomes)
+
+# 2) extract VI table from a tidymodels workflow fit
+get_vi_tbl <- function(fit_obj, top_n = 25) {
+  wf <- fit_obj$fit
+  eng <- workflows::extract_fit_engine(wf)
+
+  if (inherits(eng, "ranger")) {
+    vi <- eng$variable.importance
+    tibble(
+      Variable = names(vi),
+      Importance = as.numeric(vi)
+    ) %>%
+      arrange(desc(Importance)) %>%
+      slice_head(n = top_n)
+  } else if (inherits(eng, "xgb.Booster")) {
+    imp <- xgboost::xgb.importance(model = eng)
+    tibble(
+      Variable = imp$Feature,
+      Importance = imp$Gain
+    ) %>%
+      arrange(desc(Importance)) %>%
+      slice_head(n = top_n)
+  } else {
+    stop("Unknown engine: ", paste(class(eng), collapse = ", "))
+  }
+}
+
+# 3) build VIP tables + plots
+vip_tables_plain <- list()
+vip_plots_plain  <- list()
+
+for (k in seq_len(nrow(best_plain_by_outcome))) {
+  oc <- best_plain_by_outcome$outcome[k]
+  md <- best_plain_by_outcome$model[k]
+  i  <- run_lookup[[oc]]
+
+  fit_key <- if (md == "RF_plain") "rf_plain" else "xgb_plain"
+  fit_obj <- all_runs[[i]]$fits[[fit_key]]
+
+  vi_tbl <- get_vi_tbl(fit_obj, top_n = 25)
+  vip_tables_plain[[oc]] <- vi_tbl
+
+  vip_plots_plain[[oc]] <- vi_tbl %>%
+    ggplot(aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste0("VIP (plain): ", oc, " — ", md),
+      x = NULL, y = "Importance"
+    ) +
+    theme_minimal()
+}
+
+best_plain_by_outcome
+vip_tables_plain
+vip_plots_plain
+```
+```{r}
+purrr::iwalk(vip_plots_plain, ~ { print(.x) })
+```
+```{r}
+
+top_n <- 25  # match what you used when you built vip_tables_plain
+
+vip_long <- purrr::imap_dfr(vip_tables_plain, ~ {
+  .x %>%
+    mutate(
+      outcome = .y,
+      rank = row_number(),
+      # normalize within outcome so RF importance and XGB gain become comparable
+      imp_norm = Importance / max(Importance, na.rm = TRUE)
+    )
+})
+
+# (A) Frequency summary: appears in top N how often?
+vip_freq <- vip_long %>%
+  group_by(Variable) %>%
+  summarise(
+    n_outcomes_in_topN = n_distinct(outcome),
+    outcomes = paste(sort(unique(outcome)), collapse = ", "),
+    avg_rank = mean(rank, na.rm = TRUE),
+    median_rank = median(rank, na.rm = TRUE),
+    avg_imp_norm = mean(imp_norm, na.rm = TRUE),
+    median_imp_norm = median(imp_norm, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_outcomes_in_topN), avg_rank)
+
+vip_freq %>% slice_head(n = 30)
+
+
+n_outcomes <- n_distinct(vip_long$outcome)
+
+vip_consensus <- vip_long %>%
+  group_by(Variable) %>%
+  summarise(
+    freq = n_distinct(outcome) / n_outcomes,         # 0–1
+    strength = mean(imp_norm, na.rm = TRUE),         # 0–1
+    consensus_score = freq * strength,               # 0–1
+    .groups = "drop"
+  ) %>%
+  arrange(desc(consensus_score))
+
+vip_consensus %>% slice_head(n = 30)
+
+
+
+shared <- vip_freq %>% filter(n_outcomes_in_topN == n_outcomes)
+specific <- vip_freq %>% filter(n_outcomes_in_topN == 1)
+
+shared
+specific %>% slice_head(n = 30)
+
+# Across taxonomic levels, the most consistently important predictors reflect subsoil development and particle-size organization: the thickness and depth of Bt/argillic-like zones and the overall texture (clay/silt/sand) across 0–150 cm. Secondary but high-leverage predictors capture sandy mantles (coarse-over-fine profiles) and wetness/redox expression (gleyed horizons). Together, these features summarize key pedogenic controls—illuviation intensity, parent material texture/stratification, and drainage—that Soil Taxonomy uses to differentiate taxa.
+```
+
+
+```{r}
+
+
+fit_key_from_model <- function(model) {
+  dplyr::case_when(
+    model == "RF_plain"     ~ "rf_plain",
+    model == "RF_umap"      ~ "rf_umap",
+    model == "RF_umap_hdb"  ~ "rf_umap_hdb",
+    model == "XGB_plain"    ~ "xgb_plain",
+    model == "XGB_umap"     ~ "xgb_umap",
+    model == "XGB_umap_hdb" ~ "xgb_umap_hdb",
+    TRUE ~ NA_character_
+  )
+}
+
+best_by_outcome <- all_results_metrics %>%
+  dplyr::group_by(outcome) %>%
+  dplyr::arrange(dplyr::desc(bal_accuracy), dplyr::desc(kap)) %>%
+  dplyr::slice(1) %>%
+  dplyr::ungroup()
+
+targets <- c("taxorder", "taxsubgrp_mod1", "taxpartsize")
+run_lookup <- setNames(seq_along(outcomes), outcomes)
+
+per_class_from_counts <- function(pred_tbl) {
+  # pred_tbl must have columns: truth, .pred_class
+  counts <- pred_tbl %>%
+    dplyr::count(truth, .pred_class, name = "n")
+
+  truth_tot <- counts %>%
+    dplyr::group_by(truth) %>%
+    dplyr::summarise(support = sum(n), .groups = "drop") %>%
+    dplyr::rename(class = truth)
+
+  pred_tot <- counts %>%
+    dplyr::group_by(.pred_class) %>%
+    dplyr::summarise(pred_n = sum(n), .groups = "drop") %>%
+    dplyr::rename(class = .pred_class)
+
+  tp <- counts %>%
+    dplyr::filter(truth == .pred_class) %>%
+    dplyr::transmute(class = truth, tp = n)
+
+  truth_tot %>%
+    dplyr::left_join(pred_tot, by = "class") %>%
+    dplyr::left_join(tp, by = "class") %>%
+    dplyr::mutate(
+      tp = dplyr::coalesce(tp, 0L),
+      pred_n = dplyr::coalesce(pred_n, 0L),
+      recall = ifelse(support > 0, tp / support, NA_real_),
+      precision = ifelse(pred_n > 0, tp / pred_n, NA_real_)
+    ) %>%
+    dplyr::arrange(dplyr::desc(support))
+}
+
+report_one <- function(outcome_name) {
+
+  b <- best_by_outcome %>%
+    dplyr::filter(outcome == outcome_name) %>%
+    dplyr::slice(1)
+
+  if (nrow(b) == 0) stop("Outcome not found in best_by_outcome: ", outcome_name)
+
+  model_name <- b$model[[1]]
+  fit_key <- fit_key_from_model(model_name)
+  if (is.na(fit_key)) stop("No fit key for model: ", model_name)
+
+  i <- run_lookup[[outcome_name]]
+  if (is.null(i)) stop("Outcome not found in outcomes/run_lookup: ", outcome_name)
+
+  pred_tbl <- all_runs[[i]]$fits[[fit_key]]$pred %>%
+    dplyr::rename(truth = y)
+
+  overall <- tibble::tibble(
+    outcome = outcome_name,
+    model = model_name,
+    acc = yardstick::accuracy(pred_tbl, truth = truth, estimate = .pred_class)$.estimate,
+    bal_acc = yardstick::bal_accuracy(pred_tbl, truth = truth, estimate = .pred_class)$.estimate,
+    kap = yardstick::kap(pred_tbl, truth = truth, estimate = .pred_class)$.estimate,
+    f1_macro = yardstick::f_meas(pred_tbl, truth = truth, estimate = .pred_class, estimator = "macro")$.estimate
+  )
+
+  per_class <- per_class_from_counts(pred_tbl)
+
+  top_conf <- pred_tbl %>%
+    dplyr::count(truth, .pred_class, name = "n") %>%
+    dplyr::group_by(truth) %>%
+    dplyr::mutate(p = n / sum(n)) %>%
+    dplyr::ungroup() %>%
+    dplyr::filter(truth != .pred_class) %>%
+    dplyr::arrange(dplyr::desc(n)) %>%
+    dplyr::slice_head(n = 15)
+
+  list(overall = overall, per_class = per_class, top_conf = top_conf)
+}
+
+reports <- purrr::set_names(purrr::map(targets, report_one), targets)
+
+# print nicely
+reports$taxorder$overall
+reports$taxorder$per_class
+reports$taxorder$top_conf
+
+reports$taxsuborder$overall
+reports$taxsuborder$per_class
+reports$taxsuborder$top_conf
+
+reports$taxgrtgroup$overall
+reports$taxgrtgroup$per_class
+reports$taxgrtgroup$top_conf
+
+reports$taxsubgrp_mod1$overall
+reports$taxsubgrp_mod1$per_class
+reports$taxsubgrp_mod1$top_conf
+
+
+reports$taxpartsize$overall
+reports$taxpartsize$per_class
+reports$taxpartsize$top_conf
+
+
+#Thresholds on continuous processes
+# Wetness (Aquic) and sandy mantle thickness (Arenic/Grossarenic) are gradients. When expression is subtle or near boundaries, the model flips categories—especially toward defaults (Typic).
+# 
+# Depth-window / incomplete profile representation (0–150 cm)
+# When key diagnostic horizons are deep, thin, or not well captured in measured horizons, models drift toward “less developed” categories (Entisols) and muddle development intensity boundaries.
+# 
+# Control-section definitions vs summary predictors
+# Family particle-size is rule-based on a defined control section; your summaries approximate it but blur boundaries—leading to adjacent-class errors.
+```
+
+
+
+
