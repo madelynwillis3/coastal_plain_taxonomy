@@ -20,7 +20,7 @@ library(rlang)
 ```{r}
 #load dataset:
 #150cm:
-pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_02_26_26.csv")
+pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_03_05_2026.csv")
 
 set.seed(1)
 
@@ -54,17 +54,50 @@ test  <- testing(split)
 rec <- recipe(taxorder ~ ., data = train) %>%
   update_role(peiid, new_role = "id") %>%
   step_rm(any_of(c(
-    "taxonname_clean",
-    "taxsuborder", "taxgrtgroup",
-    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
-    "taxpartsize"
+    "taxonname_clean","taxonname_key","taxclname",
+    "taxsuborder","taxgrtgroup","taxpartsize",
+    "taxsubgrp","taxsubgrp_clean",
+    "taxsubgrp_mod1","taxsubgrp_mod2","taxsubgrp_mod3",
+    "taxsubgrp_mod_group","taxgrtgroup_mod_group","taxsuborder_mod_group"
   ))) %>%
+  step_rm(starts_with("mod_"), starts_with("is_")) %>%
+
   step_string2factor(all_nominal_predictors()) %>%
   step_unknown(all_nominal_predictors()) %>%
   step_other(all_nominal_predictors(), threshold = 0.01) %>%
-  step_zv(all_predictors()) %>%          # move this UP
-  step_impute_median(all_numeric_predictors()) %>%
+
+  # NA indicators ONLY for CEC-related columns
+  step_indicate_na(all_of(c(
+    "cec7_w",
+    "pct_hz_with_cec7",
+    "min_cec_per_kg_clay_0_150",
+    "median_cec_per_kg_clay_bt_zone"
+  )), prefix = "na2_") %>%
+
   step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+
+  step_impute_median(all_numeric_predictors())  %>%
+  step_mutate_at(
+    all_of(c(
+      "sandy_mantle_cm",
+      "plinthite_thickness_cm","plinthite_overlap_0_150_cm",
+      "bt_thickness_cm","argillic_thickness_cm","argillic_contiguous_max_cm"
+    )),
+    fn = ~ pmax(.x, 0)
+  ) %>%
+  step_log(all_of(c(
+    "sandy_mantle_cm",
+    "plinthite_thickness_cm","plinthite_overlap_0_150_cm",
+    "bt_thickness_cm","argillic_thickness_cm","argillic_contiguous_max_cm"
+  )), offset = 1) %>%
+  # log BEFORE normalize
+  step_log(all_of(c(
+    "sandy_mantle_cm",
+    "plinthite_thickness_cm","plinthite_overlap_0_150_cm",
+    "bt_thickness_cm","argillic_thickness_cm","argillic_contiguous_max_cm"
+  )), offset = 1) %>%
+
   step_normalize(all_numeric_predictors())
 
 prep_rec <- prep(rec)
@@ -270,9 +303,19 @@ confidence_summary_tbl <- function(pred_tbl, model_name = "model") {
 ### TAXORDER UMAP and DBSCAN
 
 ```{r}
+# UMAP can't take NA/Inf; enforce finite numeric matrix
+x_train_umap <- x_train %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+x_test_umap <- x_test %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+
+# replace any remaining NA with 0 (UMAP-safe)
+x_train_umap[is.na(x_train_umap)] <- 0
+x_test_umap[is.na(x_test_umap)] <- 0
+
 set.seed(2)
 umap_fit <- uwot::umap(
-  as.matrix(x_train),
+  as.matrix(x_train_umap),
   n_components = 10,
   n_neighbors = 15,
   min_dist = 0.1,
@@ -280,10 +323,9 @@ umap_fit <- uwot::umap(
   ret_model = TRUE
 )
 
+z_test <- as.data.frame(uwot::umap_transform(as.matrix(x_test_umap), umap_fit))
 z_train <- as.data.frame(umap_fit$embedding)
 names(z_train) <- paste0("U", seq_len(ncol(z_train)))
-
-z_test <- as.data.frame(uwot::umap_transform(as.matrix(x_test), umap_fit))
 names(z_test) <- names(z_train)
 
 train_umap <- bind_cols(z_train, taxorder = train$taxorder)
