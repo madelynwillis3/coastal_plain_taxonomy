@@ -1,0 +1,1978 @@
+---
+title: "perry_clean_NCSS_02_26_2026"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(uwot)
+library(forcats)
+library(beepr)
+library(yardstick)
+library(aqp)
+# ============================================================
+# HELPERS
+# ============================================================
+
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0 || all(is.na(x))) y else x
+}
+
+first_non_na <- function(x) {
+  y <- x[!is.na(x) & str_squish(as.character(x)) != ""]
+  if (length(y) == 0) NA_character_ else as.character(y[1])
+}
+
+mode_non_na <- function(x) {
+  y <- x[!is.na(x) & str_squish(as.character(x)) != ""]
+  if (length(y) == 0) NA_character_ else names(sort(table(y), decreasing = TRUE))[1]
+}
+
+parse_top_bottom <- function(x) {
+  top <- as.numeric(str_extract(x, "^\\d+"))
+  bot <- as.numeric(str_extract(x, "(?<=-)\\d+"))
+  tibble(top_cm = top, bottom_cm = bot)
+}
+
+hz_base <- function(hz) {
+  h <- str_to_upper(str_trim(hz %||% ""))
+  h <- str_replace_all(h, "\\s+", "")
+  h <- str_remove(h, "\\d+$")
+
+  case_when(
+    str_detect(h, "^AP")         ~ "Ap",
+    str_detect(h, "^AB")         ~ "Ab",
+    str_detect(h, "^AG")         ~ "Ag",
+    str_detect(h, "^A")          ~ "A",
+    str_detect(h, "^EG")         ~ "Eg",
+    str_detect(h, "^EX")         ~ "Ex",
+    str_detect(h, "^E")          ~ "E",
+    str_detect(h, "^B[T].*G")    ~ "Btg",
+    str_detect(h, "^B[T].*SS")   ~ "Btss",
+    str_detect(h, "^B[T].*X")    ~ "Btx",
+    str_detect(h, "^B[T]")       ~ "Bt",
+    str_detect(h, "^BH")         ~ "Bh",
+    str_detect(h, "^BC")         ~ "BC",
+    str_detect(h, "^BX")         ~ "Bx",
+    str_detect(h, "^B")          ~ "B",
+    str_detect(h, "^CG")         ~ "Cg",
+    str_detect(h, "^C")          ~ "C",
+    str_detect(h, "^OA")         ~ "Oa",
+    str_detect(h, "^OE")         ~ "Oe",
+    str_detect(h, "^R")          ~ "R",
+    TRUE                         ~ "Unknown"
+  )
+}
+
+is_carbonate_hz <- function(hz) {
+  h <- str_to_lower(str_trim(hz %||% ""))
+  str_detect(h, "k")
+}
+
+is_gleyed <- function(hz, chroma) {
+  h <- str_to_lower(str_trim(hz %||% ""))
+  g_suffix <- str_detect(h, "g")
+  low_chroma <- !is.na(chroma) & chroma <= 2
+  g_suffix | low_chroma
+}
+
+hex_to_rgb01 <- function(hex_vec) {
+  out <- matrix(NA_real_, nrow = length(hex_vec), ncol = 3)
+  ok <- !is.na(hex_vec) & nzchar(hex_vec)
+
+  if (any(ok)) {
+    rgb <- grDevices::col2rgb(hex_vec[ok])
+    out[ok, ] <- t(rgb) / 255
+  }
+
+  out
+}
+
+# FIXES PERRY COLORS LIKE "10YR4/2" -> "10YR 4/2"
+fix_munsell <- function(x) {
+  x %>%
+    as.character() %>%
+    str_squish() %>%
+    str_replace("^([0-9.]+[A-Z]+)([0-9.]+/[0-9.]+)$", "\\1 \\2")
+}
+
+# SAFE weighted mean
+wmean_or_na <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w)
+  if (!any(ok)) NA_real_ else weighted.mean(x[ok], w[ok])
+}
+
+# SAFE min
+min_or_na <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) NA_real_ else min(x)
+}
+
+parse_subgrp_mods <- function(subgrp, gg_hint = NA_character_) {
+  x0 <- subgrp %>%
+    as.character() %>%
+    str_squish() %>%
+    na_if("")
+
+  if (is.na(x0)) {
+    return(tibble(
+      subgrp_gg = gg_hint %||% NA_character_,
+      taxsubgrp_mod1 = NA_character_,
+      taxsubgrp_mod2 = NA_character_,
+      taxsubgrp_mod3 = NA_character_
+    ))
+  }
+
+  toks <- str_split(x0, "\\s+", simplify = FALSE)[[1]]
+  toks <- toks[toks != ""]
+
+  if (length(toks) == 0) {
+    return(tibble(
+      subgrp_gg = gg_hint %||% NA_character_,
+      taxsubgrp_mod1 = NA_character_,
+      taxsubgrp_mod2 = NA_character_,
+      taxsubgrp_mod3 = NA_character_
+    ))
+  }
+
+  gg <- if (!is.na(gg_hint) && str_squish(gg_hint) != "") gg_hint else toks[length(toks)]
+  mods <- if (length(toks) >= 2) toks[1:(length(toks) - 1)] else character(0)
+
+  tibble(
+    subgrp_gg      = gg,
+    taxsubgrp_mod1 = mods[1] %||% NA_character_,
+    taxsubgrp_mod2 = mods[2] %||% NA_character_,
+    taxsubgrp_mod3 = mods[3] %||% NA_character_
+  )
+}
+
+add_top1_margin <- function(pred_df) {
+  pred_cols <- names(pred_df)[
+    str_detect(names(pred_df), "^\\.pred_") & names(pred_df) != ".pred_class"
+  ]
+
+  pred_df %>%
+    rowwise() %>%
+    mutate(
+      top1 = max(c_across(all_of(pred_cols))),
+      top2 = ifelse(length(pred_cols) > 1,
+                    sort(c_across(all_of(pred_cols)), decreasing = TRUE)[2],
+                    NA_real_),
+      margin = ifelse(length(pred_cols) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup()
+}
+
+overlap_thick <- function(top, bot, a, b) {
+  pmax(0, pmin(bot, b) - pmax(top, a))
+}
+
+wmean_safe <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+is_sandy_hz <- function(texcl, sand, clay,
+                        sand_min = 70, clay_max = 15,
+                        tex_fallback = c("Sand", "Loamy sand")) {
+
+  primary <- is.finite(sand) & is.finite(clay) &
+    (sand >= sand_min) & (clay <= clay_max)
+
+  fallback <- (!is.finite(sand) | !is.finite(clay)) &
+    !is.na(texcl) &
+    (str_to_lower(texcl) %in% str_to_lower(tex_fallback))
+
+  primary | fallback
+}
+
+calc_sandy_indices <- function(df, interval_top = 0, interval_bot = 150) {
+
+  d <- df %>%
+    mutate(
+      hzdept = as.numeric(hzdept),
+      hzdepb = as.numeric(hzdepb),
+      hz_thick = hzdepb - hzdept,
+      sand = as.numeric(sandtotmeasured),
+      clay = as.numeric(claytotmeasured),
+      sandy_hz = is_sandy_hz(texcl, sand, clay),
+      bt_like = (!is.na(L_suffix) & str_detect(str_to_lower(L_suffix), "t")) |
+        (!is.na(hzname_clean) & str_detect(hzname_clean, "^Bt")) |
+        (!is.na(hzname) & str_detect(hzname, "^Bt"))
+    ) %>%
+    filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+    arrange(hzdept, hzdepb)
+
+  if (nrow(d) == 0) {
+    return(tibble(
+      sandy_mantle_cm = NA_real_,
+      depth_to_first_nonsandy_cm = NA_real_,
+      sandy_layers_n_surface = NA_real_,
+      pct_sandy_0_150 = NA_real_,
+      mean_sand_0_150 = NA_real_,
+      mean_clay_0_150 = NA_real_,
+      has_bt_below_mantle = NA,
+      delta_clay_at_mantle_break = NA_real_,
+      delta_sand_at_mantle_break = NA_real_,
+      abrupt_sand_to_bt_transition = NA
+    ))
+  }
+
+  surface <- min(d$hzdept, na.rm = TRUE)
+  first_nonsandy_idx <- which(!d$sandy_hz)[1]
+
+  sandy_mantle_cm <- if (is.na(first_nonsandy_idx)) {
+    max(d$hzdepb, na.rm = TRUE) - surface
+  } else {
+    d$hzdept[first_nonsandy_idx] - surface
+  }
+
+  depth_to_first_nonsandy_cm <- if (is.na(first_nonsandy_idx)) NA_real_ else d$hzdept[first_nonsandy_idx]
+  sandy_layers_n_surface <- if (is.na(first_nonsandy_idx)) nrow(d) else (first_nonsandy_idx - 1)
+
+  d_int <- d %>%
+    mutate(
+      ov = overlap_thick(hzdept, hzdepb, interval_top, interval_bot),
+      ov_sandy = ifelse(sandy_hz, ov, 0)
+    ) %>%
+    filter(ov > 0)
+
+  int_thick <- sum(d_int$ov, na.rm = TRUE)
+  pct_sandy <- if (int_thick > 0) 100 * sum(d_int$ov_sandy, na.rm = TRUE) / int_thick else NA_real_
+
+  mean_sand <- wmean_safe(d_int$sand, d_int$ov)
+  mean_clay <- wmean_safe(d_int$clay, d_int$ov)
+
+  if (!is.na(first_nonsandy_idx) && first_nonsandy_idx > 1) {
+    last_sandy <- d[first_nonsandy_idx - 1, ]
+    first_non  <- d[first_nonsandy_idx, ]
+
+    has_bt_below_mantle <- isTRUE(first_non$bt_like)
+    delta_clay <- first_non$clay - last_sandy$clay
+    delta_sand <- last_sandy$sand - first_non$sand
+
+    abrupt <- isTRUE(has_bt_below_mantle) &&
+      is.finite(delta_clay) && is.finite(delta_sand) &&
+      delta_clay >= 15 && delta_sand >= 20
+  } else {
+    has_bt_below_mantle <- FALSE
+    delta_clay <- NA_real_
+    delta_sand <- NA_real_
+    abrupt <- FALSE
+  }
+
+  tibble(
+    sandy_mantle_cm = sandy_mantle_cm,
+    depth_to_first_nonsandy_cm = depth_to_first_nonsandy_cm,
+    sandy_layers_n_surface = sandy_layers_n_surface,
+    pct_sandy_0_150 = pct_sandy,
+    mean_sand_0_150 = mean_sand,
+    mean_clay_0_150 = mean_clay,
+    has_bt_below_mantle = has_bt_below_mantle,
+    delta_clay_at_mantle_break = delta_clay,
+    delta_sand_at_mantle_break = delta_sand,
+    abrupt_sand_to_bt_transition = abrupt
+  )
+}
+
+overlap_thick <- function(top, bot, a, b) {
+  pmax(0, pmin(bot, b) - pmax(top, a))
+}
+
+calc_plinthite_indices <- function(df, upper_limit = 150) {
+
+  d <- df %>%
+    mutate(
+      hzdept = as.numeric(hzdept),
+      hzdepb = as.numeric(hzdepb),
+      hz_thick = hzdepb - hzdept,
+
+      has_v_suffix = !is.na(L_suffix) & str_detect(str_to_lower(L_suffix), "v"),
+
+      # fallback: horizon name ends with v / has plinthitic-style v code
+      has_v_name = is.na(L_suffix) & !is.na(hzname_clean) &
+        str_detect(str_to_lower(hzname_clean), "v[0-9]*$|v[a-z]*[0-9]*$"),
+
+      plinthitic_hz = has_v_suffix | has_v_name
+    ) %>%
+    filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+    arrange(hzdept, hzdepb)
+
+  if (nrow(d) == 0) {
+    return(tibble(
+      plinthite_flag = NA,
+      top_depth_plinthite = NA_real_,
+      plinthite_thickness_cm = NA_real_,
+      pct_plinthite_by_hz = NA_real_,
+      pct_plinthite_by_thickness = NA_real_,
+      plinthite_overlap_0_150_cm = NA_real_,
+      plinthite_within_150cm_flag = NA
+    ))
+  }
+
+  profile_top <- min(d$hzdept, na.rm = TRUE)
+  profile_bottom <- max(d$hzdepb, na.rm = TRUE)
+  profile_thickness <- profile_bottom - profile_top
+
+  d <- d %>%
+    mutate(
+      ov_0_150 = overlap_thick(hzdept, hzdepb, 0, upper_limit)
+    )
+
+  plinthite_flag <- any(d$plinthitic_hz, na.rm = TRUE)
+
+  top_depth_plinthite <- if (plinthite_flag) {
+    min(d$hzdept[d$plinthitic_hz], na.rm = TRUE)
+  } else {
+    NA_real_
+  }
+
+  plinthite_thickness_cm <- sum(d$hz_thick[d$plinthitic_hz], na.rm = TRUE)
+
+  pct_plinthite_by_hz <- 100 * mean(d$plinthitic_hz, na.rm = TRUE)
+
+  pct_plinthite_by_thickness <- if (is.finite(profile_thickness) && profile_thickness > 0) {
+    100 * plinthite_thickness_cm / profile_thickness
+  } else {
+    NA_real_
+  }
+
+  plinthite_overlap_0_150_cm <- sum(d$ov_0_150[d$plinthitic_hz], na.rm = TRUE)
+
+  plinthite_within_150cm_flag <- any(d$plinthitic_hz & d$ov_0_150 > 0, na.rm = TRUE)
+
+  tibble(
+    plinthite_flag = plinthite_flag,
+    top_depth_plinthite = top_depth_plinthite,
+    plinthite_thickness_cm = plinthite_thickness_cm,
+    pct_plinthite_by_hz = pct_plinthite_by_hz,
+    pct_plinthite_by_thickness = pct_plinthite_by_thickness,
+    plinthite_overlap_0_150_cm = plinthite_overlap_0_150_cm,
+    plinthite_within_150cm_flag = plinthite_within_150cm_flag
+  )
+}
+
+calc_argillic_kandic_pale_indices <- function(df, upper = 150) {
+  d <- df %>%
+    mutate(
+      hzdept = as.numeric(hzdept),
+      hzdepb = as.numeric(hzdepb),
+      hz_thick = hzdepb - hzdept,
+      has_bt_like = (!is.na(L_suffix) & str_detect(str_to_lower(L_suffix), "t")) |
+        (!is.na(hzname_clean) & str_detect(hzname_clean, "^Bt")) |
+        (!is.na(hzname) & str_detect(hzname, "^Bt"))
+    ) %>%
+    filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept) %>%
+    arrange(hzdept, hzdepb)
+
+  if (nrow(d) == 0) {
+    return(tibble(
+      argillic_kandic_pale_flag = NA,
+      depth_to_argillic_kandic_pale_cm = NA_real_
+    ))
+  }
+
+  argillic_kandic_pale_flag <- any(d$has_bt_like, na.rm = TRUE)
+
+  depth_to_argillic_kandic_pale_cm <- if (argillic_kandic_pale_flag) {
+    min(d$hzdept[d$has_bt_like], na.rm = TRUE)
+  } else {
+    NA_real_
+  }
+
+  tibble(
+    argillic_kandic_pale_flag = argillic_kandic_pale_flag,
+    depth_to_argillic_kandic_pale_cm = depth_to_argillic_kandic_pale_cm
+  )
+}
+```
+
+```{r}
+# Load data
+perry_fp <- read_csv("../data/Perry_FP_data_with_taxa_02_20_2026.csv")
+ncss <- pedon_pack_150_p %>%
+  mutate(peiid = as.character(peiid))
+min_or_na <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) == 0) NA_real_ else min(x)
+}
+# ============================================================
+# CLEAN PERRY HORIZON TABLE
+# ============================================================
+
+perry_fp_clean <- perry_fp %>%
+  mutate(
+    Point = as.character(Point),
+    Horizon = as.character(Horizon),
+    To.Depth..cm. = as.character(To.Depth..cm.),
+
+    taxclname   = na_if(str_squish(as.character(taxclname)), ""),
+    taxorder    = na_if(str_squish(as.character(taxorder)), ""),
+    taxsuborder = na_if(str_squish(as.character(taxsuborder)), ""),
+    taxgrtgroup = na_if(str_squish(as.character(taxgrtgroup)), ""),
+    taxsubgrp   = na_if(str_squish(as.character(taxsubgrp)), ""),
+    taxpartsize = na_if(str_squish(as.character(taxpartsize)), ""),
+
+    taxpartsize = str_to_lower(taxpartsize)
+  ) %>%
+  mutate(parsed = purrr::map2(taxsubgrp, taxgrtgroup, parse_subgrp_mods)) %>%
+  tidyr::unnest_wider(parsed) %>%
+  mutate(
+    taxgrtgroup = coalesce(taxgrtgroup, subgrp_gg)
+  ) %>%
+  select(-subgrp_gg)
+
+# ============================================================
+# BUILD PERRY PEDON PACK 0-150 CM
+# ============================================================
+
+build_perry_pedon_pack_0_150 <- function(perry_fp) {
+
+  hz <- perry_fp %>%
+    mutate(
+      Point = as.character(Point),
+      Horizon = as.character(Horizon),
+      To.Depth..cm. = as.character(To.Depth..cm.)
+    ) %>%
+    bind_cols(parse_top_bottom(.$To.Depth..cm.)) %>%
+    mutate(
+      bottom_cm = if_else(
+        is.na(bottom_cm) & !is.na(top_cm) & !is.na(H.Depth.cm.),
+        top_cm + as.numeric(H.Depth.cm.),
+        bottom_cm
+      ),
+      top_cm = as.numeric(top_cm),
+      bottom_cm = as.numeric(bottom_cm)
+    ) %>%
+    filter(is.finite(top_cm), is.finite(bottom_cm), bottom_cm > top_cm) %>%
+    group_by(Point) %>%
+    tidyr::fill(Horizon, .direction = "down") %>%
+    ungroup() %>%
+    mutate(
+      top150 = pmax(top_cm, 0),
+      bot150 = pmin(bottom_cm, 150),
+      thk150 = pmax(0, bot150 - top150)
+    ) %>%
+    filter(thk150 > 0) %>%
+    mutate(
+      hzbase = hz_base(Horizon),
+      sand = as.numeric(lab_sand),
+      silt = as.numeric(lab_silt),
+      clay = as.numeric(lab_clay)
+    )
+
+  # ---- FIXED MUNSELL PARSING ----
+# ---- FIXED MUNSELL PARSING + RGB CONVERSION ----
+    # ---- FIXED MUNSELL PARSING + RGB CONVERSION ----
+    m_txt <- fix_munsell(hz$Matrix.Color)
+    
+    # parse RGB directly from full Munsell notation
+    rgb_df <- aqp::parseMunsell(m_txt, return_triplets = TRUE)
+    rgb_df <- as.data.frame(rgb_df)
+    
+    for (nm in c("r", "g", "b")) {
+      if (!nm %in% names(rgb_df)) rgb_df[[nm]] <- NA_real_
+    }
+    
+    # get hex directly too
+    m_hex <- aqp::parseMunsell(m_txt)
+    
+    # manually parse hue / value / chroma from cleaned strings
+    m_hue <- str_extract(m_txt, "^[A-Z0-9.]+(?=\\s)")
+    m_val <- str_extract(m_txt, "(?<=\\s)\\d+(?:\\.\\d+)?(?=/)")
+    m_chr <- str_extract(m_txt, "(?<=/)\\d+(?:\\.\\d+)?")
+    
+    hz <- hz %>%
+      mutate(
+        munsell_fixed = m_txt,
+        hue    = m_hue,
+        value  = as.numeric(m_val),
+        chroma = as.numeric(m_chr),
+        hex    = m_hex,
+        R      = as.numeric(rgb_df$r),
+        G      = as.numeric(rgb_df$g),
+        B      = as.numeric(rgb_df$b),
+        gley_flag = is_gleyed(Horizon, chroma),
+        carb_flag = is_carbonate_hz(Horizon),
+        fragipan_flag = str_detect(str_to_lower(Horizon %||% ""), "bx|btx")
+      )
+  bt_set <- c("Bt","Btg","Btc","Btcb","Btx","Btb","Btv","Btvx","Btcn","Btgb","Btgx","Btgv","Btss","Btvc","Btcv")
+  e_set  <- c("E","Eg","EB","BE","Ec","Eb","Ex")
+
+  pedon <- hz %>%
+    group_by(Point) %>%
+    summarise(
+      peiid = first(Point),
+
+      # taxonomy carried forward
+      taxclname       = first_non_na(taxclname),
+      taxorder        = first_non_na(taxorder),
+      taxsuborder     = first_non_na(taxsuborder),
+      taxgrtgroup     = first_non_na(taxgrtgroup),
+      taxsubgrp       = first_non_na(taxsubgrp),
+      taxsubgrp_mod1  = first_non_na(taxsubgrp_mod1),
+      taxsubgrp_mod2  = first_non_na(taxsubgrp_mod2),
+      taxsubgrp_mod3  = first_non_na(taxsubgrp_mod3),
+      taxpartsize     = first_non_na(taxpartsize),
+
+      # SAFE weighted means
+      sand_w = wmean_or_na(sand, thk150),
+      silt_w = wmean_or_na(silt, thk150),
+      clay_w = wmean_or_na(clay, thk150),
+
+      R_w = wmean_or_na(R, thk150),
+      G_w = wmean_or_na(G, thk150),
+      B_w = wmean_or_na(B, thk150),
+
+      has_Bt_0_150   = any(hzbase %in% bt_set),
+      has_E_0_150    = any(hzbase %in% e_set),
+      has_gley_0_150 = any(gley_flag, na.rm = TRUE),
+
+      # SAFE mins (no Inf warnings)
+      depth_to_Bt_cm   = min_or_na(top150[hzbase %in% bt_set]),
+      depth_to_E_cm    = min_or_na(top150[hzbase %in% e_set]),
+      depth_to_gley_cm = min_or_na(top150[gley_flag]),
+
+      bt_thk_0_150_cm = sum(thk150[hzbase %in% bt_set], na.rm = TRUE),
+
+      has_argillic_0_150    = any(hzbase %in% bt_set),
+      depth_to_argillic_cm  = min_or_na(top150[hzbase %in% bt_set]),
+      argillic_thk_0_150_cm = sum(thk150[hzbase %in% bt_set], na.rm = TRUE),
+
+      any_argillic  = any(hzbase %in% bt_set),
+      any_gleyed    = any(gley_flag, na.rm = TRUE),
+      any_fragipan  = any(fragipan_flag, na.rm = TRUE),
+      any_carbonate = any(carb_flag, na.rm = TRUE),
+
+      .groups = "drop"
+    )
+
+  hz_levels <- c(
+    "A","Ap","Ab","Ag","E","Eg","Ex","B","Bc","Bh","Bt","Btg","Btgx","Btss","BC",
+    "C","Cg","Oa","Oe","R","Unknown"
+  )
+
+    prop <- hz %>%
+    mutate(hzbase = factor(hzbase, levels = hz_levels)) %>%
+    group_by(Point, hzbase) %>%
+    summarise(thk = sum(thk150, na.rm = TRUE), .groups = "drop") %>%
+    group_by(Point) %>%
+    mutate(
+      total_thk = sum(thk, na.rm = TRUE),
+      prop = dplyr::if_else(total_thk > 0, thk / total_thk, 0)
+    ) %>%
+    ungroup() %>%
+    select(Point, hzbase, prop) %>%
+    tidyr::complete(Point, hzbase, fill = list(prop = 0)) %>%
+    pivot_wider(names_from = hzbase, values_from = prop, names_prefix = "prop_hzbase_")
+
+  pedon %>%
+    left_join(prop, by = c("peiid" = "Point")) %>%
+    select(-Point) %>%
+    mutate(across(where(is.integer), as.double))
+}
+
+# ============================================================
+# REBUILD PERRY PACK
+# ============================================================
+perry_fp_clean <- perry_fp %>%
+  mutate(
+    Point = as.character(Point),
+    Horizon = as.character(Horizon),
+    To.Depth..cm. = as.character(To.Depth..cm.),
+
+    taxclname   = na_if(str_squish(as.character(taxclname)), ""),
+    taxorder    = na_if(str_squish(as.character(taxorder)), ""),
+    taxsuborder = na_if(str_squish(as.character(taxsuborder)), ""),
+    taxgrtgroup = na_if(str_squish(as.character(taxgrtgroup)), ""),
+    taxsubgrp   = na_if(str_squish(as.character(taxsubgrp)), ""),
+    taxpartsize = na_if(str_squish(as.character(taxpartsize)), ""),
+
+    taxpartsize = str_to_lower(taxpartsize)
+  ) %>%
+  mutate(parsed = purrr::map2(taxsubgrp, taxgrtgroup, parse_subgrp_mods)) %>%
+  tidyr::unnest_wider(parsed) %>%
+  mutate(
+    taxgrtgroup = coalesce(taxgrtgroup, subgrp_gg)
+  ) %>%
+  select(-subgrp_gg)
+# --- Perry horizon table in NCSS-like schema ---
+perry_hz_for_indices <- perry_fp_clean %>%
+  bind_cols(parse_top_bottom(.$To.Depth..cm.)) %>%
+  mutate(
+    hzdept = as.numeric(top_cm),
+    hzdepb = if_else(
+      !is.na(bottom_cm),
+      as.numeric(bottom_cm),
+      as.numeric(top_cm) + as.numeric(H.Depth.cm.)
+    ),
+    hzname = Horizon,
+    hzname_clean = Horizon,
+    sandtotmeasured = as.numeric(lab_sand),
+    silttotmeasured = as.numeric(lab_silt),
+    claytotmeasured = as.numeric(lab_clay),
+    cec7 = NA_real_,
+    texcl = lab_texture_class,
+    peiid = as.character(Point),
+    hz_base = hz_base(Horizon),
+    L_suffix = case_when(
+      str_detect(str_to_lower(Horizon), "^btg") ~ "tg",
+      str_detect(str_to_lower(Horizon), "^bt")  ~ "t",
+      str_detect(str_to_lower(Horizon), "^bx")  ~ "x",
+      str_detect(str_to_lower(Horizon), "^bh")  ~ "h",
+      str_detect(str_to_lower(Horizon), "^bg")  ~ "g",
+      str_detect(str_to_lower(Horizon), "^ap")  ~ "p",
+      TRUE ~ NA_character_
+    ),
+    hz_guess = hz_base
+  ) %>%
+  filter(is.finite(hzdept), is.finite(hzdepb), hzdepb > hzdept)
+
+perry_pack_150 <- build_perry_pedon_pack_0_150(perry_fp_clean) %>%
+  mutate(peiid = as.character(peiid)) %>%
+  distinct(peiid, .keep_all = TRUE)
+# --- Reuse NCSS-derived pedon index functions on Perry ---
+perry_sandy_150 <- perry_hz_for_indices %>%
+  select(peiid, hzdept, hzdepb, hzname, hzname_clean, L_suffix, texcl,
+         sandtotmeasured, claytotmeasured) %>%
+  group_by(peiid) %>%
+  group_modify(~ calc_sandy_indices(.x, interval_top = 0, interval_bot = 150)) %>%
+  ungroup()
+
+perry_plinthite_150 <- perry_hz_for_indices %>%
+  select(peiid, hzdept, hzdepb, hzname_clean, L_suffix, hz_guess) %>%
+  group_by(peiid) %>%
+  group_modify(~ calc_plinthite_indices(.x, upper_limit = 150)) %>%
+  ungroup()
+
+perry_arg_kand_pale_150 <- perry_hz_for_indices %>%
+  select(peiid, hzdept, hzdepb, hzname, hzname_clean, L_suffix,
+         claytotmeasured, sandtotmeasured, cec7) %>%
+  group_by(peiid) %>%
+  group_modify(~ calc_argillic_kandic_pale_indices(.x, upper = 150)) %>%
+  ungroup()
+
+# --- Join onto pedon pack ---
+perry_pack_150 <- perry_pack_150 %>%
+  left_join(perry_sandy_150, by = "peiid") %>%
+  left_join(perry_plinthite_150, by = "peiid") %>%
+  left_join(perry_arg_kand_pale_150, by = "peiid")
+
+```
+
+```{r}
+
+
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0) y else x
+}
+
+add_top1_margin <- function(pred_df) {
+  pred_cols <- names(pred_df)[
+    stringr::str_detect(names(pred_df), "^\\.pred_") & names(pred_df) != ".pred_class"
+  ]
+
+  pred_df %>%
+    rowwise() %>%
+    mutate(
+      probs  = list(c_across(all_of(pred_cols))),
+      top1   = max(probs, na.rm = TRUE),
+      top2   = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(-probs)
+}
+
+pad_like_train_raw <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
+
+  missing <- setdiff(req, names(out))
+
+  for (nm in missing) {
+    tmpl <- train_df[[nm]]
+
+    if (stringr::str_detect(nm, "^prop_hzbase_")) {
+      out[[nm]] <- 0
+    } else if (stringr::str_detect(nm, "^(any_|has_)")) {
+      out[[nm]] <- FALSE
+    } else if (is.logical(tmpl)) {
+      out[[nm]] <- FALSE
+    } else if (is.numeric(tmpl) || is.integer(tmpl) || is.double(tmpl)) {
+      out[[nm]] <- NA_real_
+    } else {
+      out[[nm]] <- NA_character_
+    }
+  }
+
+  out %>%
+    mutate(across(where(is.logical), ~ tidyr::replace_na(.x, FALSE))) %>%
+    mutate(across(where(is.integer), as.double)) %>%
+    select(any_of(c("peiid", req)))
+}
+
+deploy_plain_to_perry <- function(bundle, perry_pack) {
+  outcome <- bundle$outcome
+
+  perry_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+
+  x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  missing_baked <- setdiff(bundle$x_cols, names(x_perry))
+  if (length(missing_baked) > 0) {
+    stop("Missing baked columns in Perry for ", bundle$name, ": ",
+         paste(missing_baked, collapse = ", "))
+  }
+
+  x_perry <- x_perry %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+  pred <- bind_cols(
+    perry_raw %>% select(peiid),
+    predict(bundle$final_fit, new_data = x_perry, type = "prob"),
+    predict(bundle$final_fit, new_data = x_perry, type = "class")
+  ) %>%
+    add_top1_margin() %>%
+    mutate(
+      model_name = bundle$name,
+      outcome = bundle$outcome,
+      model_type = bundle$model_type
+    )
+
+  pred
+}
+
+deploy_umap_hdb_to_perry <- function(bundle, perry_pack) {
+  outcome <- bundle$outcome
+
+  perry_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+
+  x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  missing_baked <- setdiff(bundle$x_cols, names(x_perry))
+  if (length(missing_baked) > 0) {
+    stop("Missing baked columns in Perry for ", bundle$name, ": ",
+         paste(missing_baked, collapse = ", "))
+  }
+
+  x_perry <- x_perry %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+# UMAP transform
+  if (is.null(bundle$umap_fit)) {
+    stop("bundle$umap_fit is NULL for ", bundle$name)
+  }
+  
+  z_perry <- as.data.frame(
+    uwot::umap_transform(
+      X = as.matrix(x_perry),
+      model = bundle$umap_fit
+    )
+  )
+  names(z_perry) <- bundle$umap_colnames
+
+  train_z <- bundle$train_umap_features
+  train_cluster <- bundle$hdb_fit$cluster
+
+  nearest_idx <- apply(as.matrix(z_perry), 1, function(z) {
+    d <- rowSums((train_z - matrix(z, nrow = nrow(train_z), ncol = ncol(train_z), byrow = TRUE))^2)
+    which.min(d)
+  })
+
+  perry_cluster <- train_cluster[nearest_idx]
+  hdb_levels <- sort(unique(train_cluster))
+
+  perry_model_dat <- bind_cols(
+    z_perry,
+    hdb_cluster = factor(perry_cluster, levels = hdb_levels),
+    hdb_noise = factor(if_else(perry_cluster == 0, "noise", "cluster"),
+                       levels = c("cluster", "noise"))
+  )
+
+  pred <- bind_cols(
+    perry_raw %>% select(peiid),
+    predict(bundle$final_fit, new_data = perry_model_dat, type = "prob"),
+    predict(bundle$final_fit, new_data = perry_model_dat, type = "class")
+  ) %>%
+    add_top1_margin() %>%
+    mutate(
+      model_name = bundle$name,
+      outcome = bundle$outcome,
+      model_type = bundle$model_type
+    )
+
+  pred
+}
+
+deploy_bundle_to_perry <- function(bundle, perry_pack) {
+  if (bundle$model_type == "plain") {
+    deploy_plain_to_perry(bundle, perry_pack)
+  } else if (bundle$model_type == "umap_hdb") {
+    deploy_umap_hdb_to_perry(bundle, perry_pack)
+  } else {
+    stop("Unknown model_type: ", bundle$model_type)
+  }
+}
+
+best_model_bundles <- list(
+  taxorder_rf_umap_hdb      = readRDS("../outputs/models/taxorder_rf_umap_hdb_bundle.rds"),
+  taxsuborder_rf_plain      = readRDS("../outputs/models/taxsuborder_rf_plain_bundle.rds"),
+  taxgrtgroup_xgb_umap_hdb  = readRDS("../outputs/models/taxgrtgroup_xgb_umap_hdb_bundle.rds"),
+  taxsubgrp_xgb_plain       = readRDS("../outputs/models/taxsubgrp_xgb_plain_bundle.rds"),
+  taxpartsize_rf_plain      = readRDS("../outputs/models/taxpartsize_rf_plain_bundle.rds")
+)
+names(best_model_bundles) <- purrr::map_chr(best_model_bundles, "name")
+
+names(best_model_bundles)
+load_bundle_umap_models <- function(bundle) {
+  if ((bundle$model_type %||% "") == "umap_hdb") {
+    if (is.null(bundle$umap_model_file)) {
+      stop("Bundle missing umap_model_file: ", bundle$name)
+    }
+    bundle$umap_fit <- uwot::load_uwot(bundle$umap_model_file)
+  }
+  bundle
+}
+best_model_bundles <- purrr::map(best_model_bundles, load_bundle_umap_models)
+perry_preds <- purrr::imap(
+  best_model_bundles,
+  ~ deploy_bundle_to_perry(.x, perry_pack_150)
+)
+
+names(perry_preds)
+```
+
+
+
+
+
+
+```{r}
+# -------------------------------
+# Pad new raw data to match training raw columns
+# -------------------------------
+pad_like_train_raw <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
+
+  missing <- setdiff(req, names(out))
+
+  for (nm in missing) {
+    tmpl <- train_df[[nm]]
+
+    if (str_detect(nm, "^prop_hzbase_")) {
+      out[[nm]] <- 0
+    } else if (str_detect(nm, "^(any_|has_)")) {
+      out[[nm]] <- FALSE
+    } else if (is.logical(tmpl)) {
+      out[[nm]] <- FALSE
+    } else if (is.numeric(tmpl) || is.integer(tmpl) || is.double(tmpl)) {
+      out[[nm]] <- NA_real_
+    } else {
+      out[[nm]] <- NA_character_
+    }
+  }
+
+  out %>%
+    mutate(across(where(is.integer), as.double)) %>%
+    select(any_of(c("peiid", req)))
+}
+
+# -------------------------------
+# Fit one UMAP + RF model
+# -------------------------------
+fit_umap_rf_workflow <- function(
+  ncss_df,
+  outcome,
+  min_n = NULL,
+  filter_expr = NULL,
+  seed_split = 101,
+  seed_umap = 202,
+  k_umap = 10,
+  n_neighbors = 15
+) {
+  outcome <- rlang::as_name(rlang::ensym(outcome))
+  outcome_sym <- rlang::sym(outcome)
+
+  if (!outcome %in% names(ncss_df)) {
+    stop("Outcome column not found in ncss_df: ", outcome)
+  }
+
+  tax_cols <- c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxsuborder", "taxgrtgroup", "taxsubgrp",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize", "taxmineralogy", "taxactivity", "taxtemp"
+  )
+
+  dat <- ncss_df %>%
+    mutate(peiid = as.character(peiid))
+  dat <- dat %>%
+  mutate(across(where(is.logical), ~ replace_na(.x, FALSE)))
+
+  if (!is.null(filter_expr)) {
+    dat <- dat %>% filter(!!rlang::parse_expr(filter_expr))
+  }
+
+  dat <- dat %>%
+    mutate(
+      !!outcome_sym := str_squish(as.character(.data[[outcome]])),
+      !!outcome_sym := na_if(.data[[outcome]], "")
+    )
+
+  if (outcome == "taxpartsize") {
+    dat <- dat %>%
+      mutate(!!outcome_sym := str_to_lower(.data[[outcome]]))
+  }
+
+  dat <- dat %>%
+    filter(!is.na(.data[[outcome]]))
+
+  if (!is.null(min_n)) {
+    dat <- dat %>%
+      mutate(
+        !!outcome_sym := fct_lump_min(
+          factor(.data[[outcome]]),
+          min = min_n,
+          other_level = "Other"
+        )
+      ) %>%
+      filter(.data[[outcome]] != "Other") %>%
+      droplevels()
+  } else {
+    dat <- dat %>%
+      mutate(!!outcome_sym := factor(.data[[outcome]])) %>%
+      droplevels()
+  }
+
+  if (nlevels(dat[[outcome]]) < 2) {
+    stop("Need at least 2 classes after filtering/lumping for outcome: ", outcome)
+  }
+
+  dat <- dat %>% mutate(across(where(is.integer), as.double))
+
+  set.seed(seed_split)
+  split <- initial_split(dat, prop = 0.8, strata = !!outcome_sym)
+  train <- training(split)
+  test  <- testing(split)
+
+  # remove taxonomy leaks EXCEPT the outcome itself
+  drop_cols <- setdiff(tax_cols, outcome)
+
+  # also drop leftover character predictors not id/outcome
+  char_drop <- names(train)[vapply(train, is.character, logical(1))]
+  char_drop <- setdiff(char_drop, c("peiid", outcome))
+  drop_cols <- union(drop_cols, char_drop)
+
+  train <- train %>% select(-any_of(drop_cols))
+  test  <- test  %>% select(-any_of(drop_cols))
+
+  rec <- recipe(as.formula(paste(outcome, "~ .")), data = train) %>%
+    update_role(peiid, new_role = "id") %>%
+    step_mutate_at(all_nominal_predictors(), fn = as.factor) %>%
+    step_unknown(all_nominal_predictors()) %>%
+    step_other(all_nominal_predictors(), threshold = 0.01) %>%
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+    step_zv(all_predictors()) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+
+  prep_rec <- prep(rec)
+
+  b_train <- bake(prep_rec, new_data = train)
+  b_test  <- bake(prep_rec, new_data = test)
+
+  x_train <- b_train %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+  
+  x_test <- b_test %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+  
+  # drop columns that are completely missing in training
+  all_na_cols <- names(x_train)[vapply(x_train, function(x) all(is.na(x)), logical(1))]
+  if (length(all_na_cols) > 0) {
+    message("Dropping all-NA baked columns: ", paste(all_na_cols, collapse = ", "))
+    x_train <- x_train %>% select(-all_of(all_na_cols))
+    x_test  <- x_test  %>% select(-all_of(all_na_cols))
+  }
+  
+  # align test to train columns
+  x_cols <- names(x_train)
+  x_test <- x_test %>% select(all_of(x_cols))
+  
+  # replace any remaining NA / Inf / -Inf
+  x_train <- x_train %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+  
+  x_test <- x_test %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+  
+  stopifnot(!anyNA(x_train))
+  stopifnot(!anyNA(x_test))
+
+  set.seed(seed_umap)
+  umap_fit <- uwot::umap(
+    X = as.matrix(x_train),
+    n_components = k_umap,
+    n_neighbors = max(2, min(n_neighbors, nrow(x_train) - 1)),
+    min_dist = 0.1,
+    metric = "euclidean",
+    ret_model = TRUE
+  )
+
+  z_train <- as.data.frame(umap_fit$embedding)
+  names(z_train) <- paste0("U", seq_len(ncol(z_train)))
+
+  z_test <- as.data.frame(uwot::umap_transform(as.matrix(x_test), umap_fit))
+  names(z_test) <- names(z_train)
+
+  train_umap <- bind_cols(z_train, !!outcome_sym := train[[outcome]])
+  test_umap  <- bind_cols(z_test,  !!outcome_sym := test[[outcome]])
+
+  rf_spec <- rand_forest(trees = 1000) %>%
+    set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+    set_mode("classification")
+
+  wf <- workflow() %>%
+    add_model(rf_spec) %>%
+    add_formula(as.formula(paste(outcome, "~ .")))
+
+  rf_fit <- fit(wf, data = train_umap)
+
+  pred_test <- bind_cols(
+    predict(rf_fit, test_umap, type = "prob"),
+    predict(rf_fit, test_umap, type = "class"),
+    test_umap %>% select(all_of(outcome))
+  ) %>%
+    add_top1_margin()
+
+  list(
+    outcome = outcome,
+    outcome_levels = levels(train[[outcome]]),
+    train_raw = train,
+    test_raw = test,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    umap_fit = umap_fit,
+    rf_fit = rf_fit,
+    train_umap = train_umap,
+    test_umap = test_umap,
+    pred_test = pred_test
+  )
+}
+
+# -------------------------------
+# Predict Perry with fitted workflow
+# -------------------------------
+predict_on_perry <- function(model_obj, perry_pack) {
+  outcome <- model_obj$outcome
+
+  perry_ready_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = model_obj$train_raw,
+    outcome = outcome
+  )
+  perry_ready_raw <- perry_ready_raw %>%
+  mutate(across(where(is.logical), ~ replace_na(.x, FALSE)))
+
+  x_perry <- bake(model_obj$prep_rec, new_data = perry_ready_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  # hard-align Perry baked columns to training baked columns
+  x_perry <- x_perry %>% select(all_of(model_obj$x_cols))
+
+  z_perry <- as.data.frame(
+    uwot::umap_transform(as.matrix(x_perry), model_obj$umap_fit)
+  )
+  names(z_perry) <- paste0("U", seq_len(ncol(z_perry)))
+
+  perry_umap <- bind_cols(
+    perry_ready_raw %>% select(peiid),
+    z_perry
+  )
+
+  pred <- bind_cols(
+    perry_umap %>% select(peiid),
+    predict(model_obj$rf_fit, perry_umap, type = "prob"),
+    predict(model_obj$rf_fit, perry_umap, type = "class")
+  ) %>%
+    add_top1_margin()
+
+  pred
+}
+
+# -------------------------------
+# Build pedon truth from Perry horizon table
+# -------------------------------
+build_perry_truth <- function(perry_fp_clean, truth_col, order_filter = NULL) {
+  truth_col <- rlang::as_name(rlang::ensym(truth_col))
+
+  dat <- perry_fp_clean %>%
+    mutate(
+      peiid = as.character(Point),
+      truth_val = na_if(str_squish(as.character(.data[[truth_col]])), "")
+    )
+
+  if (truth_col == "taxpartsize") {
+    dat <- dat %>% mutate(truth_val = str_to_lower(truth_val))
+  }
+
+  if (!is.null(order_filter)) {
+    dat <- dat %>% filter(taxorder == order_filter)
+  }
+
+  dat %>%
+    group_by(peiid) %>%
+    summarise(
+      n_hz = n(),
+      n_truth_nonNA = sum(!is.na(truth_val)),
+      n_truth_unique = n_distinct(truth_val[!is.na(truth_val)]),
+      truth = mode_non_na(truth_val),
+      .groups = "drop"
+    )
+}
+
+# -------------------------------
+# Validate Perry predictions
+# -------------------------------
+validate_perry_preds <- function(pred_df, truth_df) {
+  out <- pred_df %>%
+    left_join(truth_df, by = "peiid") %>%
+    filter(!is.na(truth), n_truth_unique == 1) %>%
+    mutate(
+      truth = factor(truth),
+      .pred_class = factor(as.character(.pred_class))
+    )
+
+  lvl <- union(levels(out$truth), levels(out$.pred_class))
+
+  out <- out %>%
+    mutate(
+      truth = factor(truth, levels = lvl),
+      .pred_class = factor(.pred_class, levels = lvl)
+    )
+
+  list(
+    data = out,
+    conf_mat = conf_mat(out, truth = truth, estimate = .pred_class),
+    metrics = metric_set(accuracy, kap, bal_accuracy)(out, truth = truth, estimate = .pred_class),
+    f_meas = f_meas(out, truth = truth, estimate = .pred_class, estimator = "macro")
+  )
+}
+```
+
+```{r}
+# -------------------------------
+# TAXORDER
+# -------------------------------
+order_model <- fit_umap_rf_workflow(
+  ncss_df = ncss,
+  outcome = taxorder,
+  min_n = 15,
+  seed_split = 101,
+  seed_umap = 202
+)
+
+cat("\n=== NCSS TAXORDER CONFUSION ===\n")
+print(conf_mat(order_model$pred_test, truth = taxorder, estimate = .pred_class))
+
+cat("\n=== NCSS TAXORDER METRICS ===\n")
+print(metric_set(accuracy, kap, bal_accuracy)(
+  order_model$pred_test, truth = taxorder, estimate = .pred_class
+))
+
+perry_pred_order <- predict_on_perry(order_model, perry_pack_150)
+
+perry_truth_order <- build_perry_truth(perry_fp_clean, taxorder)
+
+perry_val_order <- validate_perry_preds(perry_pred_order, perry_truth_order)
+
+cat("\n=== PERRY TAXORDER CONFUSION ===\n")
+print(perry_val_order$conf_mat)
+
+cat("\n=== PERRY TAXORDER METRICS ===\n")
+print(perry_val_order$metrics)
+print(perry_val_order$f_meas)
+
+perry_pred_order %>%
+  count(.pred_class, sort = TRUE)
+
+
+```
+```{r}
+make_plain_bundle <- function(
+  outcome,
+  train_raw,
+  prep_rec,
+  x_cols,
+  fit_obj
+) {
+  list(
+    model_type = "plain",
+    outcome = outcome,
+    train_raw = train_raw,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    fit = fit_obj
+  )
+}
+
+make_umap_hdb_bundle <- function(
+  outcome,
+  train_raw,
+  prep_rec,
+  x_cols,
+  umap_fit,
+  hdb_fit,
+  fit_obj,
+  umap_colnames
+) {
+  list(
+    model_type = "umap_hdb",
+    outcome = outcome,
+    train_raw = train_raw,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    umap_fit = umap_fit,
+    hdb_fit = hdb_fit,
+    fit = fit_obj,
+    umap_colnames = umap_colnames
+  )
+}
+
+pad_like_train_raw <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
+
+  missing <- setdiff(req, names(out))
+
+  for (nm in missing) {
+    tmpl <- train_df[[nm]]
+
+    if (str_detect(nm, "^prop_hzbase_")) {
+      out[[nm]] <- 0
+    } else if (str_detect(nm, "^(any_|has_)")) {
+      out[[nm]] <- FALSE
+    } else if (is.logical(tmpl)) {
+      out[[nm]] <- FALSE
+    } else if (is.numeric(tmpl) || is.integer(tmpl) || is.double(tmpl)) {
+      out[[nm]] <- NA_real_
+    } else {
+      out[[nm]] <- NA_character_
+    }
+  }
+
+  out %>%
+    mutate(across(where(is.logical), ~ tidyr::replace_na(.x, FALSE))) %>%
+    mutate(across(where(is.integer), as.double)) %>%
+    select(any_of(c("peiid", req)))
+}
+```
+
+```{r}
+deploy_plain_to_perry <- function(bundle, perry_pack) {
+  stopifnot(bundle$model_type == "plain")
+
+  outcome <- bundle$outcome
+
+  perry_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+
+  x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+  pred <- bind_cols(
+    perry_raw %>% select(peiid),
+    predict(bundle$final_fit, new_data = bind_cols(x_perry), type = "prob"),
+    predict(bundle$final_fit, new_data = bind_cols(x_perry), type = "class")
+  ) %>%
+    rowwise() %>%
+    mutate(
+      probs = list(c_across(starts_with(".pred_") & !matches("^\\.pred_class$"))),
+      top1 = max(probs),
+      top2 = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup()
+
+  pred
+}
+```
+
+```{r}
+deploy_umap_hdb_to_perry <- function(bundle, perry_pack) {
+  stopifnot(bundle$model_type == "umap_hdb")
+
+  outcome <- bundle$outcome
+
+  if (is.null(bundle$umap_fit)) {
+    stop("bundle$umap_fit is NULL for ", bundle$name)
+  }
+  if (is.null(bundle$hdb_fit)) {
+    stop("bundle$hdb_fit is NULL for ", bundle$name)
+  }
+  if (is.null(bundle$train_umap_features)) {
+    stop("bundle$train_umap_features is NULL for ", bundle$name)
+  }
+
+  perry_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+
+  x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  missing_baked <- setdiff(bundle$x_cols, names(x_perry))
+  if (length(missing_baked) > 0) {
+    stop("Missing baked columns in Perry for ", bundle$name, ": ",
+         paste(missing_baked, collapse = ", "))
+  }
+
+  x_perry <- x_perry %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+  z_perry <- as.data.frame(
+    uwot::umap_transform(X = as.matrix(x_perry), model = bundle$umap_fit)
+  )
+  names(z_perry) <- bundle$umap_colnames
+
+  train_z <- bundle$train_umap_features
+  train_cluster <- bundle$hdb_fit$cluster
+
+  nearest_idx <- apply(as.matrix(z_perry), 1, function(z) {
+    d <- rowSums((train_z - matrix(z, nrow = nrow(train_z), ncol = ncol(train_z), byrow = TRUE))^2)
+    which.min(d)
+  })
+
+  perry_cluster <- train_cluster[nearest_idx]
+  hdb_levels <- sort(unique(train_cluster))
+
+  perry_model_dat <- bind_cols(
+    z_perry,
+    hdb_cluster = factor(perry_cluster, levels = hdb_levels),
+    hdb_noise = factor(if_else(perry_cluster == 0, "noise", "cluster"),
+                       levels = c("cluster", "noise"))
+  )
+
+  pred <- bind_cols(
+    perry_raw %>% select(peiid),
+    predict(bundle$final_fit, new_data = perry_model_dat, type = "prob"),
+    predict(bundle$final_fit, new_data = perry_model_dat, type = "class")
+  ) %>%
+    add_top1_margin() %>%
+    mutate(
+      model_name = bundle$name,
+      outcome = bundle$outcome,
+      model_type = bundle$model_type
+    )
+
+  pred
+}
+```
+
+```{r}
+add_hdbscan_features <- function(train_umap, test_umap, outcome, minPts = 10) {
+
+  x_train <- train_umap %>% select(-all_of(outcome))
+  x_test  <- test_umap  %>% select(-all_of(outcome))
+
+  hdb_fit <- dbscan::hdbscan(
+    as.matrix(x_train),
+    minPts = minPts
+  )
+
+  # store training coords for later Perry prediction
+  hdb_fit$data <- as.matrix(x_train)
+
+  test_cluster <- predict(
+    hdb_fit,
+    newdata = as.matrix(x_test),
+    data    = as.matrix(x_train)
+  )
+
+  levs <- sort(unique(c(hdb_fit$cluster, test_cluster)))
+
+  train_hdb <- train_umap %>%
+    mutate(
+      hdb_cluster = factor(hdb_fit$cluster, levels = levs),
+      hdb_noise   = factor(if_else(hdb_fit$cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+
+  test_hdb <- test_umap %>%
+    mutate(
+      hdb_cluster = factor(test_cluster, levels = levs),
+      hdb_noise   = factor(if_else(test_cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+
+  list(
+    train = train_hdb,
+    test  = test_hdb,
+    fit   = hdb_fit
+  )
+}
+```
+
+```{r}
+# ============================================================
+# PERRY DEPLOYMENT BUNDLE + PREDICTION RUNNER
+# Assumes:
+#   - perry_pack_150 exists
+#   - the NCSS model objects from your training script still exist
+# ============================================================
+
+library(tidyverse)
+library(tidymodels)
+library(uwot)
+library(dbscan)
+library(rlang)
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+`%||%` <- function(x, y) if (is.null(x) || length(x) == 0) y else x
+
+add_top1_margin <- function(pred_df) {
+  pred_cols <- names(pred_df)[
+    str_detect(names(pred_df), "^\\.pred_") & names(pred_df) != ".pred_class"
+  ]
+
+  pred_df %>%
+    rowwise() %>%
+    mutate(
+      probs  = list(c_across(all_of(pred_cols))),
+      top1   = max(probs, na.rm = TRUE),
+      top2   = ifelse(length(probs) > 1, sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(-probs)
+}
+
+pad_like_train_raw <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
+
+  missing <- setdiff(req, names(out))
+
+  for (nm in missing) {
+    tmpl <- train_df[[nm]]
+
+    if (str_detect(nm, "^prop_hzbase_")) {
+      out[[nm]] <- 0
+    } else if (str_detect(nm, "^(any_|has_)")) {
+      out[[nm]] <- FALSE
+    } else if (is.logical(tmpl)) {
+      out[[nm]] <- FALSE
+    } else if (is.numeric(tmpl) || is.integer(tmpl) || is.double(tmpl)) {
+      out[[nm]] <- NA_real_
+    } else {
+      out[[nm]] <- NA_character_
+    }
+  }
+
+  out %>%
+    mutate(across(where(is.logical), ~ tidyr::replace_na(.x, FALSE))) %>%
+    mutate(across(where(is.integer), as.double)) %>%
+    select(any_of(c("peiid", req)))
+}
+
+# build truth from Perry horizon table
+mode_non_na <- function(x) {
+  y <- x[!is.na(x) & str_squish(as.character(x)) != ""]
+  if (length(y) == 0) NA_character_ else names(sort(table(y), decreasing = TRUE))[1]
+}
+
+build_perry_truth <- function(perry_fp_clean, truth_col, order_filter = NULL) {
+  truth_col <- rlang::as_name(rlang::ensym(truth_col))
+
+  dat <- perry_fp_clean %>%
+    mutate(
+      peiid = as.character(Point),
+      truth_val = na_if(str_squish(as.character(.data[[truth_col]])), "")
+    )
+
+  if (truth_col == "taxpartsize") {
+    dat <- dat %>% mutate(truth_val = str_to_lower(truth_val))
+  }
+
+  if (!is.null(order_filter)) {
+    dat <- dat %>% filter(taxorder == order_filter)
+  }
+
+  dat %>%
+    group_by(peiid) %>%
+    summarise(
+      n_hz = n(),
+      n_truth_nonNA = sum(!is.na(truth_val)),
+      n_truth_unique = n_distinct(truth_val[!is.na(truth_val)]),
+      truth = mode_non_na(truth_val),
+      .groups = "drop"
+    )
+}
+
+validate_perry_preds <- function(pred_df, truth_df) {
+  out <- pred_df %>%
+    left_join(truth_df, by = "peiid") %>%
+    filter(!is.na(truth), n_truth_unique == 1) %>%
+    mutate(
+      truth = factor(truth),
+      .pred_class = factor(as.character(.pred_class))
+    )
+
+  lvl <- union(levels(out$truth), levels(out$.pred_class))
+
+  out <- out %>%
+    mutate(
+      truth = factor(truth, levels = lvl),
+      .pred_class = factor(.pred_class, levels = lvl)
+    )
+
+  list(
+    data = out,
+    conf_mat = conf_mat(out, truth = truth, estimate = .pred_class),
+    metrics = metric_set(accuracy, kap, bal_accuracy)(out, truth = truth, estimate = .pred_class),
+    f_meas = f_meas(out, truth = truth, estimate = .pred_class, estimator = "macro")
+  )
+}
+
+# ------------------------------------------------------------
+# Bundle constructors
+# ------------------------------------------------------------
+make_plain_bundle <- function(
+  name,
+  outcome,
+  train_raw,
+  prep_rec,
+  fit_obj
+) {
+  x_cols <- bake(prep_rec, new_data = train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    names()
+
+  list(
+    name = name,
+    model_type = "plain",
+    outcome = outcome,
+    train_raw = train_raw,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    fit = fit_obj
+  )
+}
+
+make_umap_hdb_bundle <- function(
+  name,
+  outcome,
+  train_raw,
+  prep_rec,
+  umap_fit,
+  hdb_fit,
+  fit_obj,
+  train_umap_features
+) {
+  x_cols <- bake(prep_rec, new_data = train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    names()
+
+  umap_colnames <- colnames(train_umap_features)
+
+  list(
+    name = name,
+    model_type = "umap_hdb",
+    outcome = outcome,
+    train_raw = train_raw,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    umap_fit = umap_fit,
+    hdb_fit = hdb_fit,
+    fit = fit_obj,
+    umap_colnames = umap_colnames,
+    train_umap_features = as.matrix(train_umap_features)
+  )
+}
+
+# ------------------------------------------------------------
+# Deployment functions
+# ------------------------------------------------------------
+deploy_plain_to_perry <- function(bundle, perry_pack) {
+  stopifnot(bundle$model_type == "plain")
+
+  outcome <- bundle$outcome
+
+  perry_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+
+  x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  missing_baked <- setdiff(bundle$x_cols, names(x_perry))
+  if (length(missing_baked) > 0) {
+    stop("Missing baked columns in Perry for ", bundle$name, ": ",
+         paste(missing_baked, collapse = ", "))
+  }
+
+  x_perry <- x_perry %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+  pred <- bind_cols(
+    perry_raw %>% select(peiid),
+    predict(bundle$final_fit, new_data = x_perry, type = "prob"),
+    predict(bundle$final_fit, new_data = x_perry, type = "class")
+  ) %>%
+    add_top1_margin() %>%
+    mutate(
+      model_name = bundle$name,
+      outcome = bundle$outcome,
+      model_type = bundle$model_type
+    )
+
+  pred
+}
+
+deploy_umap_hdb_to_perry <- function(bundle, perry_pack) {
+  stopifnot(bundle$model_type == "umap_hdb")
+
+  if (is.null(bundle$umap_fit)) {
+    stop("bundle$umap_fit is NULL for ", bundle$name)
+  }
+
+  outcome <- bundle$outcome
+
+  perry_raw <- pad_like_train_raw(
+    new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+
+  x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric))
+
+  missing_baked <- setdiff(bundle$x_cols, names(x_perry))
+  if (length(missing_baked) > 0) {
+    stop("Missing baked columns in Perry for ", bundle$name, ": ",
+         paste(missing_baked, collapse = ", "))
+  }
+
+  x_perry <- x_perry %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+  z_perry <- as.data.frame(
+    uwot::umap_transform(X = as.matrix(x_perry), model = bundle$umap_fit)
+  )
+  names(z_perry) <- bundle$umap_colnames
+
+  train_z <- bundle$train_umap_features
+  train_cluster <- bundle$hdb_fit$cluster
+
+  nearest_idx <- apply(as.matrix(z_perry), 1, function(z) {
+    d <- rowSums((train_z - matrix(z, nrow = nrow(train_z), ncol = ncol(train_z), byrow = TRUE))^2)
+    which.min(d)
+  })
+
+  perry_cluster <- train_cluster[nearest_idx]
+  hdb_levels <- sort(unique(train_cluster))
+
+  perry_model_dat <- bind_cols(
+    z_perry,
+    hdb_cluster = factor(perry_cluster, levels = hdb_levels),
+    hdb_noise = factor(if_else(perry_cluster == 0, "noise", "cluster"),
+                       levels = c("cluster", "noise"))
+  )
+
+  pred <- bind_cols(
+    perry_raw %>% select(peiid),
+    predict(bundle$final_fit, new_data = perry_model_dat, type = "prob"),
+    predict(bundle$final_fit, new_data = perry_model_dat, type = "class")
+  ) %>%
+    add_top1_margin() %>%
+    mutate(
+      model_name = bundle$name,
+      outcome = bundle$outcome,
+      model_type = bundle$model_type
+    )
+
+  pred
+}
+
+deploy_bundle_to_perry <- function(bundle, perry_pack) {
+  if (bundle$model_type == "plain") {
+    deploy_plain_to_perry(bundle, perry_pack)
+  } else if (bundle$model_type == "umap_hdb") {
+    deploy_umap_hdb_to_perry(bundle, perry_pack)
+  } else {
+    stop("Unknown model_type: ", bundle$model_type)
+  }
+}
+
+# ------------------------------------------------------------
+# Build model bundles from objects that already exist
+# ------------------------------------------------------------
+model_bundles <- list()
+
+# 1) taxorder : RF_umap_hdb
+if (exists("train") &&
+    exists("prep_rec") &&
+    exists("umap_fit") &&
+    exists("hdb_fit") &&
+    exists("rf_final_hdb")) {
+
+  # store train UMAP coords inside hdb_fit if not already there
+  if (is.null(hdb_fit$data)) {
+    hdb_fit$data <- as.matrix(z_train)
+  }
+
+model_bundles[["taxorder_rf_umap_hdb"]] <- make_umap_hdb_bundle(
+  name = "taxorder_rf_umap_hdb",
+  outcome = "taxorder",
+  train_raw = train,
+  prep_rec = prep_rec,
+  umap_fit = umap_fit,
+  hdb_fit = hdb_fit,
+  fit_obj = rf_final_hdb,
+  train_umap_features = z_train
+)
+}
+
+# 2) taxgrtgroup : XGB_umap_hdb
+if (exists("train_gg") &&
+    exists("prep_rec_gg") &&
+    exists("umap_fit_gg_xgb") &&
+    exists("hdb_gg_xgb") &&
+    exists("xgb_final_gg")) {
+
+  if (is.null(hdb_gg_xgb$fit$data)) {
+    hdb_gg_xgb$fit$data <- as.matrix(
+      hdb_gg_xgb$train %>% select(-taxgrtgroup, -hdb_cluster, -hdb_noise)
+    )
+  }
+
+ model_bundles[["taxgrtgroup_xgb_umap_hdb"]] <- make_umap_hdb_bundle(
+  name = "taxgrtgroup_xgb_umap_hdb",
+  outcome = "taxgrtgroup",
+  train_raw = train_gg,
+  prep_rec = prep_rec_gg,
+  umap_fit = umap_fit_gg_xgb,
+  hdb_fit = hdb_gg_xgb$fit,
+  fit_obj = xgb_final_gg,
+  train_umap_features = z_train_gg_xgb
+)
+}
+
+# 3) taxpartsize : RF_plain
+if (exists("clean_ps") &&
+    exists("res_ps")) {
+
+  model_bundles[["taxpartsize_rf_plain"]] <- make_plain_bundle(
+    name = "taxpartsize_rf_plain",
+    outcome = "taxpartsize",
+    train_raw = clean_ps$train,
+    prep_rec = prep(res_ps$recipe, training = clean_ps$train, retain = TRUE),
+    fit_obj = res_ps$final_fit
+  )
+}
+
+# OPTIONAL 4) taxsuborder : RF_plain
+# only runs if you have a real no-UMAP taxsuborder model object in memory
+if (exists("clean_so") &&
+    exists("res_so")) {
+
+  model_bundles[["taxsuborder_rf_plain"]] <- make_plain_bundle(
+    name = "taxsuborder_rf_plain",
+    outcome = "taxsuborder",
+    train_raw = clean_so$train,
+    prep_rec = prep(res_so$recipe, training = clean_so$train, retain = TRUE),
+    fit_obj = res_so$final_fit
+  )
+}
+
+# OPTIONAL 5) taxsubgrp : XGB_plain
+if (exists("clean_subgrp_xgb") &&
+    exists("res_subgrp_xgb")) {
+
+  model_bundles[["taxsubgrp_xgb_plain"]] <- make_plain_bundle(
+    name = "taxsubgrp_xgb_plain",
+    outcome = "taxsubgrp",
+    train_raw = clean_subgrp_xgb$train,
+    prep_rec = prep(res_subgrp_xgb$recipe, training = clean_subgrp_xgb$train, retain = TRUE),
+    fit_obj = res_subgrp_xgb$final_fit
+  )
+}
+
+# OPTIONAL 6) taxpartsize : XGB_plain
+if (exists("clean_ps_xgb") &&
+    exists("res_ps_xgb")) {
+
+  model_bundles[["taxpartsize_xgb_plain"]] <- make_plain_bundle(
+    name = "taxpartsize_xgb_plain",
+    outcome = "taxpartsize",
+    train_raw = clean_ps_xgb$train,
+    prep_rec = prep(res_ps_xgb$recipe, training = clean_ps_xgb$train, retain = TRUE),
+    fit_obj = res_ps_xgb$final_fit
+  )
+}
+
+cat("\n=== MODEL BUNDLES AVAILABLE ===\n")
+print(names(model_bundles))
+
+
+# ------------------------------------------------------------
+# Refresh UMAP models if uwot transform is broken
+# ------------------------------------------------------------
+refresh_umap_bundle <- function(bundle, outcome, n_components, n_neighbors, seed_umap = 2) {
+  x_train_rebuilt <- bake(bundle$prep_rec, new_data = bundle$train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    select(all_of(bundle$x_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+  set.seed(seed_umap)
+  umap_fit_rebuilt <- uwot::umap(
+    as.matrix(x_train_rebuilt),
+    n_components = n_components,
+    n_neighbors = min(n_neighbors, nrow(x_train_rebuilt) - 1),
+    min_dist = 0.1,
+    metric = "euclidean",
+    ret_model = TRUE
+  )
+
+  bundle$umap_fit <- umap_fit_rebuilt
+  bundle$train_umap_features <- umap_fit_rebuilt$embedding
+  bundle$umap_colnames <- paste0("U", seq_len(ncol(umap_fit_rebuilt$embedding)))
+
+  bundle
+}
+
+# taxorder UMAP refresh
+if ("taxorder_rf_umap_hdb" %in% names(model_bundles)) {
+  model_bundles$taxorder_rf_umap_hdb <- refresh_umap_bundle(
+    bundle = model_bundles$taxorder_rf_umap_hdb,
+    outcome = "taxorder",
+    n_components = 10,
+    n_neighbors = 15,
+    seed_umap = 2
+  )
+}
+
+# great group UMAP refresh
+if ("taxgrtgroup_xgb_umap_hdb" %in% names(model_bundles)) {
+  model_bundles$taxgrtgroup_xgb_umap_hdb <- refresh_umap_bundle(
+    bundle = model_bundles$taxgrtgroup_xgb_umap_hdb,
+    outcome = "taxgrtgroup",
+    n_components = 15,
+    n_neighbors = 10,
+    seed_umap = 140
+  )
+}
+# ------------------------------------------------------------
+# Run all available bundles on Perry
+# ------------------------------------------------------------
+perry_preds <- purrr::imap(
+  model_bundles,
+  ~ deploy_bundle_to_perry(.x, perry_pack_150)
+)
+
+cat("\n=== PERRY PREDICTION TABLES CREATED ===\n")
+print(names(perry_preds))
+
+# combined long table
+perry_preds_long <- bind_rows(perry_preds)
+
+cat("\n=== COMBINED PERRY PREDICTIONS ===\n")
+print(
+  perry_preds_long %>%
+    count(model_name, .pred_class, sort = TRUE),
+  n = 200
+)
+
+# ------------------------------------------------------------
+# Optional Perry validation against existing Perry truth
+# ------------------------------------------------------------
+# requires perry_fp_clean to exist
+perry_validations <- list()
+
+if (exists("perry_fp_clean")) {
+  for (nm in names(model_bundles)) {
+    outcome_i <- model_bundles[[nm]]$outcome
+    pred_i <- perry_preds[[nm]]
+
+    truth_i <- build_perry_truth(perry_fp_clean, !!sym(outcome_i))
+    val_i <- validate_perry_preds(pred_i, truth_i)
+
+    perry_validations[[nm]] <- val_i
+
+    cat("\n====================================================\n")
+    cat("MODEL:", nm, "\n")
+    cat("OUTCOME:", outcome_i, "\n")
+    cat("====================================================\n")
+    print(val_i$metrics)
+    print(val_i$f_meas)
+    print(val_i$conf_mat)
+  }
+}
+
+# ------------------------------------------------------------
+# Optional: save outputs
+# ------------------------------------------------------------
+# write.csv(perry_preds_long, "../outputs/perry_predictions_all_models.csv", row.names = FALSE)
+
+# individual files if desired
+# purrr::iwalk(perry_preds, ~ write.csv(.x, paste0("../outputs/", .y, "_perry_preds.csv"), row.names = FALSE))
+```
+
+
+
+
+

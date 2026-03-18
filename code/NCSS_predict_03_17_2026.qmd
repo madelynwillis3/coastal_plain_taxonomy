@@ -1,0 +1,1023 @@
+---
+title: "NCSS_predict_best_models_03_17_2026"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(uwot)
+library(forcats)
+library(beepr)
+library(yardstick)
+library(dbscan)
+library(rlang)
+library(xgboost)
+library(bonsai)
+library(beepr)
+dir.create("../outputs/models", showWarnings = FALSE, recursive = TRUE)
+
+
+pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_03_05_2026.csv") %>%
+  mutate(peiid = as.character(peiid))
+```
+
+
+```{r}
+# ============================================================
+# HELPERS
+# ============================================================
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0) y else x
+}
+
+build_plain_bundle <- function(
+  name,
+  outcome,
+  train_raw,
+  prep_rec,
+  final_fit
+) {
+  x_cols <- bake(prep_rec, new_data = train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    names()
+
+  list(
+    name = name,
+    outcome = outcome,
+    model_type = "plain",
+    train_raw = train_raw,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    final_fit = final_fit
+  )
+}
+
+build_umap_hdb_bundle <- function(
+  name,
+  outcome,
+  train_raw,
+  prep_rec,
+  final_fit,
+  umap_model_file,
+  hdb_fit,
+  z_train,
+  umap_n_components,
+  umap_n_neighbors,
+  umap_min_dist = 0.1,
+  umap_metric = "euclidean",
+  umap_seed = NA_integer_
+) {
+  x_cols <- bake(prep_rec, new_data = train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    names()
+
+  list(
+    name = name,
+    outcome = outcome,
+    model_type = "umap_hdb",
+    train_raw = train_raw,
+    prep_rec = prep_rec,
+    x_cols = x_cols,
+    final_fit = final_fit,
+    umap_model_file = umap_model_file,
+    hdb_fit = hdb_fit,
+    train_umap_features = as.matrix(z_train),
+    umap_colnames = colnames(z_train),
+    umap_settings = list(
+      n_components = umap_n_components,
+      n_neighbors = umap_n_neighbors,
+      min_dist = umap_min_dist,
+      metric = umap_metric,
+      seed = umap_seed
+    )
+  )
+}
+
+add_hdbscan_features <- function(train_umap, test_umap, outcome, minPts = 10) {
+  x_train <- train_umap %>% select(-all_of(outcome))
+  x_test  <- test_umap  %>% select(-all_of(outcome))
+
+  hdb_fit <- dbscan::hdbscan(
+    as.matrix(x_train),
+    minPts = minPts
+  )
+
+  test_cluster <- predict(
+    hdb_fit,
+    newdata = as.matrix(x_test),
+    data = as.matrix(x_train)
+  )
+
+  levs <- sort(unique(c(hdb_fit$cluster, test_cluster)))
+
+  train_hdb <- train_umap %>%
+    mutate(
+      hdb_cluster = factor(hdb_fit$cluster, levels = levs),
+      hdb_noise = factor(if_else(hdb_fit$cluster == 0, "noise", "cluster"),
+                         levels = c("cluster", "noise"))
+    )
+
+  test_hdb <- test_umap %>%
+    mutate(
+      hdb_cluster = factor(test_cluster, levels = levs),
+      hdb_noise = factor(if_else(test_cluster == 0, "noise", "cluster"),
+                         levels = c("cluster", "noise"))
+    )
+
+  list(
+    train = train_hdb,
+    test = test_hdb,
+    fit = hdb_fit
+  )
+}
+
+drop_bad_predictors <- function(train_df, test_df, outcome, id_col = "peiid", drop_cols = NULL) {
+  train_df <- train_df %>% select(-any_of(drop_cols))
+  test_df  <- test_df  %>% select(-any_of(drop_cols))
+
+  train_df <- train_df %>% mutate(across(where(is.logical), as.integer))
+  test_df  <- test_df  %>% mutate(across(where(is.logical), as.integer))
+
+  char_preds <- names(train_df)[vapply(train_df, is.character, logical(1))]
+  char_preds <- setdiff(char_preds, c(id_col, outcome))
+
+  if (length(char_preds) > 0) {
+    train_df <- train_df %>% select(-all_of(char_preds))
+    test_df  <- test_df  %>% select(-all_of(char_preds))
+  }
+
+  pred_names <- setdiff(names(train_df), c(id_col, outcome))
+  one_val <- pred_names[
+    vapply(train_df[pred_names], function(x) length(unique(x[!is.na(x)])) <= 1, logical(1))
+  ]
+
+  if (length(one_val) > 0) {
+    train_df <- train_df %>% select(-all_of(one_val))
+    test_df  <- test_df  %>% select(-all_of(one_val))
+  }
+
+  list(train = train_df, test = test_df)
+}
+
+fit_rf_direct <- function(train_df, test_df, outcome, id_col = "peiid",
+                          trees = 1500, grid_levels = 4,
+                          metric_for_best = "bal_accuracy") {
+
+  outcome_sym <- rlang::sym(outcome)
+  form <- as.formula(paste(outcome, "~ ."))
+
+  rec <- recipe(form, data = train_df) %>%
+    update_role(all_of(id_col), new_role = "id") %>%
+    step_zv(all_predictors()) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+
+  prep_rec <- prep(rec, training = train_df, retain = TRUE)
+
+  x_train <- bake(prep_rec, new_data = train_df) %>%
+    select(-all_of(c(outcome, id_col)))
+
+  p <- ncol(x_train)
+  min_class_n <- train_df %>%
+    count(!!outcome_sym) %>%
+    summarise(min_n = min(n)) %>%
+    pull(min_n)
+
+  v <- min(5, min_class_n)
+
+  rf_spec <- rand_forest(
+    trees = trees,
+    mtry = tune(),
+    min_n = tune()
+  ) %>%
+    set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+    set_mode("classification")
+
+  wf <- workflow() %>%
+    add_model(rf_spec) %>%
+    add_recipe(rec)
+
+  min_class_n <- train_df %>%
+  count(!!outcome_sym) %>%
+  summarise(min_n = min(n)) %>%
+  pull(min_n)
+  
+  v <- min(5, min_class_n)
+  
+  if (v < 2) stop("At least one class has <2 training samples.")
+  
+  folds <- vfold_cv(train_df, v = v, strata = !!outcome_sym)
+
+  grid <- grid_regular(
+    mtry(range = c(1, min(10, p))),
+    min_n(range = c(2, 20)),
+    levels = grid_levels
+  )
+
+  tuned <- tune_grid(
+    wf,
+    resamples = folds,
+    grid = grid,
+    metrics = metric_set(accuracy, kap, bal_accuracy)
+  )
+
+  best <- select_best(tuned, metric = metric_for_best)
+
+  final_fit <- finalize_workflow(wf, best) %>%
+    fit(train_df)
+
+  pred <- predict(final_fit, test_df, type = "prob") %>%
+    bind_cols(predict(final_fit, test_df, type = "class")) %>%
+    bind_cols(test_df %>% select(all_of(outcome)))
+
+  list(
+    recipe = rec,
+    prep_rec = prep_rec,
+    tuned = tuned,
+    best = best,
+    final_fit = final_fit,
+    pred = pred
+  )
+}
+
+fit_xgb_direct <- function(train_df, test_df, outcome, id_col = "peiid",
+                           metric_for_best = "bal_accuracy",
+                           grid_size = 25) {
+
+  outcome_sym <- rlang::sym(outcome)
+  form <- as.formula(paste(outcome, "~ ."))
+
+  rec <- recipe(form, data = train_df) %>%
+    update_role(all_of(id_col), new_role = "id") %>%
+    step_zv(all_predictors()) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_normalize(all_numeric_predictors())
+
+  prep_rec <- prep(rec, training = train_df, retain = TRUE)
+
+  baked_train <- bake(prep_rec, new_data = train_df) %>%
+    select(-all_of(c(outcome, id_col)))
+
+  folds <- vfold_cv(train_df, v = 5, strata = !!outcome_sym)
+
+  xgb_spec <- boost_tree(
+    trees = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune(),
+    min_n = tune(),
+    sample_size = tune(),
+    mtry = tune(),
+    stop_iter = 25
+  ) %>%
+    set_engine("xgboost") %>%
+    set_mode("classification")
+
+  wf <- workflow() %>%
+    add_model(xgb_spec) %>%
+    add_recipe(rec)
+
+  params <- parameters(
+    trees(range = c(500L, 2500L)),
+    tree_depth(range = c(2L, 8L)),
+    learn_rate(range = c(-3, -0.5)),
+    loss_reduction(range = c(-3, 1)),
+    min_n(range = c(2L, 20L)),
+    sample_prop(range = c(0.5, 1.0)),
+    finalize(mtry(), baked_train)
+  )
+
+  grid <- grid_latin_hypercube(params, size = grid_size)
+
+  tuned <- tune_grid(
+    wf,
+    resamples = folds,
+    grid = grid,
+    metrics = metric_set(bal_accuracy, kap, accuracy)
+  )
+
+  best <- select_best(tuned, metric = metric_for_best)
+
+  final_fit <- finalize_workflow(wf, best) %>%
+    fit(train_df)
+
+  pred <- predict(final_fit, test_df, type = "prob") %>%
+    bind_cols(predict(final_fit, test_df, type = "class")) %>%
+    bind_cols(test_df %>% select(all_of(outcome)))
+
+  list(
+    recipe = rec,
+    prep_rec = prep_rec,
+    tuned = tuned,
+    best = best,
+    final_fit = final_fit,
+    pred = pred
+  )
+}
+
+```
+
+```{r}
+
+set.seed(1)
+
+df_order <- pedon_pack_150_p %>%
+  mutate(taxorder = factor(taxorder)) %>%
+  mutate(taxorder = fct_lump_min(taxorder, min = 15, other_level = "Other")) %>%
+  filter(taxorder != "Other") %>%
+  droplevels()
+
+split_order <- initial_split(df_order, prop = 0.8, strata = taxorder)
+train_order <- training(split_order)
+test_order  <- testing(split_order)
+
+rec_order <- recipe(taxorder ~ ., data = train_order) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean","taxonname_key","taxclname",
+    "taxsuborder","taxgrtgroup","taxpartsize",
+    "taxsubgrp","taxsubgrp_clean",
+    "taxsubgrp_mod1","taxsubgrp_mod2","taxsubgrp_mod3",
+    "taxsubgrp_mod_group","taxgrtgroup_mod_group","taxsuborder_mod_group"
+  ))) %>%
+  step_rm(starts_with("mod_"), starts_with("is_")) %>%
+  step_string2factor(all_nominal_predictors()) %>%
+  step_unknown(all_nominal_predictors()) %>%
+  step_other(all_nominal_predictors(), threshold = 0.01) %>%
+  step_indicate_na(all_of(c(
+    "cec7_w",
+    "pct_hz_with_cec7",
+    "min_cec_per_kg_clay_0_150",
+    "median_cec_per_kg_clay_bt_zone"
+  )), prefix = "na2_") %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_mutate_at(
+    all_of(c(
+      "sandy_mantle_cm",
+      "plinthite_thickness_cm","plinthite_overlap_0_150_cm",
+      "bt_thickness_cm","argillic_thickness_cm","argillic_contiguous_max_cm"
+    )),
+    fn = ~ pmax(.x, 0)
+  ) %>%
+  step_log(all_of(c(
+    "sandy_mantle_cm",
+    "plinthite_thickness_cm","plinthite_overlap_0_150_cm",
+    "bt_thickness_cm","argillic_thickness_cm","argillic_contiguous_max_cm"
+  )), offset = 1) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_order <- prep(rec_order)
+
+x_train_order <- bake(prep_rec_order, new_data = train_order) %>%
+  select(-taxorder, -peiid) %>%
+  mutate(across(where(is.logical), as.integer))
+
+x_test_order <- bake(prep_rec_order, new_data = test_order) %>%
+  select(-taxorder, -peiid) %>%
+  mutate(across(where(is.logical), as.integer))
+
+x_train_order[!is.finite(as.matrix(x_train_order))] <- 0
+x_test_order[!is.finite(as.matrix(x_test_order))] <- 0
+
+set.seed(2)
+umap_fit_order <- uwot::umap(
+  as.matrix(x_train_order),
+  n_components = 10,
+  n_neighbors = 15,
+  min_dist = 0.1,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+umap_fit_gg <- uwot::umap(
+  as.matrix(x_train_gg),
+  n_components = 15,
+  n_neighbors = 10,
+  min_dist = 0.01,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+z_train_order <- as.data.frame(umap_fit_order$embedding)
+z_test_order <- as.data.frame(uwot::umap_transform(as.matrix(x_test_order), umap_fit_order))
+names(z_train_order) <- paste0("U", seq_len(ncol(z_train_order)))
+names(z_test_order)  <- names(z_train_order)
+
+train_umap_order <- bind_cols(z_train_order, taxorder = train_order$taxorder)
+test_umap_order  <- bind_cols(z_test_order,  taxorder = test_order$taxorder)
+
+hdb_order <- add_hdbscan_features(
+  train_umap = train_umap_order,
+  test_umap = test_umap_order,
+  outcome = "taxorder",
+  minPts = 10
+)
+
+rf_order_spec <- rand_forest(
+  trees = 1000,
+  mtry = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_order <- workflow() %>%
+  add_model(rf_order_spec) %>%
+  add_formula(taxorder ~ .)
+
+set.seed(3)
+folds_order <- vfold_cv(hdb_order$train, v = 5, strata = taxorder)
+
+grid_order <- grid_regular(
+  mtry(range = c(2, min(12, ncol(hdb_order$train) - 1))),
+  min_n(range = c(2, 25)),
+  levels = 5
+)
+
+tuned_order <- tune_grid(
+  wf_order,
+  resamples = folds_order,
+  grid = grid_order,
+  metrics = metric_set(accuracy, kap)
+)
+
+best_order <- select_best(tuned_order, metric = "kap")
+
+rf_final_order <- finalize_workflow(wf_order, best_order) %>%
+  fit(hdb_order$train)
+uwot::save_uwot(
+  umap_fit_order,
+  file = "../outputs/models/taxorder_rf_umap_hdb_umap.uwot"
+)
+pred_order <- predict(rf_final_order, hdb_order$test, type = "prob") %>%
+  bind_cols(predict(rf_final_order, hdb_order$test, type = "class")) %>%
+  bind_cols(hdb_order$test %>% select(taxorder))
+
+
+taxorder_bundle <- build_umap_hdb_bundle(
+  name = "taxorder_rf_umap_hdb",
+  outcome = "taxorder",
+  train_raw = train_order,
+  prep_rec = prep_rec_order,
+  final_fit = rf_final_order,
+  umap_model_file = "../outputs/models/taxorder_rf_umap_hdb_umap.uwot",
+  hdb_fit = hdb_order$fit,
+  z_train = z_train_order,
+  umap_n_components = 10,
+  umap_n_neighbors = 15,
+  umap_min_dist = 0.1,
+  umap_metric = "euclidean",
+  umap_seed = 2
+)
+taxorder_bundle$umap_model_file <- "../outputs/models/taxorder_rf_umap_hdb_umap.uwot"
+taxorder_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  pred_order,
+  truth = taxorder,
+  estimate = .pred_class
+)
+
+taxorder_bundle$f_meas <- f_meas(
+  pred_order,
+  truth = taxorder,
+  estimate = .pred_class,
+  estimator = "macro"
+)
+
+taxorder_bundle$conf_mat <- conf_mat(
+  pred_order,
+  truth = taxorder,
+  estimate = .pred_class
+)
+
+saveRDS(
+  taxorder_bundle,
+  "../outputs/models/taxorder_rf_umap_hdb_bundle.rds"
+)
+```
+
+```{r}
+
+set.seed(51)
+
+df_so <- pedon_pack_150_p %>%
+  mutate(
+    taxsuborder = str_squish(as.character(taxsuborder)),
+    taxsuborder = na_if(taxsuborder, "")
+  ) %>%
+  filter(!is.na(taxsuborder)) %>%
+  mutate(taxsuborder = factor(taxsuborder)) %>%
+  mutate(taxsuborder = fct_lump_min(taxsuborder, min = 15, other_level = "Other")) %>%
+  filter(taxsuborder != "Other") %>%
+  droplevels()
+
+split_so <- initial_split(df_so, prop = 0.8, strata = taxsuborder)
+train_so <- training(split_so)
+test_so  <- testing(split_so)
+
+clean_so <- drop_bad_predictors(
+  train_df = train_so,
+  test_df = test_so,
+  outcome = "taxsuborder",
+  id_col = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxgrtgroup", "taxsubgrp",
+    "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  )
+)
+
+res_so <- fit_rf_direct(
+  train_df = clean_so$train,
+  test_df = clean_so$test,
+  outcome = "taxsuborder",
+  id_col = "peiid"
+)
+taxsuborder_rf_bundle <- build_plain_bundle(
+  name = "taxsuborder_rf_plain",
+  outcome = "taxsuborder",
+  train_raw = clean_so$train,
+  prep_rec = res_so$prep_rec,
+  final_fit = res_so$final_fit
+)
+
+taxsuborder_rf_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  res_so$pred,
+  truth = taxsuborder,
+  estimate = .pred_class
+)
+
+taxsuborder_rf_bundle$f_meas <- f_meas(
+  res_so$pred,
+  truth = taxsuborder,
+  estimate = .pred_class,
+  estimator = "macro"
+)
+
+taxsuborder_rf_bundle$conf_mat <- conf_mat(
+  res_so$pred,
+  truth = taxsuborder,
+  estimate = .pred_class
+)
+
+saveRDS(
+  taxsuborder_rf_bundle,
+  "../outputs/models/taxsuborder_rf_plain_bundle.rds"
+)
+```
+
+```{r}
+
+set.seed(11)
+
+df_gg <- pedon_pack_150_p %>%
+  mutate(taxgrtgroup = factor(taxgrtgroup)) %>%
+  filter(!is.na(taxgrtgroup), taxgrtgroup != "") %>%
+  mutate(taxgrtgroup = fct_lump_min(taxgrtgroup, min = 20, other_level = "Other")) %>%
+  filter(taxgrtgroup != "Other") %>%
+  droplevels()
+
+split_gg <- initial_split(df_gg, prop = 0.8, strata = taxgrtgroup)
+train_gg <- training(split_gg)
+test_gg  <- testing(split_gg)
+
+rec_gg <- recipe(taxgrtgroup ~ ., data = train_gg) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_rm(any_of(c(
+    "taxonname_clean",
+    "taxorder", "taxsuborder",
+    "taxsubgrp", "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxpartsize"
+  ))) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_gg <- prep(rec_gg)
+
+# after baking
+x_train_gg <- bake(prep_rec_gg, new_data = train_gg) %>%
+  select(-taxgrtgroup, -peiid)
+
+x_test_gg  <- bake(prep_rec_gg, new_data = test_gg) %>%
+  select(-taxgrtgroup, -peiid)
+
+# logical -> integer
+x_train_gg <- x_train_gg %>% mutate(across(where(is.logical), as.integer))
+x_test_gg  <- x_test_gg  %>% mutate(across(where(is.logical), as.integer))
+
+# keep numeric only
+x_train_gg <- x_train_gg %>% select(where(is.numeric))
+x_test_gg  <- x_test_gg  %>% select(where(is.numeric))
+
+# replace NA / NaN / Inf for UMAP safety
+x_train_gg <- x_train_gg %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+x_test_gg <- x_test_gg %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+
+x_train_gg[is.na(x_train_gg)] <- 0
+x_test_gg[is.na(x_test_gg)] <- 0
+
+stopifnot(all(vapply(x_train_gg, is.numeric, logical(1))))
+stopifnot(sum(is.na(x_train_gg)) == 0)
+stopifnot(sum(is.na(x_test_gg)) == 0)
+stopifnot(all(is.finite(as.matrix(x_train_gg))))
+stopifnot(all(is.finite(as.matrix(x_test_gg))))
+
+set.seed(140)
+umap_fit_gg <- uwot::umap(
+  as.matrix(x_train_gg),
+  n_components = 15,
+  n_neighbors = 10,
+  min_dist = 0.01,
+  metric = "euclidean",
+  ret_model = TRUE
+)
+uwot::save_uwot(
+  umap_fit_gg,
+  file = "../outputs/models/taxgrtgroup_xgb_umap_hdb_umap.uwot"
+)
+z_train_gg <- as.data.frame(umap_fit_gg$embedding)
+z_test_gg <- as.data.frame(uwot::umap_transform(as.matrix(x_test_gg), umap_fit_gg))
+names(z_train_gg) <- paste0("U", seq_len(ncol(z_train_gg)))
+names(z_test_gg)  <- names(z_train_gg)
+
+train_umap_gg <- bind_cols(z_train_gg, taxgrtgroup = train_gg$taxgrtgroup)
+test_umap_gg  <- bind_cols(z_test_gg,  taxgrtgroup = test_gg$taxgrtgroup)
+
+hdb_gg <- add_hdbscan_features(
+  train_umap = train_umap_gg,
+  test_umap = test_umap_gg,
+  outcome = "taxgrtgroup",
+  minPts = 5
+)
+
+xgb_spec_gg <- boost_tree(
+  trees = tune(),
+  tree_depth = tune(),
+  learn_rate = tune(),
+  loss_reduction = tune(),
+  min_n = tune(),
+  sample_size = tune(),
+  mtry = tune(),
+  stop_iter = 25
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf_gg <- workflow() %>%
+  add_model(xgb_spec_gg) %>%
+  add_formula(taxgrtgroup ~ .)
+
+set.seed(141)
+folds_gg_xgb <- vfold_cv(hdb_gg$train, v = 5, strata = taxgrtgroup)
+
+xgb_params_gg <- parameters(
+  trees(range = c(500L, 2500L)),
+  tree_depth(range = c(2L, 8L)),
+  learn_rate(range = c(-3, -0.5)),
+  loss_reduction(range = c(-3, 1)),
+  min_n(range = c(2L, 20L)),
+  sample_prop(range = c(0.5, 1.0)),
+  finalize(mtry(), hdb_gg$train %>% select(-taxgrtgroup))
+)
+
+set.seed(142)
+grid_xgb_gg <- grid_latin_hypercube(xgb_params_gg, size = 25)
+
+tuned_xgb_gg <- tune_grid(
+  xgb_wf_gg,
+  resamples = folds_gg_xgb,
+  grid = grid_xgb_gg,
+  metrics = metric_set(bal_accuracy, kap, accuracy)
+)
+
+best_xgb_gg <- select_best(tuned_xgb_gg, metric = "bal_accuracy")
+
+xgb_final_gg <- finalize_workflow(xgb_wf_gg, best_xgb_gg) %>%
+  fit(hdb_gg$train)
+
+
+
+
+
+taxgrtgroup_bundle <- build_umap_hdb_bundle(
+  name = "taxgrtgroup_xgb_umap_hdb",
+  outcome = "taxgrtgroup",
+  train_raw = train_gg,
+  prep_rec = prep_rec_gg,
+  final_fit = xgb_final_gg,
+  umap_model_file = "../outputs/models/taxgrtgroup_xgb_umap_hdb_umap.uwot",
+  hdb_fit = hdb_gg$fit,
+  z_train = z_train_gg,
+  umap_n_components = 15,
+  umap_n_neighbors = 10,
+  umap_min_dist = 0.01,
+  umap_metric = "euclidean",
+  umap_seed = 140
+)
+pred_gg_xgb <- predict(xgb_final_gg, hdb_gg$test, type = "prob") %>%
+  bind_cols(predict(xgb_final_gg, hdb_gg$test, type = "class")) %>%
+  bind_cols(hdb_gg$test %>% select(taxgrtgroup))
+taxgrtgroup_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  pred_gg_xgb,
+  truth = taxgrtgroup,
+  estimate = .pred_class
+)
+
+taxgrtgroup_bundle$f_meas <- f_meas(
+  pred_gg_xgb,
+  truth = taxgrtgroup,
+  estimate = .pred_class,
+  estimator = "macro"
+)
+
+taxgrtgroup_bundle$conf_mat <- conf_mat(
+  pred_gg_xgb,
+  truth = taxgrtgroup,
+  estimate = .pred_class
+)
+
+saveRDS(
+  taxgrtgroup_bundle,
+  "../outputs/models/taxgrtgroup_xgb_umap_hdb_bundle.rds"
+)
+```
+
+
+```{r}
+set.seed(61)
+
+df_subgrp <- pedon_pack_150_p %>%
+  mutate(
+    taxsubgrp = str_squish(as.character(taxsubgrp_mod1)),
+    taxsubgrp = na_if(taxsubgrp, "")
+  ) %>%
+  filter(!is.na(taxsubgrp)) %>%
+  add_count(taxsubgrp, name = "class_n") %>%
+  filter(class_n >= 8) %>%   # or 10
+  select(-class_n) %>%
+  mutate(taxsubgrp = factor(taxsubgrp))
+
+split_subgrp <- initial_split(df_subgrp, prop = 0.8, strata = taxsubgrp)
+train_subgrp <- training(split_subgrp)
+test_subgrp  <- testing(split_subgrp)
+
+clean_subgrp_xgb <- drop_bad_predictors(
+  train_df = train_subgrp,
+  test_df = test_subgrp,
+  outcome = "taxsubgrp",
+  id_col = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxsuborder", "taxsubgrp_mod2", "taxsubgrp_mod3",
+    "taxgrtgroup", "taxpartsize"
+  )
+)
+
+res_subgrp_xgb <- fit_xgb_direct(
+  train_df = clean_subgrp_xgb$train,
+  test_df = clean_subgrp_xgb$test,
+  outcome = "taxsubgrp",
+  id_col = "peiid",
+  grid_size = 10
+)
+
+taxsubgrp_xgb_bundle <- build_plain_bundle(
+  name = "taxsubgrp_xgb_plain",
+  outcome = "taxsubgrp",
+  train_raw = clean_subgrp_xgb$train,
+  prep_rec = res_subgrp_xgb$prep_rec,
+  final_fit = res_subgrp_xgb$final_fit
+)
+
+taxsubgrp_xgb_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  res_subgrp_xgb$pred,
+  truth = taxsubgrp,
+  estimate = .pred_class
+)
+
+taxsubgrp_xgb_bundle$f_meas <- f_meas(
+  res_subgrp_xgb$pred,
+  truth = taxsubgrp,
+  estimate = .pred_class,
+  estimator = "macro"
+)
+
+taxsubgrp_xgb_bundle$conf_mat <- conf_mat(
+  res_subgrp_xgb$pred,
+  truth = taxsubgrp,
+  estimate = .pred_class
+)
+
+saveRDS(
+  taxsubgrp_xgb_bundle,
+  "../outputs/models/taxsubgrp_xgb_plain_bundle.rds"
+)
+```
+
+```{r}
+
+set.seed(41)
+
+df_ps <- pedon_pack_150_p %>%
+  mutate(
+    taxpartsize = str_squish(as.character(taxpartsize)),
+    taxpartsize = na_if(taxpartsize, "")
+  ) %>%
+  filter(!is.na(taxpartsize)) %>%
+  add_count(taxpartsize, name = "class_n") %>%
+  filter(class_n >= 8) %>%
+  select(-class_n) %>%
+  mutate(taxpartsize = factor(taxpartsize)) %>%
+  droplevels()
+
+split_ps <- initial_split(df_ps, prop = 0.8, strata = taxpartsize)
+train_ps <- training(split_ps)
+test_ps  <- testing(split_ps)
+
+clean_ps <- drop_bad_predictors(
+  train_df = train_ps,
+  test_df = test_ps,
+  outcome = "taxpartsize",
+  id_col = "peiid",
+  drop_cols = c(
+    "taxonname_clean", "taxonname_key", "taxclname",
+    "taxorder", "taxsuborder", "taxgrtgroup",
+    "taxsubgrp", "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3"
+  )
+)
+
+res_ps <- fit_rf_direct(
+  train_df = clean_ps$train,
+  test_df = clean_ps$test,
+  outcome = "taxpartsize",
+  id_col = "peiid"
+)
+
+taxpartsize_rf_bundle <- build_plain_bundle(
+  name = "taxpartsize_rf_plain",
+  outcome = "taxpartsize",
+  train_raw = clean_ps$train,
+  prep_rec = res_ps$prep_rec,
+  final_fit = res_ps$final_fit
+)
+
+taxpartsize_rf_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  res_ps$pred,
+  truth = taxpartsize,
+  estimate = .pred_class
+)
+
+taxpartsize_rf_bundle$f_meas <- f_meas(
+  res_ps$pred,
+  truth = taxpartsize,
+  estimate = .pred_class,
+  estimator = "macro"
+)
+
+taxpartsize_rf_bundle$conf_mat <- conf_mat(
+  res_ps$pred,
+  truth = taxpartsize,
+  estimate = .pred_class
+)
+
+saveRDS(
+  taxpartsize_rf_bundle,
+  "../outputs/models/taxpartsize_rf_plain_bundle.rds"
+)
+```
+
+```{r}
+
+set.seed(71)
+
+clean_ps_xgb <- clean_ps
+
+res_ps_xgb <- fit_xgb_direct(
+  train_df = clean_ps_xgb$train,
+  test_df = clean_ps_xgb$test,
+  outcome = "taxpartsize",
+  id_col = "peiid"
+)
+
+taxpartsize_xgb_bundle <- build_plain_bundle(
+  name = "taxpartsize_xgb_plain",
+  outcome = "taxpartsize",
+  train_raw = clean_ps_xgb$train,
+  prep_rec = res_ps_xgb$prep_rec,
+  final_fit = res_ps_xgb$final_fit
+)
+
+taxpartsize_xgb_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  res_ps_xgb$pred,
+  truth = taxpartsize,
+  estimate = .pred_class
+)
+
+taxpartsize_xgb_bundle$f_meas <- f_meas(
+  res_ps_xgb$pred,
+  truth = taxpartsize,
+  estimate = .pred_class,
+  estimator = "macro"
+)
+
+taxpartsize_xgb_bundle$conf_mat <- conf_mat(
+  res_ps_xgb$pred,
+  truth = taxpartsize,
+  estimate = .pred_class
+)
+
+saveRDS(
+  taxpartsize_xgb_bundle,
+  "../outputs/models/taxpartsize_xgb_plain_bundle.rds"
+)
+```
+
+```{r}
+
+all_model_bundles <- list(
+  taxorder_rf_umap_hdb = taxorder_bundle,
+  taxsuborder_rf_plain = taxsuborder_rf_bundle,
+  taxgrtgroup_xgb_umap_hdb = taxgrtgroup_bundle,
+  taxsubgrp_xgb_plain = taxsubgrp_xgb_bundle,
+  taxpartsize_rf_plain = taxpartsize_rf_bundle,
+  taxpartsize_xgb_plain = taxpartsize_xgb_bundle
+)
+
+saveRDS(all_model_bundles, "../outputs/models/all_model_bundles.rds")
+
+names(all_model_bundles)
+```
+
+```{r}
+model_files <- list.files("../outputs/models", pattern = "_bundle\\.rds$", full.names = TRUE)
+
+model_objs <- lapply(model_files, readRDS)
+
+ncss_metric_summary <- purrr::map_dfr(model_objs, function(x) {
+
+  met_tbl <- if (!is.null(x$metrics)) {
+    x$metrics %>%
+      dplyr::select(.metric, .estimate) %>%
+      tidyr::pivot_wider(names_from = .metric, values_from = .estimate)
+  } else {
+    tibble(
+      accuracy = NA_real_,
+      kap = NA_real_,
+      bal_accuracy = NA_real_
+    )
+  }
+
+  f1_tbl <- if (!is.null(x$f_meas)) {
+    x$f_meas %>%
+      dplyr::select(f_meas_macro = .estimate)
+  } else {
+    tibble(f_meas_macro = NA_real_)
+  }
+
+  bind_cols(
+    tibble(
+      model = x$name %||% NA_character_,
+      outcome = x$outcome %||% NA_character_
+    ),
+    met_tbl,
+    f1_tbl
+  )
+})
+
+ncss_metric_summary
+beepr::beep("wilhelm")
+```
+```{r}
+model_files <- list.files("../outputs/models", pattern = "_bundle\\.rds$", full.names = TRUE)
+model_objs <- lapply(model_files, readRDS)
+
+bundle_check <- purrr::map_dfr(model_objs, function(x) {
+  tibble(
+    name = x$name %||% NA_character_,
+    outcome = x$outcome %||% NA_character_,
+    model_type = x$model_type %||% NA_character_,
+    has_prep_rec = !is.null(x$prep_rec),
+    has_final_fit = !is.null(x$final_fit),
+    has_metrics = !is.null(x$metrics),
+    has_f_meas = !is.null(x$f_meas),
+    has_conf_mat = !is.null(x$conf_mat),
+    has_umap_fit = ifelse((x$model_type %||% "") == "umap_hdb", !is.null(x$umap_fit), NA),
+    has_hdb_fit = ifelse((x$model_type %||% "") == "umap_hdb", !is.null(x$hdb_fit), NA)
+  )
+})
+
+bundle_check
+```
+
+
+
+
