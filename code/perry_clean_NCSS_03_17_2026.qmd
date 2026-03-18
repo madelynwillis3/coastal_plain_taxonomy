@@ -832,12 +832,15 @@ deploy_bundle_to_perry <- function(bundle, perry_pack) {
     stop("Unknown model_type: ", bundle$model_type)
   }
 }
+mod1_bundle <- readRDS("../outputs/models/taxsubgrp_xgb_plain_bundle.rds")
 
+mod1_bundle$name <- "taxsubgrp_mod1_xgb_plain"
+mod1_bundle$outcome <- "taxsubgrp_mod1"
 best_model_bundles <- list(
   taxorder_rf_umap_hdb      = readRDS("../outputs/models/taxorder_rf_umap_hdb_bundle.rds"),
   taxsuborder_rf_plain      = readRDS("../outputs/models/taxsuborder_rf_plain_bundle.rds"),
   taxgrtgroup_xgb_umap_hdb  = readRDS("../outputs/models/taxgrtgroup_xgb_umap_hdb_bundle.rds"),
-  taxsubgrp_xgb_plain       = readRDS("../outputs/models/taxsubgrp_xgb_plain_bundle.rds"),
+   taxsubgrp_mod1_xgb_plain  = mod1_bundle,
   taxpartsize_rf_plain      = readRDS("../outputs/models/taxpartsize_rf_plain_bundle.rds")
 )
 names(best_model_bundles) <- purrr::map_chr(best_model_bundles, "name")
@@ -896,7 +899,31 @@ pad_like_train_raw <- function(new_df, train_df, outcome) {
     mutate(across(where(is.integer), as.double)) %>%
     select(any_of(c("peiid", req)))
 }
+coerce_raw_types_like_train <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
 
+  common <- intersect(req, names(out))
+
+  for (nm in common) {
+    tmpl <- train_df[[nm]]
+
+    if (is.integer(tmpl)) {
+      out[[nm]] <- as.integer(round(as.numeric(out[[nm]])))
+    } else if (is.double(tmpl) || is.numeric(tmpl)) {
+      out[[nm]] <- as.numeric(out[[nm]])
+    } else if (is.logical(tmpl)) {
+      out[[nm]] <- as.logical(out[[nm]])
+      out[[nm]][is.na(out[[nm]])] <- FALSE
+    } else if (is.character(tmpl)) {
+      out[[nm]] <- as.character(out[[nm]])
+    } else if (is.factor(tmpl)) {
+      out[[nm]] <- factor(as.character(out[[nm]]), levels = levels(tmpl))
+    }
+  }
+
+  out
+}
 # -------------------------------
 # Fit one UMAP + RF model
 # -------------------------------
@@ -1301,11 +1328,14 @@ deploy_plain_to_perry <- function(bundle, perry_pack) {
   outcome <- bundle$outcome
 
   perry_raw <- pad_like_train_raw(
-    new_df = perry_pack,
-    train_df = bundle$train_raw,
-    outcome = outcome
-  )
+  new_df = perry_pack,
+  train_df = bundle$train_raw,
+  outcome = outcome)
 
+  perry_raw <- coerce_raw_types_like_train(
+    new_df = perry_raw,
+    train_df = bundle$train_raw,
+    outcome = outcome)
   x_perry <- bake(bundle$prep_rec, new_data = perry_raw) %>%
     select(-any_of(c(outcome, "peiid"))) %>%
     mutate(across(where(is.logical), as.double)) %>%
@@ -1349,6 +1379,12 @@ deploy_umap_hdb_to_perry <- function(bundle, perry_pack) {
 
   perry_raw <- pad_like_train_raw(
     new_df = perry_pack,
+    train_df = bundle$train_raw,
+    outcome = outcome
+  )
+  
+  perry_raw <- coerce_raw_types_like_train(
+    new_df = perry_raw,
     train_df = bundle$train_raw,
     outcome = outcome
   )

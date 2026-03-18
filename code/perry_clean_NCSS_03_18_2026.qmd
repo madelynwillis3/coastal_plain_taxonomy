@@ -605,7 +605,14 @@ perry_pack_150 <- perry_pack_150 %>%
   left_join(perry_arg_kand_pale_150, by = "peiid")
 
 glimpse(perry_pack_150)
+
+perry_pack_150 <- perry_pack_150 %>%
+  mutate(peiid = as.character(peiid))
+
+perry_fp_clean <- perry_fp_clean %>%
+  mutate(peiid = as.character(Point))
 ```
+
 ```{r}
 # ============================================================
 # DEPLOYMENT HELPERS FOR SAVED BUNDLES
@@ -782,6 +789,7 @@ deploy_bundle_to_perry <- function(bundle, perry_pack) {
     stop("Unknown model_type: ", bundle$model_type)
   }
 }
+
 ```
 
 ```{r}
@@ -793,7 +801,7 @@ best_model_bundles <- list(
   taxorder_rf_umap_hdb     = readRDS(file.path("../outputs/models/taxorder_rf_umap_hdb_bundle.rds")),
   taxsuborder_rf_plain     = readRDS(file.path("../outputs/models/taxsuborder_rf_plain_bundle.rds")),
   taxgrtgroup_xgb_umap_hdb = readRDS(file.path( "../outputs/models/taxgrtgroup_xgb_umap_hdb_bundle.rds")),
-  taxsubgrp_xgb_plain      = readRDS(file.path( "../outputs/models/taxsubgrp_xgb_plain_bundle.rds")),
+  taxsubgrp_mod1_xgb_plain = readRDS(file.path( "../outputs/models/taxsubgrp_mod1_xgb_plain_bundle.rds")),
   taxpartsize_rf_plain     = readRDS(file.path("../outputs/models/taxpartsize_rf_plain_bundle.rds"))
 )
 
@@ -865,13 +873,26 @@ perry_preds <- purrr::imap(
 )
 
 names(perry_preds)
+perry_preds <- purrr::imap(
+  best_model_bundles,
+  ~ deploy_bundle_to_perry(.x, perry_pack_150)
+)
+
+perry_preds <- purrr::map(perry_preds, ~ .x %>% mutate(peiid = as.character(peiid)))
 ```
 ```{r}
 # ============================================================
 # COMBINED PREDICTION TABLE
 # ============================================================
-
-perry_preds_long <- bind_rows(perry_preds)
+perry_preds_long <- perry_preds %>%
+  purrr::map(~ .x %>% mutate(
+    peiid = as.character(peiid),
+    model_name = as.character(model_name),
+    outcome = as.character(outcome),
+    model_type = as.character(model_type),
+    .pred_class = as.character(.pred_class)
+  )) %>%
+  bind_rows()
 
 perry_preds_long %>%
   count(model_name, .pred_class, sort = TRUE)
@@ -888,11 +909,11 @@ build_perry_truth <- function(perry_fp_clean, truth_col, order_filter = NULL) {
   dat <- perry_fp_clean %>%
     mutate(
       peiid = as.character(Point),
-      truth_val = na_if(stringr::str_squish(as.character(.data[[truth_col]])), "")
+      truth_val = na_if(str_squish(as.character(.data[[truth_col]])), "")
     )
 
   if (truth_col == "taxpartsize") {
-    dat <- dat %>% mutate(truth_val = stringr::str_to_lower(truth_val))
+    dat <- dat %>% mutate(truth_val = str_to_lower(truth_val))
   }
 
   if (!is.null(order_filter)) {
@@ -911,6 +932,9 @@ build_perry_truth <- function(perry_fp_clean, truth_col, order_filter = NULL) {
 }
 
 validate_perry_preds <- function(pred_df, truth_df) {
+  pred_df <- pred_df %>% mutate(peiid = as.character(peiid))
+  truth_df <- truth_df %>% mutate(peiid = as.character(peiid))
+
   out <- pred_df %>%
     left_join(truth_df, by = "peiid") %>%
     filter(!is.na(truth), n_truth_unique == 1) %>%

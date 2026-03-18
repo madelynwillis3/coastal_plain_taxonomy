@@ -757,23 +757,23 @@ set.seed(61)
 
 df_subgrp <- pedon_pack_150_p %>%
   mutate(
-    taxsubgrp = str_squish(as.character(taxsubgrp_mod1)),
-    taxsubgrp = na_if(taxsubgrp, "")
+    taxsubgrp_mod1 = str_squish(as.character(taxsubgrp_mod1)),
+    taxsubgrp_mod1 = na_if(taxsubgrp_mod1, "")
   ) %>%
-  filter(!is.na(taxsubgrp)) %>%
-  add_count(taxsubgrp, name = "class_n") %>%
-  filter(class_n >= 8) %>%   # or 10
+  filter(!is.na(taxsubgrp_mod1)) %>%
+  add_count(taxsubgrp_mod1, name = "class_n") %>%
+  filter(class_n >= 8) %>%
   select(-class_n) %>%
-  mutate(taxsubgrp = factor(taxsubgrp))
+  mutate(taxsubgrp_mod1 = factor(taxsubgrp_mod1))
 
-split_subgrp <- initial_split(df_subgrp, prop = 0.8, strata = taxsubgrp)
+split_subgrp <- initial_split(df_subgrp, prop = 0.8, strata = taxsubgrp_mod1)
 train_subgrp <- training(split_subgrp)
 test_subgrp  <- testing(split_subgrp)
 
 clean_subgrp_xgb <- drop_bad_predictors(
   train_df = train_subgrp,
   test_df = test_subgrp,
-  outcome = "taxsubgrp",
+  outcome = "taxsubgrp_mod1",
   id_col = "peiid",
   drop_cols = c(
     "taxonname_clean", "taxonname_key", "taxclname",
@@ -785,14 +785,14 @@ clean_subgrp_xgb <- drop_bad_predictors(
 res_subgrp_xgb <- fit_xgb_direct(
   train_df = clean_subgrp_xgb$train,
   test_df = clean_subgrp_xgb$test,
-  outcome = "taxsubgrp",
+  outcome = "taxsubgrp_mod1",
   id_col = "peiid",
   grid_size = 10
 )
 
 taxsubgrp_xgb_bundle <- build_plain_bundle(
   name = "taxsubgrp_xgb_plain",
-  outcome = "taxsubgrp",
+  outcome = "taxsubgrp_mod1",
   train_raw = clean_subgrp_xgb$train,
   prep_rec = res_subgrp_xgb$prep_rec,
   final_fit = res_subgrp_xgb$final_fit
@@ -800,26 +800,26 @@ taxsubgrp_xgb_bundle <- build_plain_bundle(
 
 taxsubgrp_xgb_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
   res_subgrp_xgb$pred,
-  truth = taxsubgrp,
+  truth = taxsubgrp_mod1,
   estimate = .pred_class
 )
 
 taxsubgrp_xgb_bundle$f_meas <- f_meas(
   res_subgrp_xgb$pred,
-  truth = taxsubgrp,
+  truth = taxsubgrp_mod1,
   estimate = .pred_class,
   estimator = "macro"
 )
 
 taxsubgrp_xgb_bundle$conf_mat <- conf_mat(
   res_subgrp_xgb$pred,
-  truth = taxsubgrp,
+  truth = taxsubgrp_mod1,
   estimate = .pred_class
 )
 
 saveRDS(
   taxsubgrp_xgb_bundle,
-  "../outputs/models/taxsubgrp_xgb_plain_bundle.rds"
+  "../outputs/models/taxsubgrp_mod1_xgb_plain_bundle.rds"
 )
 ```
 
@@ -947,7 +947,7 @@ all_model_bundles <- list(
   taxorder_rf_umap_hdb = taxorder_bundle,
   taxsuborder_rf_plain = taxsuborder_rf_bundle,
   taxgrtgroup_xgb_umap_hdb = taxgrtgroup_bundle,
-  taxsubgrp_xgb_plain = taxsubgrp_xgb_bundle,
+  taxsubgrp_xgb_plain = taxsubgrp_mod1_xgb_bundle,
   taxpartsize_rf_plain = taxpartsize_rf_bundle,
   taxpartsize_xgb_plain = taxpartsize_xgb_bundle
 )
