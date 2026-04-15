@@ -1,0 +1,689 @@
+---
+title: "NCSS_spatial_series_LOOCV_RK"
+format: html
+---
+
+```{r setup}
+library(tidyverse)
+library(terra)
+library(sf)
+library(gstat)
+library(ranger)
+library(yardstick)
+library(tidyterra)
+library(caret)
+
+dir.create("../outputs/spatial", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-inputs}
+# ============================================================
+# LOAD ALL INPUTS
+# ============================================================
+
+# Covariate stack
+if (!exists("cov_stack")) {
+  cov_stack <- terra::rast(
+    "../data/spatial/covariate_stack_3m_all_with_SR_indices.tif"
+  )
+}
+
+# Pedon points
+if (!exists("soil_pts")) {
+  soil_pts <- sf::st_read(
+    "../data/spatial/perry_pedon_locs.shp", quiet = TRUE
+  ) %>%
+    sf::st_transform(crs = sf::st_crs(terra::crs(cov_stack))) %>%
+    rename(Point = Point_ID) %>%
+    mutate(Point = as.character(Point))
+}
+
+# Covariates already extracted at pedon locations
+if (!exists("cov_at_pedons")) {
+  cov_at_pedons <- read.csv(
+    "../outputs/spatial/covariates_at_pedons.csv"
+  ) %>%
+    mutate(Point = as.character(Point))
+}
+
+# Perry series truth
+perry_fp_clean <- read.csv(
+  "../data/Perry_FP_data_with_taxa_02_20_2026.csv"
+) %>%
+  mutate(Point = as.character(Point))
+
+perry_series_truth <- perry_fp_clean %>%
+  mutate(
+    series = na_if(str_squish(as.character(series_clean)), ""),
+    series = na_if(series, "Fill"),
+    series = na_if(series, "fill"),
+    series = str_to_title(series)
+  ) %>%
+  group_by(Point) %>%
+  summarise(
+    series = {
+      y <- series[!is.na(series)]
+      if (length(y) == 0) NA_character_
+      else names(sort(table(y), decreasing = TRUE))[1]
+    },
+    .groups = "drop"
+  )
+
+# XY coordinates
+pts_xy <- soil_pts %>%
+  st_drop_geometry() %>%
+  bind_cols(
+    st_coordinates(soil_pts) %>%
+      as.data.frame() %>%
+      rename(coord_X = X, coord_Y = Y)
+  ) %>%
+  mutate(Point = as.character(Point)) %>%
+  select(Point, coord_X, coord_Y)
+
+cat("Inputs loaded.\n")
+cat("Pedon points:", nrow(soil_pts), "\n")
+cat("Covariate rows:", nrow(cov_at_pedons), "\n")
+cat("Series truth rows:", nrow(perry_series_truth), "\n")
+```
+
+```{r build-model-df}
+# ============================================================
+# BUILD ONE-ROW-PER-PEDON MODEL DATASET
+# ============================================================
+
+# Collapse covariates to one row per Point (average if duplicated)
+cov_dedup <- cov_at_pedons %>%
+  mutate(Point = as.character(Point)) %>%
+  group_by(Point) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop")
+
+# Series truth: one row per Point
+truth_dedup <- perry_series_truth %>%
+  distinct(Point, .keep_all = TRUE)
+
+# Join everything
+model_df <- cov_dedup %>%
+  left_join(truth_dedup, by = "Point") %>%
+  left_join(pts_xy, by = "Point") %>%
+  filter(!is.na(series), !is.na(coord_X)) %>%
+  add_count(series, name = "series_n") %>%
+  filter(series_n >= 3) %>%
+  select(-series_n) %>%
+  mutate(series = factor(series))
+
+cat("Model dataset:\n")
+cat("  One row per pedon:", nrow(model_df), "\n")
+cat("  Unique points:", n_distinct(model_df$Point), "\n")
+cat("  Series:\n")
+model_df %>%
+  mutate(series = as.character(series)) %>%
+  count(series, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+# Covariate columns (no Point, series, coords)
+cov_cols <- setdiff(
+  names(model_df),
+  c("Point", "series", "coord_X", "coord_Y", "series_n")
+)
+
+# Remove zero-variance columns
+cov_cols <- cov_cols[
+  vapply(model_df[cov_cols],
+         function(x) length(unique(x[is.finite(x)])) > 1,
+         logical(1))
+]
+
+cat("Covariates:", length(cov_cols), "\n")
+```
+
+```{r loocv}
+# ============================================================
+# LOOCV: RF ON SPATIAL COVARIATES
+# Train on n-1 pedons, predict the left-out pedon
+# Repeat for all n pedons
+# ============================================================
+
+n <- nrow(model_df)
+series_levels <- levels(model_df$series)
+n_series <- length(series_levels)
+
+# Storage for LOOCV predictions
+loocv_results <- tibble(
+  Point       = character(n),
+  true_series = character(n),
+  pred_series = character(n),
+  top1_prob   = numeric(n)
+)
+
+# Storage for predicted probabilities (for kriging residuals later)
+loocv_probs <- matrix(NA_real_, nrow = n, ncol = n_series,
+                      dimnames = list(NULL, paste0("prob_", series_levels)))
+
+cat("Running LOOCV (n =", n, ")...\n")
+
+for (i in seq_len(n)) {
+
+  train_i <- model_df[-i, ]
+  test_i  <- model_df[i,  ]
+
+  # Impute NAs with column medians from training set
+  train_x <- train_i %>% select(all_of(cov_cols))
+  test_x  <- test_i  %>% select(all_of(cov_cols))
+
+  col_medians <- vapply(train_x, median, numeric(1), na.rm = TRUE)
+
+  for (nm in cov_cols) {
+    train_x[[nm]][is.na(train_x[[nm]])] <- col_medians[nm]
+    test_x[[nm]][is.na(test_x[[nm]])]   <- col_medians[nm]
+  }
+
+  # Fit RF
+  rf_i <- ranger::ranger(
+    x          = train_x,
+    y          = train_i$series,
+    num.trees  = 1000,
+    mtry       = max(2, floor(sqrt(length(cov_cols)))),
+    min.node.size = 2,
+    probability = TRUE,
+    seed       = 42 + i
+  )
+
+  # Predict left-out pedon
+  pred_i <- predict(rf_i, data = test_x)$predictions
+
+  # Align probability columns to series_levels
+  prob_row <- rep(NA_real_, n_series)
+  names(prob_row) <- series_levels
+  matched <- intersect(series_levels, colnames(pred_i))
+  prob_row[matched] <- pred_i[1, matched]
+
+  loocv_probs[i, ] <- prob_row
+
+  pred_class <- series_levels[which.max(prob_row)]
+  top1       <- max(prob_row, na.rm = TRUE)
+
+  loocv_results$Point[i]       <- model_df$Point[i]
+  loocv_results$true_series[i] <- as.character(model_df$series[i])
+  loocv_results$pred_series[i] <- pred_class
+  loocv_results$top1_prob[i]   <- top1
+
+  if (i %% 10 == 0 || i == n)
+    cat("  Fold", i, "/", n, "\n")
+}
+
+cat("\nLOOCV complete.\n")
+```
+
+```{r loocv-metrics}
+# ============================================================
+# LOOCV METRICS
+# ============================================================
+
+loocv_results <- loocv_results %>%
+  mutate(
+    correct = true_series == pred_series,
+    true_series = factor(true_series, levels = series_levels),
+    pred_series = factor(pred_series, levels = series_levels)
+  )
+
+# Overall metrics
+overall_acc <- mean(loocv_results$correct, na.rm = TRUE)
+overall_kap <- yardstick::kap_vec(
+  truth    = loocv_results$true_series,
+  estimate = loocv_results$pred_series
+)
+overall_f1 <- yardstick::f_meas_vec(
+  truth     = loocv_results$true_series,
+  estimate  = loocv_results$pred_series,
+  estimator = "macro"
+)
+
+cat("\n============================================================\n")
+cat("LOOCV RESULTS\n")
+cat("============================================================\n")
+cat("Overall accuracy:", round(overall_acc, 3), "\n")
+cat("Kappa:           ", round(overall_kap, 3), "\n")
+cat("Macro F1:        ", round(overall_f1,  3), "\n")
+
+# Per-class accuracy
+cat("\nPer-class accuracy:\n")
+loocv_results %>%
+  group_by(true_series) %>%
+  summarise(
+    n         = n(),
+    n_correct = sum(correct),
+    acc       = round(n_correct / n, 2),
+    mean_prob = round(mean(top1_prob), 2),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(acc)) %>%
+  as.data.frame() %>%
+  print()
+
+# Confusion matrix
+cat("\nConfusion matrix:\n")
+conf <- table(
+  True      = loocv_results$true_series,
+  Predicted = loocv_results$pred_series
+)
+print(conf)
+
+# Misclassification pairs
+cat("\nMisclassification pairs:\n")
+loocv_results %>%
+  filter(!correct) %>%
+  count(true_series, pred_series, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+# Save LOOCV results
+write.csv(loocv_results,
+          "../outputs/spatial/loocv_results.csv",
+          row.names = FALSE)
+```
+
+```{r fit-final-rf}
+# ============================================================
+# FIT FINAL RF ON ALL PEDONS
+# (used for wall-to-wall prediction + residual kriging)
+# ============================================================
+
+# Impute NAs
+full_x <- model_df %>% select(all_of(cov_cols))
+col_medians_full <- vapply(full_x, median, numeric(1), na.rm = TRUE)
+for (nm in cov_cols) {
+  full_x[[nm]][is.na(full_x[[nm]])] <- col_medians_full[nm]
+}
+
+set.seed(42)
+rf_final <- ranger::ranger(
+  x             = full_x,
+  y             = model_df$series,
+  num.trees     = 1500,
+  mtry          = max(2, floor(sqrt(length(cov_cols)))),
+  min.node.size = 2,
+  probability   = TRUE,
+  importance    = "permutation",
+  seed          = 42
+)
+
+cat("Final RF fitted on all", nrow(model_df), "pedons.\n")
+cat("OOB prediction error:", round(rf_final$prediction.error, 3), "\n")
+
+# In-sample predicted probabilities (for residual kriging)
+insample_probs <- rf_final$predictions
+colnames(insample_probs) <- colnames(rf_final$predictions)
+```
+
+```{r variogram-kriging}
+# ============================================================
+# REGRESSION KRIGING: FIT VARIOGRAMS ON RF RESIDUALS
+# Residual = observed indicator (0/1) - RF predicted probability
+# ============================================================
+
+variogram_fits <- list()
+krige_models   <- list()
+
+for (s in series_levels) {
+
+  if (!s %in% colnames(insample_probs)) next
+
+  resid_df <- tibble(
+    coord_X  = model_df$coord_X,
+    coord_Y  = model_df$coord_Y,
+    observed = as.integer(as.character(model_df$series) == s),
+    rf_prob  = insample_probs[, s],
+    residual = observed - rf_prob
+  ) %>%
+    filter(is.finite(residual))
+
+  if (nrow(resid_df) < 5) {
+    cat("Skipping", s, "-- fewer than 5 observations.\n")
+    next
+  }
+
+  resid_sf <- sf::st_as_sf(
+    resid_df,
+    coords = c("coord_X", "coord_Y"),
+    crs    = sf::st_crs(soil_pts)
+  )
+
+  # Empirical variogram
+  vgm_emp <- tryCatch(
+    gstat::variogram(residual ~ 1, data = resid_sf),
+    error = function(e) NULL
+  )
+  if (is.null(vgm_emp)) next
+
+  # Fit theoretical variogram
+  vgm_fit <- tryCatch(
+    gstat::fit.variogram(vgm_emp, gstat::vgm(c("Sph", "Exp"))),
+    error = function(e) tryCatch(
+      gstat::fit.variogram(vgm_emp, gstat::vgm("Exp")),
+      error = function(e2) NULL
+    )
+  )
+  if (is.null(vgm_fit)) next
+
+  variogram_fits[[s]] <- list(empirical = vgm_emp, fitted = vgm_fit)
+  krige_models[[s]]   <- list(data = resid_sf, vgm = vgm_fit)
+
+  cat("Variogram fitted:", s,
+      "| Model:", as.character(vgm_fit$model[2]),
+      "| Range:", round(vgm_fit$range[2], 1),
+      "| Sill:", round(sum(vgm_fit$psill), 4), "\n")
+}
+
+cat("\nVariograms fitted for", length(krige_models), "series.\n")
+
+# Plot variograms
+for (s in names(variogram_fits)) {
+  p <- plot(
+    variogram_fits[[s]]$empirical,
+    variogram_fits[[s]]$fitted,
+    main = paste("Variogram of RF residuals:", s)
+  )
+  print(p)
+}
+```
+
+```{r wall-to-wall}
+# ============================================================
+# WALL-TO-WALL PREDICTION
+# RF probability + kriged residual correction
+# ============================================================
+
+cat("Building pixel prediction data frame...\n")
+cov_df <- terra::as.data.frame(
+  cov_stack[[cov_cols]], xy = TRUE, na.rm = FALSE
+)
+n_pixels <- nrow(cov_df)
+cat("Total pixels:", n_pixels, "\n")
+
+# Impute NAs using full-dataset medians
+cov_pred <- cov_df %>%
+  select(all_of(cov_cols)) %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+
+for (nm in cov_cols) {
+  cov_pred[[nm]][is.na(cov_pred[[nm]])] <- col_medians_full[nm]
+}
+
+# Predict in chunks
+chunk_size <- 50000
+n_chunks   <- ceiling(n_pixels / chunk_size)
+prob_list  <- vector("list", n_chunks)
+
+cat("Predicting in", n_chunks, "chunks...\n")
+for (i in seq_len(n_chunks)) {
+  idx <- ((i-1)*chunk_size + 1):min(i*chunk_size, n_pixels)
+
+  chunk_preds <- predict(
+    rf_final,
+    data = cov_pred[idx, , drop = FALSE]
+  )$predictions
+
+  prob_list[[i]] <- as.data.frame(chunk_preds)
+  if (i %% 5 == 0 || i == n_chunks)
+    cat("  Chunk", i, "/", n_chunks, "\n")
+}
+
+all_probs <- bind_rows(prob_list)
+cat("Prediction complete. Columns:", paste(names(all_probs), collapse=", "), "\n")
+
+# Build RF probability raster stack
+prob_raster_list <- list()
+
+for (s in series_levels) {
+  if (!s %in% names(all_probs)) next
+
+  r <- terra::rast(cov_stack[[1]])
+  terra::values(r) <- all_probs[[s]]
+  names(r) <- paste0("prob_", s)
+
+  if (any(is.finite(terra::values(r)))) {
+    prob_raster_list[[s]] <- r
+  }
+}
+
+prob_rasters <- terra::rast(prob_raster_list)
+cat("RF probability rasters:", terra::nlyr(prob_rasters), "layers\n")
+```
+
+```{r krige-correction}
+# ============================================================
+# ADD KRIGED RESIDUAL CORRECTION
+# ============================================================
+
+if (length(krige_models) > 0) {
+
+  # Build prediction grid from raster (valid pixels only)
+  pred_grid <- terra::as.data.frame(
+    cov_stack[[1]], xy = TRUE, na.rm = TRUE
+  ) %>%
+    select(x, y) %>%
+    sf::st_as_sf(coords = c("x", "y"),
+                 crs = sf::st_crs(soil_pts))
+
+  cat("Kriging residuals for", length(krige_models), "series...\n")
+
+  for (s in names(krige_models)) {
+    cat("  Kriging:", s, "...\n")
+
+    krige_result <- tryCatch(
+      gstat::krige(
+        formula   = residual ~ 1,
+        locations = krige_models[[s]]$data,
+        newdata   = pred_grid,
+        model     = krige_models[[s]]$vgm,
+        debug.level = 0
+      ),
+      error = function(e) {
+        cat("    Failed:", conditionMessage(e), "\n")
+        NULL
+      }
+    )
+
+    if (is.null(krige_result)) next
+
+    # Build correction raster using rasterize (more reliable than cellFromXY)
+    krige_sf <- krige_result %>%
+      mutate(krige_val = var1.pred) %>%
+      select(krige_val)
+
+    krige_rast <- terra::rasterize(
+      terra::vect(krige_sf),
+      cov_stack[[1]],
+      field = "krige_val",
+      fun   = "mean"
+    )
+
+    # Apply correction and clamp to [0, 1]
+    layer_nm <- paste0("prob_", s)
+    if (layer_nm %in% names(prob_rasters)) {
+      corrected <- terra::clamp(
+        prob_rasters[[layer_nm]] + krige_rast,
+        lower = 0, upper = 1
+      )
+      prob_rasters[[layer_nm]] <- corrected
+      cat("    Correction applied.\n")
+    }
+  }
+} else {
+  cat("No variogram models -- skipping kriging correction.\n")
+  cat("Map will show RF probabilities only.\n")
+}
+
+# Final classified map: series with highest probability per pixel
+predicted_class_idx <- terra::which.lyr(prob_rasters)
+names(predicted_class_idx) <- "predicted_series_idx"
+
+# Series name lookup
+fitted_series <- str_remove(names(prob_rasters), "^prob_")
+series_lookup <- tibble(
+  idx    = seq_along(fitted_series),
+  series = fitted_series
+)
+
+# Save rasters
+terra::writeRaster(
+  prob_rasters,
+  "../outputs/spatial/series_prob_stack_loocv_rk.tif",
+  overwrite = TRUE
+)
+terra::writeRaster(
+  predicted_class_idx,
+  "../outputs/spatial/series_predicted_class_loocv_rk.tif",
+  overwrite = TRUE
+)
+write.csv(series_lookup,
+          "../outputs/spatial/series_index_lookup_loocv.csv",
+          row.names = FALSE)
+
+cat("Rasters saved.\n")
+```
+
+```{r visualize}
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+# Factor raster for ggplot
+predicted_factor <- terra::as.factor(predicted_class_idx)
+levels(predicted_factor) <- data.frame(
+  value  = seq_along(fitted_series),
+  series = fitted_series
+)
+
+# 1. Predicted series map
+p_map <- ggplot() +
+  tidyterra::geom_spatraster(data = predicted_factor) +
+  scale_fill_viridis_d(
+    option   = "turbo",
+    na.value = "grey90",
+    name     = "Predicted Series"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Predicted Soil Series — Perry Site",
+    subtitle = "RF + Regression Kriging (LOOCV validated, 3m resolution)"
+  )
+print(p_map)
+ggsave("../outputs/spatial/map_predicted_series_loocv_rk.png",
+       p_map, width = 10, height = 8, dpi = 200)
+
+# 2. Probability surface per series
+for (s in fitted_series) {
+  layer_nm <- paste0("prob_", s)
+  if (!layer_nm %in% names(prob_rasters)) next
+
+  p <- ggplot() +
+    tidyterra::geom_spatraster(data = prob_rasters[[layer_nm]]) +
+    scale_fill_distiller(
+      palette   = "RdYlGn",
+      direction = 1,
+      na.value  = "grey90",
+      limits    = c(0, 1),
+      name      = "Probability"
+    ) +
+    theme_minimal() +
+    labs(
+      title    = paste("Probability surface:", s),
+      subtitle = "RF + kriging correction"
+    )
+  print(p)
+  ggsave(
+    paste0("../outputs/spatial/prob_",
+           str_replace_all(s, " ", "_"), "_loocv_rk.png"),
+    p, width = 8, height = 6, dpi = 200
+  )
+}
+
+# 3. Validation overlay: LOOCV predictions at pedon locations
+loocv_sf <- loocv_results %>%
+  left_join(pts_xy, by = "Point") %>%
+  filter(!is.na(coord_X)) %>%
+  sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+               crs = sf::st_crs(soil_pts))
+
+p_val <- ggplot() +
+  tidyterra::geom_spatraster(data = predicted_factor) +
+  scale_fill_viridis_d(option = "turbo", na.value = "grey90",
+                       name = "Predicted (map)") +
+  geom_sf(data = loocv_sf,
+          aes(color = true_series, shape = correct),
+          size = 3, stroke = 1.2) +
+  scale_color_brewer(palette = "Set1", name = "True Series") +
+  scale_shape_manual(
+    values = c("TRUE" = 16, "FALSE" = 4),
+    name   = "LOOCV correct?"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "LOOCV Validation Overlay",
+    subtitle = "Circles = correct prediction; X = misclassified"
+  )
+print(p_val)
+ggsave("../outputs/spatial/map_loocv_validation_overlay.png",
+       p_val, width = 10, height = 8, dpi = 200)
+
+# 4. Variable importance
+importance_df <- tibble(
+  variable   = names(rf_final$variable.importance),
+  importance = rf_final$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(variable = fct_reorder(variable, importance))
+
+p_imp <- ggplot(importance_df %>% slice_head(n = 20),
+                aes(x = importance, y = variable)) +
+  geom_col(fill = "#2c7bb6") +
+  theme_minimal() +
+  labs(
+    title = "Variable Importance — Spatial RF (Perry Series)",
+    x     = "Permutation Importance",
+    y     = NULL
+  )
+print(p_imp)
+ggsave("../outputs/spatial/variable_importance_loocv_rf.png",
+       p_imp, width = 8, height = 6, dpi = 200)
+```
+
+```{r summary}
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+cat("\n============================================================\n")
+cat("SPATIAL SERIES PREDICTION — FINAL SUMMARY\n")
+cat("============================================================\n")
+cat("Method:            RF + Regression Kriging\n")
+cat("Validation:        Leave-One-Out Cross-Validation (LOOCV)\n")
+cat("Pedons:           ", nrow(model_df), "\n")
+cat("Series modeled:   ", length(fitted_series), "\n")
+cat("Covariates used:  ", length(cov_cols), "\n")
+cat("Variograms fitted:", length(krige_models), "\n")
+cat("\nLOOCV Performance:\n")
+cat("  Accuracy:", round(overall_acc, 3), "\n")
+cat("  Kappa:   ", round(overall_kap, 3), "\n")
+cat("  Macro F1:", round(overall_f1,  3), "\n")
+cat("\nOOB Error (full model):", round(rf_final$prediction.error, 3), "\n")
+
+if (length(variogram_fits) > 0) {
+  cat("\nVariogram ranges (spatial autocorrelation distance):\n")
+  for (s in names(variogram_fits)) {
+    cat(" ", s, ":",
+        round(variogram_fits[[s]]$fitted$range[2], 1),
+        "map units\n")
+  }
+}
+
+cat("\nTop 10 most important covariates:\n")
+importance_df %>%
+  slice_head(n = 10) %>%
+  mutate(importance = round(importance, 4)) %>%
+  as.data.frame() %>%
+  print()
+```

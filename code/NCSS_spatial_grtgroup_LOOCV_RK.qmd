@@ -1,0 +1,732 @@
+---
+title: "NCSS_spatial_grtgroup_LOOCV_RK"
+format: html
+---
+
+```{r setup}
+library(tidyverse)
+library(terra)
+library(sf)
+library(gstat)
+library(ranger)
+library(yardstick)
+library(tidyterra)
+
+dir.create("../outputs/spatial", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-inputs}
+# ============================================================
+# LOAD ALL INPUTS
+# ============================================================
+
+if (!exists("cov_stack")) {
+  cov_stack <- terra::rast(
+    "../data/spatial/covariate_stack_3m_all_with_SR_indices.tif"
+  )
+}
+
+if (!exists("soil_pts")) {
+  soil_pts <- sf::st_read(
+    "../data/spatial/perry_pedon_locs.shp", quiet = TRUE
+  ) %>%
+    sf::st_transform(crs = sf::st_crs(terra::crs(cov_stack))) %>%
+    rename(Point = Point_ID) %>%
+    mutate(Point = as.character(Point))
+}
+
+if (!exists("cov_at_pedons")) {
+  cov_at_pedons <- read.csv(
+    "../outputs/spatial/covariates_at_pedons.csv"
+  ) %>%
+    mutate(Point = as.character(Point))
+}
+
+# Perry horizon data
+perry_fp_clean <- read.csv(
+  "../data/Perry_FP_data_with_taxa_02_20_2026.csv"
+) %>%
+  mutate(Point = as.character(Point))
+
+# NCSS great group bundle
+ncss_gg_bundle <- readRDS(
+  "../outputs/models/taxgrtgroup_xgb_umap_hdb_bundle.rds"
+)
+ncss_gg_bundle$umap_fit <- uwot::load_uwot(
+  "../outputs/models/taxgrtgroup_xgb_umap_hdb_umap.uwot"
+)
+
+# Perry pack for NCSS model deployment
+if (!exists("perry_pack_150")) {
+  perry_pack_150 <- read.csv(
+    "../outputs/perry_pack_150_saved.rds"
+  ) %>%
+    mutate(peiid = as.character(peiid))
+}
+
+cat("All inputs loaded.\n")
+```
+
+```{r build-labels}
+# ============================================================
+# BUILD GREAT GROUP LABELS — TWO VERSIONS
+# Version A: from Perry field truth (taxgrtgroup column)
+# Version B: from NCSS XGB+UMAP model predictions
+# ============================================================
+
+# ---- Version A: Perry truth labels ----
+gg_truth <- perry_fp_clean %>%
+  mutate(
+    gg = na_if(str_squish(as.character(taxgrtgroup)), ""),
+    gg = str_to_title(gg)
+  ) %>%
+  group_by(Point) %>%
+  summarise(
+    gg = {
+      y <- gg[!is.na(gg)]
+      if (length(y) == 0) NA_character_
+      else names(sort(table(y), decreasing = TRUE))[1]
+    },
+    .groups = "drop"
+  ) %>%
+  distinct(Point, .keep_all = TRUE)
+
+cat("Perry truth great groups:\n")
+gg_truth %>%
+  filter(!is.na(gg)) %>%
+  count(gg, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+# ---- Version B: NCSS model predictions at Perry pedons ----
+# Deploy NCSS great group bundle to Perry pack
+
+pad_like_train_raw <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
+  missing <- setdiff(req, names(out))
+  for (nm in missing) {
+    tmpl <- train_df[[nm]]
+    if (str_detect(nm, "^prop_hzbase_"))    out[[nm]] <- 0
+    else if (str_detect(nm, "^(any_|has_)")) out[[nm]] <- FALSE
+    else if (is.logical(tmpl))  out[[nm]] <- FALSE
+    else if (is.integer(tmpl))  out[[nm]] <- NA_integer_
+    else if (is.numeric(tmpl))  out[[nm]] <- NA_real_
+    else                        out[[nm]] <- NA_character_
+  }
+  out %>%
+    mutate(across(where(is.logical), ~ tidyr::replace_na(.x, FALSE))) %>%
+    select(any_of(c("peiid", req)))
+}
+
+perry_padded <- pad_like_train_raw(
+  new_df   = perry_pack_150 %>% mutate(peiid = as.character(peiid)),
+  train_df = ncss_gg_bundle$train_raw,
+  outcome  = ncss_gg_bundle$outcome
+)
+
+# Force column classes to match
+for (nm in intersect(names(perry_padded), names(ncss_gg_bundle$train_raw))) {
+  tmpl <- ncss_gg_bundle$train_raw[[nm]]
+  if (is.integer(tmpl))    perry_padded[[nm]] <- as.integer(perry_padded[[nm]])
+  else if (is.logical(tmpl))   perry_padded[[nm]] <- as.logical(perry_padded[[nm]])
+  else if (is.numeric(tmpl))   perry_padded[[nm]] <- as.numeric(perry_padded[[nm]])
+  else if (is.character(tmpl)) perry_padded[[nm]] <- as.character(perry_padded[[nm]])
+  else if (is.factor(tmpl))    perry_padded[[nm]] <- factor(
+    as.character(perry_padded[[nm]]), levels = levels(tmpl)
+  )
+}
+
+# Bake through UMAP+HDBSCAN pipeline
+x_perry <- bake(ncss_gg_bundle$prep_rec, new_data = perry_padded) %>%
+  select(-any_of(c(ncss_gg_bundle$outcome, "peiid"))) %>%
+  mutate(across(where(is.logical), as.double)) %>%
+  select(where(is.numeric))
+
+missing_baked <- setdiff(ncss_gg_bundle$x_cols, names(x_perry))
+for (mc in missing_baked) x_perry[[mc]] <- 0
+x_perry <- x_perry %>%
+  select(all_of(ncss_gg_bundle$x_cols)) %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, 0)))
+
+z_perry <- as.data.frame(
+  uwot::umap_transform(as.matrix(x_perry), ncss_gg_bundle$umap_fit)
+)
+names(z_perry) <- ncss_gg_bundle$umap_colnames
+
+train_z  <- as.matrix(ncss_gg_bundle$train_umap_features)
+nearest_idx <- apply(as.matrix(z_perry), 1, function(z) {
+  d <- rowSums((train_z - matrix(z, nrow = nrow(train_z),
+                                  ncol = ncol(train_z), byrow = TRUE))^2)
+  which.min(d)
+})
+
+train_cluster  <- ncss_gg_bundle$hdb_fit$cluster
+perry_cluster  <- train_cluster[nearest_idx]
+hdb_levels     <- sort(unique(train_cluster))
+
+perry_model_dat <- bind_cols(
+  z_perry,
+  hdb_cluster = factor(perry_cluster, levels = hdb_levels),
+  hdb_noise   = factor(if_else(perry_cluster == 0, "noise", "cluster"),
+                       levels = c("cluster", "noise"))
+)
+
+ncss_gg_preds <- predict(ncss_gg_bundle$final_fit,
+                          perry_model_dat, type = "class") %>%
+  bind_cols(perry_padded %>% select(peiid))
+
+# Map peiid -> Point
+peiid_to_point <- perry_fp_clean %>%
+  select(Point, peiid = Point) %>%
+  distinct() 
+
+gg_ncss_pred <- ncss_gg_preds %>%
+  mutate(peiid = as.character(peiid)) %>%
+  rename(gg = .pred_class) %>%
+  mutate(Point = as.character(peiid)) %>%
+  select(Point, gg) %>%
+  distinct(Point, .keep_all = TRUE) %>%
+  mutate(gg = as.character(gg))
+
+cat("\nNCSS-predicted great groups at Perry pedons:\n")
+gg_ncss_pred %>%
+  count(gg, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+```
+
+```{r build-model-dfs}
+# ============================================================
+# BUILD ONE-ROW-PER-PEDON MODEL DATASETS
+# ============================================================
+
+# Deduplicate all source tables
+cov_dedup <- cov_at_pedons %>%
+  mutate(Point = as.character(Point)) %>%
+  group_by(Point) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop")
+
+pts_xy_dedup <- soil_pts %>%
+  st_drop_geometry() %>%
+  mutate(
+    coord_X = sf::st_coordinates(soil_pts)[, 1],
+    coord_Y = sf::st_coordinates(soil_pts)[, 2],
+    Point   = as.character(Point)
+  ) %>%
+  select(Point, coord_X, coord_Y) %>%
+  distinct(Point, .keep_all = TRUE)
+
+# ---- Model df A: Perry truth labels ----
+model_df_A <- cov_dedup %>%
+  left_join(gg_truth %>% mutate(Point = as.character(Point)),
+            by = "Point") %>%
+  left_join(pts_xy_dedup, by = "Point") %>%
+  filter(!is.na(gg), !is.na(coord_X)) %>%
+  add_count(gg, name = "gg_n") %>%
+  filter(gg_n >= 5) %>%
+  select(-gg_n) %>%
+  mutate(gg = factor(gg))
+
+stopifnot("Duplicates in model_df_A!" =
+            n_distinct(model_df_A$Point) == nrow(model_df_A))
+
+# ---- Model df B: NCSS predicted labels ----
+# model_df_B <- cov_dedup %>%
+#   left_join(gg_ncss_pred %>% mutate(Point = as.character(Point)),
+#             by = "Point") %>%
+#   left_join(pts_xy_dedup, by = "Point") %>%
+#   filter(!is.na(gg), !is.na(coord_X)) %>%
+#   add_count(gg, name = "gg_n") %>%
+#   filter(gg_n >= 5) %>%
+#   select(-gg_n) %>%
+#   mutate(gg = factor(gg))
+# 
+# stopifnot("Duplicates in model_df_B!" =
+#             n_distinct(model_df_B$Point) == nrow(model_df_B))
+# 
+# cat("Model A (truth) -- rows:", nrow(model_df_A),
+#     "| classes:", nlevels(model_df_A$gg), "\n")
+# model_df_A %>% mutate(gg = as.character(gg)) %>%
+#   count(gg, sort = TRUE) %>% as.data.frame() %>% print()
+# 
+# cat("\nModel B (NCSS predicted) -- rows:", nrow(model_df_B),
+#     "| classes:", nlevels(model_df_B$gg), "\n")
+# model_df_B %>% mutate(gg = as.character(gg)) %>%
+#   count(gg, sort = TRUE) %>% as.data.frame() %>% print()
+
+# Covariate columns
+cov_cols <- setdiff(names(model_df_A),
+                    c("Point", "gg", "coord_X", "coord_Y"))
+cov_cols <- cov_cols[
+  vapply(model_df_A[cov_cols],
+         function(x) length(unique(x[is.finite(x)])) > 1, logical(1))
+]
+cat("\nCovariates:", length(cov_cols), "\n")
+```
+
+```{r loocv-function}
+# ============================================================
+# LOOCV FUNCTION (reusable for both versions)
+# ============================================================
+
+run_loocv <- function(model_df, label = "model") {
+
+  n            <- nrow(model_df)
+  gg_levels    <- levels(model_df$gg)
+  n_classes    <- length(gg_levels)
+
+  loocv_results <- tibble(
+    Point    = character(n),
+    true_gg  = character(n),
+    pred_gg  = character(n),
+    top1     = numeric(n)
+  )
+
+  loocv_probs <- matrix(
+    NA_real_, nrow = n, ncol = n_classes,
+    dimnames = list(NULL, paste0("prob_", gg_levels))
+  )
+
+  cat("LOOCV [", label, "] n =", n, "classes =", n_classes, "\n")
+
+  for (i in seq_len(n)) {
+    train_i <- model_df[-i, ]
+    test_i  <- model_df[i,  ]
+
+    train_x <- train_i %>% select(all_of(cov_cols))
+    test_x  <- test_i  %>% select(all_of(cov_cols))
+
+    col_meds <- vapply(train_x, median, numeric(1), na.rm = TRUE)
+    for (nm in cov_cols) {
+      train_x[[nm]][is.na(train_x[[nm]])] <- col_meds[nm]
+      test_x[[nm]][is.na(test_x[[nm]])]   <- col_meds[nm]
+    }
+
+    rf_i <- ranger::ranger(
+      x             = train_x,
+      y             = train_i$gg,
+      num.trees     = 1000,
+      mtry          = max(2, floor(sqrt(length(cov_cols)))),
+      min.node.size = 2,
+      probability   = TRUE,
+      seed          = 42 + i
+    )
+
+    pred_i   <- predict(rf_i, data = test_x)$predictions
+    prob_row <- rep(NA_real_, n_classes)
+    names(prob_row) <- gg_levels
+    matched <- intersect(gg_levels, colnames(pred_i))
+    prob_row[matched] <- pred_i[1, matched]
+
+    loocv_probs[i, ] <- prob_row
+    pred_class <- gg_levels[which.max(prob_row)]
+
+    loocv_results$Point[i]   <- model_df$Point[i]
+    loocv_results$true_gg[i] <- as.character(model_df$gg[i])
+    loocv_results$pred_gg[i] <- pred_class
+    loocv_results$top1[i]    <- max(prob_row, na.rm = TRUE)
+
+    if (i %% 10 == 0 || i == n) cat("  Fold", i, "/", n, "\n")
+  }
+
+  loocv_results <- loocv_results %>%
+    mutate(
+      correct = true_gg == pred_gg,
+      true_gg = factor(true_gg, levels = gg_levels),
+      pred_gg = factor(pred_gg, levels = gg_levels)
+    )
+
+  list(results = loocv_results, probs = loocv_probs,
+       gg_levels = gg_levels)
+}
+
+print_loocv_metrics <- function(loocv, label = "") {
+  r <- loocv$results
+  cat("\n============================================================\n")
+  cat("LOOCV RESULTS:", label, "\n")
+  cat("============================================================\n")
+  cat("Accuracy:", round(mean(r$correct, na.rm = TRUE), 3), "\n")
+  cat("Kappa:   ", round(yardstick::kap_vec(r$true_gg, r$pred_gg), 3), "\n")
+  cat("Macro F1:", round(yardstick::f_meas_vec(
+    r$true_gg, r$pred_gg, estimator = "macro"), 3), "\n")
+
+  cat("\nPer-class accuracy:\n")
+  r %>%
+    group_by(true_gg) %>%
+    summarise(n = n(), n_correct = sum(correct),
+              acc = round(n_correct / n, 2),
+              mean_prob = round(mean(top1), 2),
+              .groups = "drop") %>%
+    arrange(desc(acc)) %>%
+    as.data.frame() %>%
+    print()
+
+  cat("\nMisclassification pairs:\n")
+  r %>%
+    filter(!correct) %>%
+    count(true_gg, pred_gg, sort = TRUE) %>%
+    as.data.frame() %>%
+    print()
+}
+```
+
+```{r run-loocv}
+# ============================================================
+# RUN LOOCV FOR BOTH VERSIONS
+# ============================================================
+
+loocv_A <- run_loocv(model_df_A, label = "Perry truth")
+#loocv_B <- run_loocv(model_df_B, label = "NCSS predicted")
+
+print_loocv_metrics(loocv_A, "Perry truth labels")
+#print_loocv_metrics(loocv_B, "NCSS predicted labels")
+
+# Save results
+write.csv(loocv_A$results,
+          "../outputs/spatial/loocv_gg_truth_results.csv",
+          row.names = FALSE)
+# #write.csv(loocv_B$results,
+#           "../outputs/spatial/loocv_gg_ncss_results.csv",
+#           row.names = FALSE)
+```
+
+```{r fit-final-rf-and-map}
+# ============================================================
+# FIT FINAL RF + WALL-TO-WALL MAP (for both versions)
+# ============================================================
+
+fit_final_and_map <- function(model_df, loocv, label, file_suffix) {
+
+  gg_levels <- loocv$gg_levels
+  n         <- nrow(model_df)
+
+  # Impute NAs
+  full_x <- model_df %>% select(all_of(cov_cols))
+  col_meds <- vapply(full_x, median, numeric(1), na.rm = TRUE)
+  for (nm in cov_cols) {
+    full_x[[nm]][is.na(full_x[[nm]])] <- col_meds[nm]
+  }
+
+  set.seed(42)
+  rf_final <- ranger::ranger(
+    x             = full_x,
+    y             = model_df$gg,
+    num.trees     = 1500,
+    mtry          = max(2, floor(sqrt(length(cov_cols)))),
+    min.node.size = 2,
+    probability   = TRUE,
+    importance    = "permutation",
+    seed          = 42
+  )
+
+  cat("\n[", label, "] OOB error:",
+      round(rf_final$prediction.error, 3), "\n")
+
+  # ---- Variograms on RF residuals ----
+  insample_probs <- rf_final$predictions
+  variogram_fits <- list()
+  krige_models   <- list()
+
+  # Field diagonal for range sanity check
+  field_ext  <- terra::ext(cov_stack)
+  field_diag <- sqrt((field_ext$xmax - field_ext$xmin)^2 +
+                     (field_ext$ymax - field_ext$ymin)^2)
+  max_range  <- field_diag * 0.4
+
+  for (s in gg_levels) {
+    if (!s %in% colnames(insample_probs)) next
+
+    # Only krige series with enough pedons
+    n_s <- sum(as.character(model_df$gg) == s)
+    if (n_s < 5) next
+
+    resid_sf <- tibble(
+      coord_X  = model_df$coord_X,
+      coord_Y  = model_df$coord_Y,
+      observed = as.integer(as.character(model_df$gg) == s),
+      residual = observed - insample_probs[, s]
+    ) %>%
+      filter(is.finite(residual)) %>%
+      sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+                   crs = sf::st_crs(soil_pts))
+
+    vgm_emp <- tryCatch(
+      gstat::variogram(residual ~ 1, data = resid_sf),
+      error = function(e) NULL
+    )
+    if (is.null(vgm_emp)) next
+
+    vgm_fit <- tryCatch(
+      gstat::fit.variogram(vgm_emp, gstat::vgm(c("Sph", "Exp"))),
+      error = function(e) tryCatch(
+        gstat::fit.variogram(vgm_emp, gstat::vgm("Exp")),
+        error = function(e2) NULL
+      )
+    )
+    if (is.null(vgm_fit)) next
+
+    # Skip unreliable ranges
+    range_val <- vgm_fit$range[2]
+    if (!is.finite(range_val) || range_val <= 0 ||
+        range_val > max_range) {
+      cat("  Skipping", s, "-- range", round(range_val, 1),
+          "outside reliable bounds.\n")
+      next
+    }
+
+    variogram_fits[[s]] <- list(empirical = vgm_emp, fitted = vgm_fit)
+    krige_models[[s]]   <- list(data = resid_sf, vgm = vgm_fit)
+    cat("  Variogram:", s, "| Range:", round(range_val, 1), "\n")
+  }
+
+  # ---- Wall-to-wall RF prediction ----
+  cov_df <- terra::as.data.frame(
+    cov_stack[[cov_cols]], xy = TRUE, na.rm = FALSE
+  )
+  n_pix    <- nrow(cov_df)
+  cov_pred <- cov_df %>% select(all_of(cov_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+  for (nm in cov_cols) {
+    cov_pred[[nm]][is.na(cov_pred[[nm]])] <- col_meds[nm]
+  }
+
+  chunk_size <- 50000
+  n_chunks   <- ceiling(n_pix / chunk_size)
+  prob_list  <- vector("list", n_chunks)
+
+  cat("  Predicting", n_chunks, "chunks...\n")
+  for (i in seq_len(n_chunks)) {
+    idx <- ((i-1)*chunk_size + 1):min(i*chunk_size, n_pix)
+    prob_list[[i]] <- as.data.frame(
+      predict(rf_final, data = cov_pred[idx,, drop=FALSE])$predictions
+    )
+  }
+  all_probs <- bind_rows(prob_list)
+
+  # Build raster stack
+  prob_raster_list <- list()
+  for (s in gg_levels) {
+    if (!s %in% names(all_probs)) next
+    r <- terra::rast(cov_stack[[1]])
+    terra::values(r) <- all_probs[[s]]
+    names(r) <- paste0("prob_", s)
+    if (any(is.finite(terra::values(r)))) prob_raster_list[[s]] <- r
+  }
+  prob_rasters <- terra::rast(prob_raster_list)
+
+  # ---- Apply kriging corrections ----
+  if (length(krige_models) > 0) {
+    pred_grid <- terra::as.data.frame(
+      cov_stack[[1]], xy = TRUE, na.rm = TRUE
+    ) %>%
+      select(x, y) %>%
+      sf::st_as_sf(coords = c("x", "y"),
+                   crs = sf::st_crs(soil_pts))
+
+    for (s in names(krige_models)) {
+      kr <- tryCatch(
+        gstat::krige(residual ~ 1,
+                     locations = krige_models[[s]]$data,
+                     newdata   = pred_grid,
+                     model     = krige_models[[s]]$vgm,
+                     debug.level = 0),
+        error = function(e) NULL
+      )
+      if (is.null(kr)) next
+
+      kr_rast <- terra::rasterize(
+        terra::vect(kr %>% mutate(v = var1.pred) %>% select(v)),
+        cov_stack[[1]], field = "v", fun = "mean"
+      )
+
+      lnm <- paste0("prob_", s)
+      if (lnm %in% names(prob_rasters)) {
+        prob_rasters[[lnm]] <- terra::clamp(
+          prob_rasters[[lnm]] + kr_rast, 0, 1
+        )
+      }
+    }
+  }
+
+  # ---- Final classified map ----
+  fitted_gg <- str_remove(names(prob_rasters), "^prob_")
+  pred_idx  <- terra::which.lyr(prob_rasters)
+  names(pred_idx) <- "predicted_gg_idx"
+
+  # Sanity check pixel distribution
+  cat("\n  Pixel counts:\n")
+  pv <- fitted_gg[terra::values(pred_idx)]
+  print(sort(table(pv, useNA = "ifany"), decreasing = TRUE))
+
+  # ---- Save rasters ----
+  terra::writeRaster(
+    prob_rasters,
+    paste0("../outputs/spatial/gg_prob_stack_", file_suffix, ".tif"),
+    overwrite = TRUE
+  )
+  terra::writeRaster(
+    pred_idx,
+    paste0("../outputs/spatial/gg_predicted_", file_suffix, ".tif"),
+    overwrite = TRUE
+  )
+
+  list(
+    rf_final       = rf_final,
+    prob_rasters   = prob_rasters,
+    pred_idx       = pred_idx,
+    fitted_gg      = fitted_gg,
+    variogram_fits = variogram_fits,
+    col_meds       = col_meds
+  )
+}
+
+cat("Fitting Model A (truth labels)...\n")
+result_A <- fit_final_and_map(model_df_A, loocv_A,
+                               "Perry truth", "truth")
+
+cat("\nFitting Model B (NCSS predicted labels)...\n")
+result_B <- fit_final_and_map(model_df_B, loocv_B,
+                               "NCSS predicted", "ncss")
+```
+
+```{r visualize}
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+make_map <- function(result, loocv, model_df, pts_xy_dedup,
+                     title, file_suffix) {
+
+  fitted_gg <- result$fitted_gg
+  n_gg      <- length(fitted_gg)
+
+  # Factor raster
+  pred_factor <- terra::as.factor(result$pred_idx)
+  levels(pred_factor) <- data.frame(
+    value = seq_along(fitted_gg),
+    gg    = fitted_gg
+  )
+
+  # Colour palette
+  gg_colors <- scales::hue_pal()(n_gg)
+  names(gg_colors) <- fitted_gg
+
+  # 1. Predicted map
+  p_map <- ggplot() +
+    tidyterra::geom_spatraster(data = pred_factor) +
+    scale_fill_manual(values  = gg_colors,
+                      na.value = "grey90",
+                      name    = "Great Group") +
+    theme_minimal() +
+    labs(title    = paste("Predicted Great Group —", title),
+         subtitle = "RF + Regression Kriging (LOOCV validated, 3m)")
+  print(p_map)
+  ggsave(paste0("../outputs/spatial/map_gg_", file_suffix, ".png"),
+         p_map, width = 10, height = 8, dpi = 200)
+
+  # 2. LOOCV validation overlay
+  loocv_sf <- loocv$results %>%
+    left_join(pts_xy_dedup, by = "Point") %>%
+    filter(!is.na(coord_X)) %>%
+    sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+                 crs = sf::st_crs(soil_pts))
+
+  p_val <- ggplot() +
+    tidyterra::geom_spatraster(data = pred_factor) +
+    scale_fill_manual(values   = gg_colors,
+                      na.value = "grey90",
+                      name     = "Predicted (map)") +
+    geom_sf(data = loocv_sf,
+            aes(color = true_gg, shape = correct),
+            size = 3, stroke = 1.2) +
+    scale_color_manual(values = gg_colors, name = "True GG") +
+    scale_shape_manual(values = c("TRUE" = 16, "FALSE" = 4),
+                       name   = "LOOCV correct?") +
+    theme_minimal() +
+    labs(title    = paste("LOOCV Overlay —", title),
+         subtitle = "Circle = correct  |  X = misclassified")
+  print(p_val)
+  ggsave(paste0("../outputs/spatial/map_gg_loocv_", file_suffix, ".png"),
+         p_val, width = 10, height = 8, dpi = 200)
+
+  # 3. Probability surfaces
+  for (s in fitted_gg) {
+    lnm <- paste0("prob_", s)
+    if (!lnm %in% names(result$prob_rasters)) next
+    p <- ggplot() +
+      tidyterra::geom_spatraster(
+        data = result$prob_rasters[[lnm]]
+      ) +
+      scale_fill_distiller(palette = "RdYlGn", direction = 1,
+                           na.value = "grey90", limits = c(0, 1),
+                           name = "Probability") +
+      theme_minimal() +
+      labs(title    = paste("Probability:", s, "|", title),
+           subtitle = "RF + kriging correction")
+    print(p)
+  }
+
+  # 4. Variable importance
+  imp_df <- tibble(
+    variable   = names(result$rf_final$variable.importance),
+    importance = result$rf_final$variable.importance
+  ) %>%
+    arrange(desc(importance)) %>%
+    mutate(variable = fct_reorder(variable, importance))
+
+  p_imp <- ggplot(imp_df %>% slice_head(n = 20),
+                  aes(x = importance, y = variable)) +
+    geom_col(fill = "#2c7bb6") +
+    theme_minimal() +
+    labs(title = paste("Variable Importance —", title),
+         x = "Permutation Importance", y = NULL)
+  print(p_imp)
+  ggsave(paste0("../outputs/spatial/imp_gg_", file_suffix, ".png"),
+         p_imp, width = 8, height = 6, dpi = 200)
+
+  invisible(NULL)
+}
+
+make_map(result_A, loocv_A, model_df_A, pts_xy_dedup,
+         "Perry Truth Labels", "truth")
+make_map(result_B, loocv_B, model_df_B, pts_xy_dedup,
+         "NCSS Predicted Labels", "ncss")
+```
+
+```{r summary}
+# ============================================================
+# COMPARISON SUMMARY
+# ============================================================
+
+cat("\n============================================================\n")
+cat("GREAT GROUP SPATIAL PREDICTION — COMPARISON SUMMARY\n")
+cat("============================================================\n")
+
+for (lab in c("A: Perry truth", "B: NCSS predicted")) {
+
+  res  <- if (str_detect(lab, "A")) loocv_A$results else loocv_B$results
+  mdf  <- if (str_detect(lab, "A")) model_df_A      else model_df_B
+  rfin <- if (str_detect(lab, "A")) result_A$rf_final else result_B$rf_final
+  vgms <- if (str_detect(lab, "A")) result_A$variogram_fits else
+                                    result_B$variogram_fits
+
+  cat("\n---", lab, "---\n")
+  cat("Pedons:", nrow(mdf), "| Classes:", nlevels(mdf$gg), "\n")
+  cat("LOOCV Accuracy:", round(mean(res$correct, na.rm=TRUE), 3), "\n")
+  cat("LOOCV Kappa:   ",
+      round(yardstick::kap_vec(res$true_gg, res$pred_gg), 3), "\n")
+  cat("LOOCV Macro F1:",
+      round(yardstick::f_meas_vec(res$true_gg, res$pred_gg,
+                                   estimator = "macro"), 3), "\n")
+  cat("OOB Error:     ", round(rfin$prediction.error, 3), "\n")
+  cat("Variograms fitted:", length(vgms), "\n")
+  if (length(vgms) > 0) {
+    for (s in names(vgms)) {
+      cat(" ", s, "range:",
+          round(vgms[[s]]$fitted$range[2], 1), "map units\n")
+    }
+  }
+}
+```

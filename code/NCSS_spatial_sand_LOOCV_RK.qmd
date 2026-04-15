@@ -1,0 +1,739 @@
+---
+title: "NCSS_spatial_sand_LOOCV_RK"
+format: html
+---
+
+```{r setup}
+library(tidyverse)
+library(terra)
+library(sf)
+library(gstat)
+library(ranger)
+library(yardstick)
+library(tidyterra)
+
+dir.create("../outputs/spatial", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-inputs}
+# ============================================================
+# LOAD INPUTS
+# ============================================================
+
+if (!exists("cov_stack")) {
+  cov_stack <- terra::rast(
+    "../data/spatial/covariate_stack_3m_all_with_SR_indices.tif"
+  )
+}
+
+if (!exists("soil_pts")) {
+  soil_pts <- sf::st_read(
+    "../data/spatial/perry_pedon_locs.shp", quiet = TRUE
+  ) %>%
+    sf::st_transform(crs = sf::st_crs(terra::crs(cov_stack))) %>%
+    rename(Point = Point_ID) %>%
+    mutate(Point = as.character(Point))
+}
+
+if (!exists("cov_at_pedons")) {
+  cov_at_pedons <- read.csv(
+    "../outputs/spatial/covariates_at_pedons.csv"
+  ) %>%
+    mutate(Point = as.character(Point))
+}
+
+perry_fp_clean <- read.csv(
+  "../data/Perry_FP_data_with_taxa_02_20_2026.csv"
+) %>%
+  mutate(Point = as.character(Point))
+
+cat("Inputs loaded.\n")
+cat("Perry horizons:", nrow(perry_fp_clean), "\n")
+```
+
+```{r compute-sand-150}
+# ============================================================
+# COMPUTE WEIGHTED AVERAGE SAND 0-150 CM PER PEDON
+# ============================================================
+
+# Parse top/bottom depths from To.Depth..cm. column
+parse_depths <- function(x) {
+  top <- as.numeric(str_extract(x, "^\\d+"))
+  bot <- as.numeric(str_extract(x, "(?<=-)\\d+"))
+  tibble(top_cm = top, bottom_cm = bot)
+}
+
+perry_hz <- perry_fp_clean %>%
+  bind_cols(parse_depths(.$To.Depth..cm.)) %>%
+  mutate(
+    bottom_cm = if_else(
+      is.na(bottom_cm) & !is.na(top_cm) & !is.na(H.Depth.cm.),
+      top_cm + as.numeric(H.Depth.cm.),
+      bottom_cm
+    ),
+    top_cm    = as.numeric(top_cm),
+    bottom_cm = as.numeric(bottom_cm),
+    sand      = as.numeric(lab_sand),
+    clay      = as.numeric(lab_clay),
+    silt      = as.numeric(lab_silt)
+  ) %>%
+  filter(
+    is.finite(top_cm), is.finite(bottom_cm),
+    bottom_cm > top_cm
+  ) %>%
+  mutate(
+    # Clip to 0-150 cm window
+    top150 = pmax(top_cm, 0),
+    bot150 = pmin(bottom_cm, 150),
+    thk150 = pmax(0, bot150 - top150)
+  ) %>%
+  filter(thk150 > 0)
+
+# Weighted mean per pedon
+wmean_safe <- function(x, w) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  if (!any(ok)) return(NA_real_)
+  sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+perry_sand_150 <- perry_hz %>%
+  group_by(Point) %>%
+  summarise(
+    sand_w150 = wmean_safe(sand, thk150),
+    clay_w150 = wmean_safe(clay, thk150),
+    silt_w150 = wmean_safe(silt, thk150),
+    n_hz      = n(),
+    n_sand    = sum(!is.na(sand)),
+    total_thk = sum(thk150),
+    .groups = "drop"
+  ) %>%
+  mutate(Point = as.character(Point))
+
+cat("Pedons with sand data:", sum(!is.na(perry_sand_150$sand_w150)), "\n")
+cat("\nSand 0-150cm summary:\n")
+summary(perry_sand_150$sand_w150) %>% print()
+
+# Distribution plot
+ggplot(perry_sand_150 %>% filter(!is.na(sand_w150)),
+       aes(x = sand_w150)) +
+  geom_histogram(bins = 20, fill = "#2c7bb6", color = "white") +
+  theme_minimal() +
+  labs(title = "Distribution of weighted average sand (0-150cm)",
+       x = "Sand (%)", y = "Count")
+```
+
+```{r build-model-df}
+# ============================================================
+# BUILD ONE-ROW-PER-PEDON MODEL DATASET
+# ============================================================
+
+# Deduplicate all source tables
+cov_dedup <- cov_at_pedons %>%
+  mutate(Point = as.character(Point)) %>%
+  group_by(Point) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop")
+
+pts_xy_dedup <- soil_pts %>%
+  st_drop_geometry() %>%
+  mutate(
+    coord_X = sf::st_coordinates(soil_pts)[, 1],
+    coord_Y = sf::st_coordinates(soil_pts)[, 2],
+    Point   = as.character(Point)
+  ) %>%
+  select(Point, coord_X, coord_Y) %>%
+  distinct(Point, .keep_all = TRUE)
+
+# Join
+model_df <- cov_dedup %>%
+  left_join(perry_sand_150 %>% select(Point, sand_w150),
+            by = "Point") %>%
+  left_join(pts_xy_dedup, by = "Point") %>%
+  filter(!is.na(sand_w150), !is.na(coord_X))
+
+# Hard stop if duplicates
+stopifnot(
+  "Duplicate Points in model_df!" =
+    n_distinct(model_df$Point) == nrow(model_df)
+)
+
+cat("Model dataset:\n")
+cat("  Pedons:", nrow(model_df), "\n")
+cat("  Sand range:", round(min(model_df$sand_w150), 1),
+    "-", round(max(model_df$sand_w150), 1), "%\n")
+cat("  Sand mean:", round(mean(model_df$sand_w150), 1), "%\n")
+cat("  Sand SD:  ", round(sd(model_df$sand_w150), 1), "%\n")
+
+# Covariate columns
+cov_cols <- setdiff(names(model_df),
+                    c("Point", "sand_w150", "coord_X", "coord_Y"))
+cov_cols <- cov_cols[
+  vapply(model_df[cov_cols],
+         function(x) length(unique(x[is.finite(x)])) > 1,
+         logical(1))
+]
+cat("Covariates:", length(cov_cols), "\n")
+```
+
+```{r loocv}
+# ============================================================
+# LOOCV: RF ON SPATIAL COVARIATES -> SAND 0-150CM
+# ============================================================
+
+n <- nrow(model_df)
+
+loocv_results <- tibble(
+  Point     = character(n),
+  observed  = numeric(n),
+  predicted = numeric(n)
+)
+
+cat("Running LOOCV (n =", n, ")...\n")
+
+for (i in seq_len(n)) {
+
+  train_i <- model_df[-i, ]
+  test_i  <- model_df[i,  ]
+
+  train_x <- train_i %>% select(all_of(cov_cols))
+  test_x  <- test_i  %>% select(all_of(cov_cols))
+
+  # Impute with training medians
+  col_meds <- vapply(train_x, median, numeric(1), na.rm = TRUE)
+  for (nm in cov_cols) {
+    train_x[[nm]][is.na(train_x[[nm]])] <- col_meds[nm]
+    test_x[[nm]][is.na(test_x[[nm]])]   <- col_meds[nm]
+  }
+
+  # Fit RF (regression mode)
+  rf_i <- ranger::ranger(
+    x             = train_x,
+    y             = train_i$sand_w150,
+    num.trees     = 1000,
+    mtry          = max(2, floor(ncol(train_x) / 3)),
+    min.node.size = 5,
+    seed          = 42 + i
+  )
+
+  pred_i <- predict(rf_i, data = test_x)$predictions
+
+  loocv_results$Point[i]     <- model_df$Point[i]
+  loocv_results$observed[i]  <- model_df$sand_w150[i]
+  loocv_results$predicted[i] <- pred_i
+
+  if (i %% 10 == 0 || i == n)
+    cat("  Fold", i, "/", n, "\n")
+}
+
+cat("LOOCV complete.\n")
+```
+
+```{r loocv-metrics}
+# ============================================================
+# LOOCV METRICS
+# ============================================================
+
+loocv_results <- loocv_results %>%
+  mutate(
+    residual = observed - predicted,
+    abs_err  = abs(residual)
+  )
+
+rmse_loocv <- sqrt(mean(loocv_results$residual^2, na.rm = TRUE))
+mae_loocv  <- mean(loocv_results$abs_err, na.rm = TRUE)
+r2_loocv   <- cor(loocv_results$observed,
+                  loocv_results$predicted,
+                  use = "complete.obs")^2
+bias_loocv <- mean(loocv_results$residual, na.rm = TRUE)
+
+cat("\n============================================================\n")
+cat("LOOCV RESULTS: Sand 0-150cm\n")
+cat("============================================================\n")
+cat("RMSE: ", round(rmse_loocv, 2), "%\n")
+cat("MAE:  ", round(mae_loocv,  2), "%\n")
+cat("R²:   ", round(r2_loocv,   3), "\n")
+cat("Bias: ", round(bias_loocv, 2), "%\n")
+
+# Observed vs predicted plot
+p_ov <- ggplot(loocv_results, aes(x = observed, y = predicted)) +
+  geom_point(alpha = 0.7, color = "#2c7bb6", size = 2) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = TRUE,
+              color = "#d73027", fill = "#fdae61", alpha = 0.2) +
+  theme_minimal() +
+  labs(
+    title    = "LOOCV: Observed vs Predicted Sand (0-150cm)",
+    subtitle = paste0("R² = ", round(r2_loocv, 3),
+                      "  |  RMSE = ", round(rmse_loocv, 2), "%",
+                      "  |  MAE = ", round(mae_loocv, 2), "%"),
+    x = "Observed Sand (%)",
+    y = "Predicted Sand (%)"
+  ) +
+  annotate("text", x = Inf, y = -Inf,
+           label = paste0("n = ", nrow(loocv_results)),
+           hjust = 1.2, vjust = -0.5, size = 3.5, color = "grey40")
+
+print(p_ov)
+ggsave("../outputs/spatial/loocv_sand_obs_vs_pred.png",
+       p_ov, width = 7, height = 6, dpi = 200)
+
+# Residual map
+resid_sf <- loocv_results %>%
+  left_join(pts_xy_dedup, by = "Point") %>%
+  filter(!is.na(coord_X)) %>%
+  sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+               crs = sf::st_crs(soil_pts))
+
+p_resid <- ggplot() +
+  geom_sf(data = resid_sf, aes(color = residual, size = abs_err)) +
+  scale_color_gradient2(low = "#d73027", mid = "white",
+                        high = "#1a9641", midpoint = 0,
+                        name = "Residual\n(obs - pred)") +
+  scale_size_continuous(range = c(1, 5), name = "|Error|") +
+  theme_minimal() +
+  labs(title    = "LOOCV Residuals — Sand 0-150cm",
+       subtitle = "Red = underpredicted  |  Green = overpredicted")
+print(p_resid)
+ggsave("../outputs/spatial/loocv_sand_residuals_map.png",
+       p_resid, width = 8, height = 7, dpi = 200)
+
+write.csv(loocv_results,
+          "../outputs/spatial/loocv_sand_results.csv",
+          row.names = FALSE)
+```
+
+```{r fit-final-rf}
+# ============================================================
+# FIT FINAL RF ON ALL PEDONS
+# ============================================================
+
+full_x <- model_df %>% select(all_of(cov_cols))
+col_meds_full <- vapply(full_x, median, numeric(1), na.rm = TRUE)
+for (nm in cov_cols) {
+  full_x[[nm]][is.na(full_x[[nm]])] <- col_meds_full[nm]
+}
+
+set.seed(42)
+rf_final <- ranger::ranger(
+  x             = full_x,
+  y             = model_df$sand_w150,
+  num.trees     = 1500,
+  mtry          = max(2, floor(length(cov_cols) / 3)),
+  min.node.size = 5,
+  importance    = "permutation",
+  seed          = 42
+)
+
+cat("Final RF:\n")
+cat("  OOB RMSE:", round(sqrt(rf_final$prediction.error), 2), "%\n")
+cat("  R² (OOB):", round(rf_final$r.squared, 3), "\n")
+
+# Variable importance
+imp_df <- tibble(
+  variable   = names(rf_final$variable.importance),
+  importance = rf_final$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(variable = fct_reorder(variable, importance))
+
+cat("\nTop 15 most important covariates:\n")
+imp_df %>% slice_head(n = 15) %>%
+  mutate(importance = round(importance, 4)) %>%
+  as.data.frame() %>% print()
+
+p_imp <- ggplot(imp_df %>% slice_head(n = 20),
+                aes(x = importance, y = variable)) +
+  geom_col(fill = "#2c7bb6") +
+  theme_minimal() +
+  labs(title = "Variable Importance — Spatial RF (Sand 0-150cm)",
+       x = "Permutation Importance", y = NULL)
+print(p_imp)
+ggsave("../outputs/spatial/imp_sand_rf.png",
+       p_imp, width = 8, height = 6, dpi = 200)
+
+# In-sample predictions for residual kriging
+insample_pred <- rf_final$predictions
+```
+
+```{r variogram}
+# ============================================================
+# VARIOGRAM ON RF RESIDUALS
+# ============================================================
+
+resid_krige_df <- tibble(
+  coord_X  = model_df$coord_X,
+  coord_Y  = model_df$coord_Y,
+  observed = model_df$sand_w150,
+  rf_pred  = insample_pred,
+  residual = observed - rf_pred
+)
+
+resid_krige_sf <- sf::st_as_sf(
+  resid_krige_df,
+  coords = c("coord_X", "coord_Y"),
+  crs    = sf::st_crs(soil_pts)
+)
+
+cat("Residual summary:\n")
+summary(resid_krige_df$residual) %>% print()
+
+# Empirical variogram
+vgm_emp <- gstat::variogram(residual ~ 1, data = resid_krige_sf)
+
+# Try fitting Spherical, then Exponential
+vgm_fit <- tryCatch(
+  gstat::fit.variogram(vgm_emp, gstat::vgm("Sph")),
+  error = function(e) tryCatch(
+    gstat::fit.variogram(vgm_emp, gstat::vgm("Exp")),
+    error = function(e2) NULL
+  )
+)
+
+if (!is.null(vgm_fit)) {
+  cat("\nVariogram model fitted:\n")
+  cat("  Model:", as.character(vgm_fit$model[2]), "\n")
+  cat("  Nugget:", round(vgm_fit$psill[1], 4), "\n")
+  cat("  Sill:  ", round(sum(vgm_fit$psill), 4), "\n")
+  cat("  Range: ", round(vgm_fit$range[2], 1), "map units\n")
+
+  p_vgm <- plot(vgm_emp, vgm_fit,
+                main = "Variogram of RF residuals — Sand 0-150cm")
+  print(p_vgm)
+} else {
+  cat("Variogram fitting failed -- will use RF only.\n")
+}
+```
+
+```{r wall-to-wall}
+# ============================================================
+# WALL-TO-WALL PREDICTION: RF + KRIGING CORRECTION
+# ============================================================
+
+cat("Building pixel data frame...\n")
+cov_df <- terra::as.data.frame(
+  cov_stack[[cov_cols]], xy = TRUE, na.rm = FALSE
+)
+n_pixels <- nrow(cov_df)
+cat("Total pixels:", n_pixels, "\n")
+
+# Impute NAs
+cov_pred <- cov_df %>%
+  select(all_of(cov_cols)) %>%
+  mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+for (nm in cov_cols) {
+  cov_pred[[nm]][is.na(cov_pred[[nm]])] <- col_meds_full[nm]
+}
+
+# Predict in chunks
+chunk_size <- 50000
+n_chunks   <- ceiling(n_pixels / chunk_size)
+pred_list  <- vector("list", n_chunks)
+
+cat("Predicting in", n_chunks, "chunks...\n")
+for (i in seq_len(n_chunks)) {
+  idx <- ((i-1)*chunk_size + 1):min(i*chunk_size, n_pixels)
+  pred_list[[i]] <- predict(
+    rf_final,
+    data = cov_pred[idx, , drop = FALSE]
+  )$predictions
+  if (i %% 5 == 0 || i == n_chunks)
+    cat("  Chunk", i, "/", n_chunks, "\n")
+}
+
+rf_pred_vec <- unlist(pred_list)
+
+# Build RF prediction raster
+sand_rf_rast <- terra::rast(cov_stack[[1]])
+terra::values(sand_rf_rast) <- rf_pred_vec
+names(sand_rf_rast) <- "sand_rf"
+
+cat("RF prediction raster built.\n")
+cat("  Predicted sand range:",
+    round(min(rf_pred_vec, na.rm = TRUE), 1), "-",
+    round(max(rf_pred_vec, na.rm = TRUE), 1), "%\n")
+
+# ---- Kriging correction ----
+if (!is.null(vgm_fit)) {
+  cat("Kriging residuals...\n")
+
+  # Prediction grid
+  pred_grid <- terra::as.data.frame(
+    cov_stack[[1]], xy = TRUE, na.rm = TRUE
+  ) %>%
+    select(x, y) %>%
+    sf::st_as_sf(coords = c("x", "y"),
+                 crs = sf::st_crs(soil_pts))
+
+  krige_result <- tryCatch(
+    gstat::krige(
+      formula   = residual ~ 1,
+      locations = resid_krige_sf,
+      newdata   = pred_grid,
+      model     = vgm_fit,
+      debug.level = 0
+    ),
+    error = function(e) {
+      cat("Kriging failed:", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+
+  if (!is.null(krige_result)) {
+    # Build kriging correction raster
+    krige_sf <- krige_result %>%
+      mutate(krige_val = var1.pred) %>%
+      select(krige_val)
+
+    krige_rast <- terra::rasterize(
+      terra::vect(krige_sf),
+      cov_stack[[1]],
+      field = "krige_val",
+      fun   = "mean"
+    )
+
+    # Final map = RF prediction + kriged residual
+    sand_rk_rast <- sand_rf_rast + krige_rast
+    names(sand_rk_rast) <- "sand_rk"
+
+    cat("Regression kriging correction applied.\n")
+    cat("  Final sand range:",
+        round(min(terra::values(sand_rk_rast), na.rm = TRUE), 1), "-",
+        round(max(terra::values(sand_rk_rast), na.rm = TRUE), 1), "%\n")
+
+    # Also build kriging variance raster (uncertainty map)
+    krige_var_sf <- krige_result %>%
+      mutate(var_val = var1.var) %>%
+      select(var_val)
+
+    krige_var_rast <- terra::rasterize(
+      terra::vect(krige_var_sf),
+      cov_stack[[1]],
+      field = "var_val",
+      fun   = "mean"
+    )
+    names(krige_var_rast) <- "sand_krige_variance"
+
+  } else {
+    sand_rk_rast   <- sand_rf_rast
+    krige_var_rast <- NULL
+    cat("Using RF-only prediction.\n")
+  }
+} else {
+  sand_rk_rast   <- sand_rf_rast
+  krige_var_rast <- NULL
+  cat("Using RF-only prediction (no variogram).\n")
+}
+
+# Save rasters
+terra::writeRaster(sand_rf_rast,
+                   "../outputs/spatial/sand_150_rf.tif",
+                   overwrite = TRUE)
+terra::writeRaster(sand_rk_rast,
+                   "../outputs/spatial/sand_150_rk.tif",
+                   overwrite = TRUE)
+if (!is.null(krige_var_rast)) {
+  terra::writeRaster(krige_var_rast,
+                     "../outputs/spatial/sand_150_krige_variance.tif",
+                     overwrite = TRUE)
+}
+cat("Rasters saved.\n")
+```
+
+```{r visualize}
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+# Observed points as sf
+obs_sf <- model_df %>%
+  sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+               crs = sf::st_crs(soil_pts))
+
+# Shared color scale limits
+sand_min <- 0
+sand_max <- 100
+
+# 1. RF prediction map
+p_rf <- ggplot() +
+  tidyterra::geom_spatraster(data = sand_rf_rast) +
+  scale_fill_distiller(
+    palette   = "YlOrBr",
+    direction = -1,
+    na.value  = "grey90",
+    limits    = c(sand_min, sand_max),
+    name      = "Sand (%)"
+  ) +
+  geom_sf(data = obs_sf, aes(fill = sand_w150),
+          shape = 21, size = 2.5, color = "white", stroke = 0.8) +
+  scale_fill_distiller(
+    palette   = "YlOrBr",
+    direction = -1,
+    limits    = c(sand_min, sand_max),
+    name      = "Sand (%)"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Predicted Sand Content (0-150cm) — RF Only",
+    subtitle = "Perry Site | Points = observed pedon values"
+  )
+print(p_rf)
+ggsave("../outputs/spatial/map_sand_rf.png",
+       p_rf, width = 10, height = 8, dpi = 200)
+
+# 2. Regression kriging map
+p_rk <- ggplot() +
+  tidyterra::geom_spatraster(data = sand_rk_rast) +
+  scale_fill_distiller(
+    palette   = "YlOrBr",
+    direction = -1,
+    na.value  = "grey90",
+    limits    = c(sand_min, sand_max),
+    name      = "Sand (%)"
+  ) +
+  geom_sf(data = obs_sf, aes(fill = sand_w150),
+          shape = 21, size = 2.5, color = "white", stroke = 0.8) +
+  scale_fill_distiller(
+    palette   = "YlOrBr",
+    direction = -1,
+    limits    = c(sand_min, sand_max),
+    name      = "Sand (%)"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Predicted Sand Content (0-150cm) — Regression Kriging",
+    subtitle = paste0("Perry Site | LOOCV R² = ", round(r2_loocv, 3),
+                      "  RMSE = ", round(rmse_loocv, 2), "%")
+  )
+print(p_rk)
+ggsave("../outputs/spatial/map_sand_rk.png",
+       p_rk, width = 10, height = 8, dpi = 200)
+
+# 3. Uncertainty map (kriging variance)
+if (!is.null(krige_var_rast)) {
+  p_var <- ggplot() +
+    tidyterra::geom_spatraster(data = krige_var_rast) +
+    scale_fill_distiller(
+      palette  = "Reds",
+      direction = 1,
+      na.value = "grey90",
+      name     = "Kriging\nVariance"
+    ) +
+    geom_sf(data = obs_sf, shape = 3,
+            size = 2, color = "black") +
+    theme_minimal() +
+    labs(
+      title    = "Prediction Uncertainty — Kriging Variance",
+      subtitle = "Higher values = less certain prediction"
+    )
+  print(p_var)
+  ggsave("../outputs/spatial/map_sand_uncertainty.png",
+         p_var, width = 10, height = 8, dpi = 200)
+}
+
+# 4. Side-by-side RF vs RK
+p_both <- ggplot() +
+  tidyterra::geom_spatraster(
+    data = c(sand_rf_rast, sand_rk_rast) %>%
+      terra::rast() %>%
+      setNames(c("RF only", "RF + Kriging"))
+  ) +
+  facet_wrap(~ lyr) +
+  scale_fill_distiller(
+    palette   = "YlOrBr",
+    direction = -1,
+    na.value  = "grey90",
+    limits    = c(sand_min, sand_max),
+    name      = "Sand (%)"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Sand 0-150cm: RF only vs Regression Kriging",
+    subtitle = "Perry Site, 3m resolution"
+  )
+print(p_both)
+ggsave("../outputs/spatial/map_sand_rf_vs_rk.png",
+       p_both, width = 14, height = 6, dpi = 200)
+
+# 5. LOOCV observed vs predicted with series color
+loocv_series <- loocv_results %>%
+  left_join(
+    perry_fp_clean %>%
+      mutate(Point = as.character(Point)) %>%
+      mutate(
+        series = na_if(str_squish(as.character(series_clean)), ""),
+        series = na_if(series, "Fill"),
+        series = str_to_title(series)
+      ) %>%
+      group_by(Point) %>%
+      summarise(series = {
+        y <- series[!is.na(series)]
+        if (length(y) == 0) NA_character_
+        else names(sort(table(y), decreasing = TRUE))[1]
+      }, .groups = "drop"),
+    by = "Point"
+  )
+
+p_ov_series <- ggplot(
+  loocv_series %>% filter(!is.na(observed)),
+  aes(x = observed, y = predicted, color = series)
+) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "grey40") +
+  scale_color_brewer(palette = "Set1", na.value = "grey70",
+                     name = "Series") +
+  theme_minimal() +
+  labs(
+    title    = "LOOCV: Observed vs Predicted Sand (colored by series)",
+    subtitle = paste0("R² = ", round(r2_loocv, 3),
+                      "  RMSE = ", round(rmse_loocv, 2), "%"),
+    x = "Observed Sand (%)",
+    y = "Predicted Sand (%)"
+  )
+print(p_ov_series)
+ggsave("../outputs/spatial/loocv_sand_obs_pred_by_series.png",
+       p_ov_series, width = 8, height = 6, dpi = 200)
+
+#The RF model explained 37% of variance in weighted mean sand content (0–150cm), with LOOCV RMSE of 12.0%. Elevation was the dominant predictor, consistent with the catenary relationship between landscape position and soil texture in the Southern Coastal Plain. Residuals showed moderate spatial autocorrelation (nugget/sill = 0.54, range = 365m), supporting application of regression kriging correction.
+```
+
+```{r summary}
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+cat("\n============================================================\n")
+cat("SPATIAL SAND PREDICTION (0-150cm) — FINAL SUMMARY\n")
+cat("============================================================\n")
+cat("Method:       RF + Regression Kriging\n")
+cat("Validation:   Leave-One-Out Cross-Validation (LOOCV)\n")
+cat("Pedons:      ", nrow(model_df), "\n")
+cat("Covariates:  ", length(cov_cols), "\n")
+cat("\nLOOCV Performance:\n")
+cat("  R²:   ", round(r2_loocv,   3), "\n")
+cat("  RMSE: ", round(rmse_loocv, 2), "% sand\n")
+cat("  MAE:  ", round(mae_loocv,  2), "% sand\n")
+cat("  Bias: ", round(bias_loocv, 2), "% sand\n")
+cat("\nFinal RF (all pedons):\n")
+cat("  OOB RMSE:", round(sqrt(rf_final$prediction.error), 2), "%\n")
+cat("  OOB R²:  ", round(rf_final$r.squared, 3), "\n")
+
+if (!is.null(vgm_fit)) {
+  cat("\nVariogram:\n")
+  cat("  Model: ", as.character(vgm_fit$model[2]), "\n")
+  cat("  Range: ", round(vgm_fit$range[2], 1), "map units\n")
+  cat("  Nugget:", round(vgm_fit$psill[1], 4), "\n")
+  cat("  Sill:  ", round(sum(vgm_fit$psill), 4), "\n")
+  cat("  Nugget/Sill ratio:",
+      round(vgm_fit$psill[1] / sum(vgm_fit$psill), 3),
+      "(< 0.25 = strong spatial structure)\n")
+}
+
+cat("\nTop 5 covariates:\n")
+imp_df %>% slice_head(n = 5) %>%
+  mutate(importance = round(importance, 4)) %>%
+  as.data.frame() %>% print()
+
+cat("\nOutputs saved to ../outputs/spatial/\n")
+```

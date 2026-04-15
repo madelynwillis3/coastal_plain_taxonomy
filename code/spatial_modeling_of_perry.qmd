@@ -1,0 +1,1520 @@
+---
+title: "NCSS_spatial_series_prediction"
+format: html
+---
+
+```{r setup}
+library(tidyverse)
+library(tidymodels)
+library(terra)
+library(sf)
+library(gstat)
+library(ranger)
+library(yardstick)
+library(tidyterra)
+library(beepr)
+dir.create("../outputs/spatial", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-data}
+# Load covariate stack
+cov_stack <- terra::rast("../data/spatial/covariate_stack_3m_all_with_SR_indices.tif")
+cat("Layers:", terra::nlyr(cov_stack), "\n")
+cat("CRS:", terra::crs(cov_stack, describe = TRUE)$name, "\n")
+print(names(cov_stack))
+
+# Load pedon points
+soil_pts_raw <- sf::st_read("../data/spatial/perry_full_locs.shp", quiet = TRUE)
+cat("N points:", nrow(soil_pts_raw), "\n")
+cat("Columns:", paste(names(soil_pts_raw), collapse = ", "), "\n")
+cat("CRS:", sf::st_crs(soil_pts_raw)$input, "\n")
+```
+
+```{r reproject-and-align}
+# Reproject points to raster CRS and standardize Point ID
+soil_pts <- soil_pts_raw %>%
+  sf::st_transform(crs = sf::st_crs(terra::crs(cov_stack))) %>%
+  rename(Point = Point_ID) %>%
+  mutate(Point = as.character(Point))
+
+cat("Points reprojected.\n")
+cat("Point examples:", paste(head(soil_pts$Point, 5), collapse = ", "), "\n")
+cat("N points:", nrow(soil_pts), "\n")
+```
+
+```{r extract-covariates}
+# Extract covariate values at pedon locations
+cov_at_pedons <- terra::extract(
+  cov_stack,
+  terra::vect(soil_pts),
+  ID = TRUE,
+  bind = FALSE
+) %>%
+  as.data.frame() %>%
+  mutate(Point = as.character(soil_pts$Point[ID])) %>%
+  select(-ID) %>%
+  relocate(Point)
+
+cat("Extracted rows:", nrow(cov_at_pedons), "\n")
+cat("Point examples:", paste(head(cov_at_pedons$Point, 5), collapse = ", "), "\n")
+
+# Report missing values
+cov_at_pedons %>%
+  select(-Point) %>%
+  summarise(across(everything(), ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "covariate", values_to = "n_missing") %>%
+  filter(n_missing > 0) %>%
+  as.data.frame() %>%
+  print()
+
+write.csv(cov_at_pedons,
+          "../outputs/spatial/covariates_at_pedons.csv",
+          row.names = FALSE)
+```
+
+```{r build-model-df}
+# Load Perry horizon data for series truth
+perry_fp_clean <- read.csv("../data/Perry_FP_data_with_taxa_02_20_2026.csv") %>%
+  mutate(Point = as.character(Point))
+
+# Build one series label per pedon (modal non-NA value)
+perry_series_truth <- perry_fp_clean %>%
+  mutate(
+    series = na_if(str_squish(as.character(series_clean)), ""),
+    series = na_if(series, "Fill"),
+    series = na_if(series, "fill"),
+    series = str_to_title(series)
+  ) %>%
+  group_by(Point) %>%
+  summarise(
+    series = {
+      y <- series[!is.na(series)]
+      if (length(y) == 0) NA_character_
+      else names(sort(table(y), decreasing = TRUE))[1]
+    },
+    .groups = "drop"
+  )
+
+cat("Series truth Points:", paste(head(perry_series_truth$Point, 5), collapse = ", "), "\n")
+cat("Covariate Points:   ", paste(head(cov_at_pedons$Point, 5), collapse = ", "), "\n")
+cat("Matching points:", sum(cov_at_pedons$Point %in% perry_series_truth$Point), "\n")
+
+# Join covariates + series truth, filter to series with >= 3 pedons
+model_df <- cov_at_pedons %>%
+  left_join(perry_series_truth, by = "Point") %>%
+  filter(!is.na(series)) %>%
+  add_count(series, name = "series_n") %>%
+  filter(series_n >= 3) %>%
+  select(-series_n) %>%
+  mutate(series = factor(series))
+
+# Join XY coordinates for kriging
+pts_xy <- soil_pts %>%
+  st_drop_geometry() %>%
+  bind_cols(
+    st_coordinates(soil_pts) %>%
+      as.data.frame() %>%
+      rename(coord_X = X, coord_Y = Y)
+  ) %>%
+  mutate(Point = as.character(Point)) %>%
+  select(Point, coord_X, coord_Y)
+
+model_df <- model_df %>%
+  left_join(pts_xy, by = "Point")
+
+cat("\nFinal model_df:\n")
+cat("  Rows:", nrow(model_df), "\n")
+cat("  Series:\n")
+model_df %>%
+  mutate(series = as.character(series)) %>%
+  count(series, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+# Diagnostic if join still failing
+if (nrow(model_df) == 0) {
+  cat("\nDIAGNOSTIC:\n")
+  cat("cov_at_pedons Points: ", paste(head(cov_at_pedons$Point, 10), collapse = ", "), "\n")
+  cat("perry_series_truth Points:", paste(head(perry_series_truth$Point, 10), collapse = ", "), "\n")
+}
+```
+
+```{r train-test-split}
+# ============================================================
+# TRAIN / TEST SPLIT (random 80/20, stratified by series)
+# ============================================================
+
+set.seed(42)
+
+split_spatial <- initial_split(model_df, prop = 0.8, strata = series)
+train_spatial <- training(split_spatial)
+test_spatial  <- testing(split_spatial)
+
+cat("Train:", nrow(train_spatial), "| Test:", nrow(test_spatial), "\n")
+cat("Test series distribution:\n")
+test_spatial %>%
+  mutate(series = as.character(series)) %>%
+  count(series, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+```
+
+```{r spatial-rf}
+# ============================================================
+# STAGE 2: SPATIAL RANDOM FOREST
+# Train RF on spatial covariates -> series at Perry pedon locations
+# ============================================================
+
+set.seed(43)
+
+# Predictor columns = all covariate columns (not Point, series, coords)
+cov_cols <- setdiff(names(train_spatial),
+                    c("Point", "series", "coord_X", "coord_Y"))
+
+# Remove any zero-variance or all-NA columns
+cov_cols <- cov_cols[
+  vapply(train_spatial[cov_cols],
+         function(x) length(unique(x[is.finite(x)])) > 1, logical(1))
+]
+
+cat("Using", length(cov_cols), "covariate predictors\n")
+
+# Recipe
+rec_spatial <- recipe(series ~ ., data = train_spatial %>%
+                         select(all_of(c("series", cov_cols)))) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+# RF spec with tuning
+rf_spatial_spec <- rand_forest(
+  trees = 1000,
+  mtry  = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_spatial <- workflow() %>%
+  add_model(rf_spatial_spec) %>%
+  add_recipe(rec_spatial)
+
+min_class_n <- train_spatial %>%
+  count(series) %>%
+  summarise(mn = min(n)) %>%
+  pull(mn)
+
+v_folds <- max(2, min(5, min_class_n))
+
+folds_spatial <- vfold_cv(
+  train_spatial %>% select(all_of(c("series", cov_cols))),
+  v = v_folds,
+  strata = series
+)
+
+p <- length(cov_cols)
+grid_spatial <- grid_regular(
+  mtry(range = c(2, min(15, p))),
+  min_n(range = c(2, 20)),
+  levels = 4
+)
+
+cat("Tuning spatial RF ...\n")
+tuned_spatial <- tune_grid(
+  wf_spatial,
+  resamples = folds_spatial,
+  grid      = grid_spatial,
+  metrics   = metric_set(kap, accuracy)
+)
+
+best_spatial <- select_best(tuned_spatial, metric = "kap")
+cat("Best spatial RF params:\n"); print(best_spatial)
+
+rf_spatial_final <- finalize_workflow(wf_spatial, best_spatial) %>%
+  fit(train_spatial %>% select(all_of(c("series", cov_cols))))
+
+# ---- Test set evaluation ----
+pred_spatial_rf <- predict(
+  rf_spatial_final,
+  test_spatial %>% select(all_of(cov_cols)),
+  type = "prob"
+) %>%
+  bind_cols(
+    predict(rf_spatial_final,
+            test_spatial %>% select(all_of(cov_cols)),
+            type = "class")
+  ) %>%
+  bind_cols(test_spatial %>% select(Point, series, coord_X, coord_Y))
+
+cat("\n--- SPATIAL RF TEST SET METRICS ---\n")
+metrics_spatial_rf <- metric_set(accuracy, kap)(
+  pred_spatial_rf,
+  truth    = series,
+  estimate = .pred_class
+)
+print(metrics_spatial_rf)
+
+f1_spatial_rf <- f_meas(
+  pred_spatial_rf,
+  truth     = series,
+  estimate  = .pred_class,
+  estimator = "macro"
+)
+print(f1_spatial_rf)
+
+cat("\nPer-class accuracy:\n")
+pred_spatial_rf %>%
+  mutate(across(c(series, .pred_class), as.character)) %>%
+  group_by(series) %>%
+  summarise(
+    n         = n(),
+    n_correct = sum(series == .pred_class),
+    acc       = round(n_correct / n, 2),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(acc)) %>%
+  as.data.frame() %>%
+  print()
+
+# Save spatial RF bundle
+saveRDS(
+  list(
+    name      = "taxseries_spatial_rf",
+    outcome   = "series",
+    cov_cols  = cov_cols,
+    final_fit = rf_spatial_final,
+    metrics   = metrics_spatial_rf,
+    f_meas    = f1_spatial_rf
+  ),
+  "../outputs/models/taxseries_spatial_rf_bundle.rds"
+)
+```
+
+```{r variogram-kriging}
+# ============================================================
+# STAGE 3: REGRESSION KRIGING ON RF RESIDUALS
+# ============================================================
+# Strategy: for each series, krige the residual of the RF
+# predicted probability vs. observed (1/0). The kriged
+# correction surface is added to the RF probability map.
+# ============================================================
+
+# Get predicted probabilities for ALL training pedons (for variogram fitting)
+prob_cols <- names(predict(rf_spatial_final,
+                           train_spatial %>% select(all_of(cov_cols)),
+                           type = "prob"))
+
+train_probs <- predict(
+  rf_spatial_final,
+  train_spatial %>% select(all_of(cov_cols)),
+  type = "prob"
+) %>%
+  bind_cols(train_spatial %>% select(Point, series, coord_X, coord_Y))
+
+# For each series, compute residual = observed indicator - predicted probability
+series_levels <- levels(model_df$series)
+
+# We will krige residuals for each series separately
+variogram_fits <- list()
+krige_models   <- list()
+
+for (s in series_levels) {
+
+  prob_col <- paste0(".pred_", s)
+  if (!prob_col %in% names(train_probs)) next
+
+  resid_df <- train_probs %>%
+    mutate(
+      observed = as.integer(as.character(series) == s),
+      residual = observed - .data[[prob_col]]
+    ) %>%
+    select(coord_X, coord_Y, residual) %>%
+    filter(is.finite(residual))
+
+  if (nrow(resid_df) < 5) next
+
+  # Convert to sf for gstat
+  resid_sf <- sf::st_as_sf(
+    resid_df,
+    coords = c("coord_X", "coord_Y"),
+    crs    = sf::st_crs(soil_pts)
+  )
+
+  # Fit empirical variogram
+  vgm_emp <- tryCatch(
+    gstat::variogram(residual ~ 1, data = resid_sf),
+    error = function(e) NULL
+  )
+
+  if (is.null(vgm_emp)) next
+
+  # Fit theoretical variogram model (try Sph, fall back to Exp)
+  vgm_fit <- tryCatch(
+    gstat::fit.variogram(vgm_emp, gstat::vgm(c("Sph", "Exp"))),
+    error = function(e) tryCatch(
+      gstat::fit.variogram(vgm_emp, gstat::vgm("Exp")),
+      error = function(e2) NULL
+    )
+  )
+
+  if (is.null(vgm_fit)) next
+
+  variogram_fits[[s]] <- list(empirical = vgm_emp, fitted = vgm_fit)
+  krige_models[[s]]   <- list(data = resid_sf, vgm = vgm_fit)
+
+  cat("Variogram fitted for series:", s, "\n")
+  cat("  Model:", vgm_fit$model[2], 
+      "| Range:", round(vgm_fit$range[2], 1),
+      "| Sill:", round(vgm_fit$psill[2], 4), "\n")
+}
+
+# ---- Plot variograms ----
+for (s in names(variogram_fits)) {
+  p <- plot(
+    variogram_fits[[s]]$empirical,
+    variogram_fits[[s]]$fitted,
+    main = paste("Variogram:", s)
+  )
+  print(p)
+}
+```
+
+```{r wall-to-wall-prediction}
+# ============================================================
+# STAGE 4: WALL-TO-WALL PREDICTION
+# ============================================================
+
+cat("Predicting across full raster extent...\n")
+cat("This may take a few minutes at 3m resolution.\n")
+
+# ---- RF prediction across all pixels ----
+# terra::predict handles the raster stack directly
+# We need to use the prepped recipe manually for raster prediction
+
+# Extract prep object from workflow
+prep_obj <- rf_spatial_final %>%
+  extract_preprocessor()
+
+# Build a prediction function compatible with terra::predict
+rf_predict_fun <- function(model, newdata, ...) {
+  # newdata is a data.frame of pixel values from terra
+  newdata_clean <- newdata %>%
+    as.data.frame() %>%
+    select(any_of(cov_cols))
+
+  # Replace non-finite with NA then impute
+  newdata_clean <- newdata_clean %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+
+  probs <- predict(model, new_data = newdata_clean, type = "prob")
+  probs
+}
+
+# Predict probabilities per pixel for each series
+# Use terra::predict with the workflow object
+prob_rasters <- terra::predict(
+  object  = cov_stack[[cov_cols]],
+  model   = rf_spatial_final,
+  fun     = function(model, ...) {
+    newdata <- list(...)[[1]] %>% as.data.frame()
+    names(newdata) <- cov_cols[seq_len(ncol(newdata))]
+    newdata[!is.finite(as.matrix(newdata))] <- NA
+    predict(model, new_data = newdata, type = "prob")
+  },
+  na.rm   = TRUE,
+  cores   = 1
+)
+
+# If terra::predict doesn't cooperate with tidymodels workflow,
+# use this safer tile-based approach instead:
+if (!exists("prob_rasters") || is.null(prob_rasters)) {
+
+  cat("Falling back to chunk-based prediction...\n")
+
+  # Convert raster to data frame for prediction
+  cov_df <- terra::as.data.frame(cov_stack[[cov_cols]], xy = TRUE, na.rm = FALSE)
+
+  # Keep track of which rows are complete
+  complete_idx <- complete.cases(cov_df %>% select(-x, -y))
+
+  cov_pred_input <- cov_df %>%
+    select(all_of(cov_cols)) %>%
+    mutate(across(everything(), ~ ifelse(is.finite(.x), .x, NA_real_)))
+
+  # Predict in chunks to avoid memory issues
+  chunk_size <- 50000
+  n_rows     <- nrow(cov_pred_input)
+  n_chunks   <- ceiling(n_rows / chunk_size)
+
+  prob_list <- vector("list", n_chunks)
+
+  cat("Predicting in", n_chunks, "chunks...\n")
+  for (i in seq_len(n_chunks)) {
+    idx_start <- (i - 1) * chunk_size + 1
+    idx_end   <- min(i * chunk_size, n_rows)
+
+    chunk <- cov_pred_input[idx_start:idx_end, ]
+
+    chunk_probs <- tryCatch(
+      predict(rf_spatial_final, new_data = chunk, type = "prob"),
+      error = function(e) {
+        matrix(NA_real_, nrow = nrow(chunk),
+               ncol = length(series_levels)) %>%
+          as.data.frame() %>%
+          setNames(paste0(".pred_", series_levels))
+      }
+    )
+
+    prob_list[[i]] <- chunk_probs
+    if (i %% 10 == 0) cat("  Chunk", i, "/", n_chunks, "\n")
+  }
+
+  all_probs <- bind_rows(prob_list)
+
+  # Reconstruct rasters for each series
+  prob_rasters <- terra::rast(cov_stack[[1]])  # template
+  prob_rasters <- terra::rast(
+    replicate(length(series_levels), terra::rast(cov_stack[[1]]))
+  )
+  names(prob_rasters) <- paste0("prob_", series_levels)
+
+  for (j in seq_along(series_levels)) {
+    s   <- series_levels[j]
+    col <- paste0(".pred_", s)
+    if (col %in% names(all_probs)) {
+      vals <- all_probs[[col]]
+      terra::values(prob_rasters[[j]]) <- vals
+    }
+  }
+}
+
+cat("RF probability rasters created.\n")
+```
+
+```{r krige-residuals}
+# ============================================================
+# ADD KRIGED RESIDUAL CORRECTION
+# ============================================================
+
+# For each series with a fitted variogram, krige the residuals
+# across the full raster extent and add to RF probability
+
+# Build prediction grid from raster extent
+raster_pts <- terra::as.data.frame(cov_stack[[1]], xy = TRUE, na.rm = TRUE) %>%
+  select(x, y) %>%
+  sf::st_as_sf(coords = c("x", "y"), crs = sf::st_crs(soil_pts))
+
+cat("Kriging residuals for", length(krige_models), "series...\n")
+
+kriged_corrections <- list()
+
+for (s in names(krige_models)) {
+  cat("  Kriging:", s, "...\n")
+
+  krige_result <- tryCatch(
+    gstat::krige(
+      formula  = residual ~ 1,
+      locations = krige_models[[s]]$data,
+      newdata  = raster_pts,
+      model    = krige_models[[s]]$vgm,
+      debug.level = 0
+    ),
+    error = function(e) {
+      cat("    Kriging failed for", s, ":", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+
+  if (is.null(krige_result)) next
+
+  # Convert kriged predictions to raster
+  krige_vals <- krige_result$var1.pred
+
+  krige_rast <- terra::rast(cov_stack[[1]])
+  # Match kriged values back to raster cells
+  krige_df <- raster_pts %>%
+    st_drop_geometry() %>%
+    bind_cols(st_coordinates(raster_pts) %>%
+                as.data.frame() %>%
+                rename(x = X, y = Y)) %>%
+    mutate(krige_val = krige_vals)
+
+  cells <- terra::cellFromXY(krige_rast,
+                              as.matrix(krige_df %>% select(x, y)))
+  terra::values(krige_rast)[cells] <- krige_df$krige_val
+
+  kriged_corrections[[s]] <- krige_rast
+  cat("    Done.\n")
+}
+
+# ---- Combine RF probabilities + kriged corrections ----
+rk_rasters <- prob_rasters  # start with RF probabilities
+
+for (s in names(kriged_corrections)) {
+  prob_layer_name <- paste0("prob_", s)
+  if (prob_layer_name %in% names(rk_rasters)) {
+    # Add kriged correction and clamp to [0, 1]
+    corrected <- rk_rasters[[prob_layer_name]] + kriged_corrections[[s]]
+    corrected <- terra::clamp(corrected, lower = 0, upper = 1)
+    rk_rasters[[prob_layer_name]] <- corrected
+  }
+}
+
+cat("Regression kriging correction applied.\n")
+```
+
+```{r predicted-class-map}
+# ============================================================
+# FINAL PREDICTED CLASS MAP
+# ============================================================
+
+# Predicted class = series with highest probability at each pixel
+predicted_class_rast <- terra::which.lyr(rk_rasters)
+names(predicted_class_rast) <- "predicted_series_idx"
+
+# Create a lookup: index -> series name
+series_lookup_df <- tibble(
+  idx    = seq_along(series_levels),
+  series = series_levels
+)
+
+# Save probability stack
+terra::writeRaster(
+  rk_rasters,
+  "../outputs/spatial/series_probability_stack_rk.tif",
+  overwrite = TRUE
+)
+
+# Save predicted class raster (as integer index)
+terra::writeRaster(
+  predicted_class_rast,
+  "../outputs/spatial/series_predicted_class_rk.tif",
+  overwrite = TRUE
+)
+
+# Save lookup table
+write.csv(series_lookup_df,
+          "../outputs/spatial/series_index_lookup.csv",
+          row.names = FALSE)
+
+cat("Saved:\n")
+cat("  ../outputs/spatial/series_probability_stack_rk.tif\n")
+cat("  ../outputs/spatial/series_predicted_class_rk.tif\n")
+cat("  ../outputs/spatial/series_index_lookup.csv\n")
+```
+
+```{r visualize}
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+# ---- 1. Predicted series map ----
+# Convert integer raster to factor for plotting
+predicted_class_factor <- terra::as.factor(predicted_class_rast)
+levels(predicted_class_factor) <- data.frame(
+  value = seq_along(series_levels),
+  series = series_levels
+)
+
+ggplot() +
+  tidyterra::geom_spatraster(data = predicted_class_factor) +
+  scale_fill_viridis_d(option = "turbo", na.value = "grey90", name = "Series") +
+  theme_minimal() +
+  labs(
+    title = "Predicted Soil Series — Perry Site",
+    subtitle = "Regression Kriging RF (spatial covariates, 3m resolution)"
+  )
+
+ggsave("../outputs/spatial/predicted_series_map.png",
+       width = 10, height = 8, dpi = 200)
+
+# ---- 2. Probability maps per series ----
+for (s in series_levels) {
+  prob_layer <- paste0("prob_", s)
+  if (!prob_layer %in% names(rk_rasters)) next
+
+  p <- ggplot() +
+    tidyterra::geom_spatraster(data = rk_rasters[[prob_layer]]) +
+    scale_fill_distiller(
+      palette  = "RdYlGn",
+      direction = 1,
+      na.value = "grey90",
+      limits   = c(0, 1),
+      name     = "Probability"
+    ) +
+    theme_minimal() +
+    labs(
+      title    = paste("Predicted probability:", s),
+      subtitle = "Regression kriging correction applied"
+    )
+
+  print(p)
+
+  ggsave(
+    paste0("../outputs/spatial/prob_map_", str_replace_all(s, " ", "_"), ".png"),
+    plot = p, width = 8, height = 6, dpi = 200
+  )
+}
+
+# ---- 3. Validation points overlaid on prediction map ----
+test_sf <- test_spatial %>%
+  sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+               crs = sf::st_crs(soil_pts))
+
+ggplot() +
+  tidyterra::geom_spatraster(data = predicted_class_factor) +
+  scale_fill_viridis_d(option = "turbo", na.value = "grey90",
+                       name = "Predicted Series") +
+  geom_sf(data = test_sf, aes(shape = as.character(series)),
+          size = 3, color = "white", stroke = 1.2) +
+  geom_sf(data = test_sf, aes(color = as.character(series),
+                               shape = as.character(series)),
+          size = 2.5) +
+  scale_color_manual(
+    values = scales::hue_pal()(length(series_levels)),
+    name   = "True Series"
+  ) +
+  scale_shape_manual(
+    values = rep(c(16, 17, 15, 18, 8), length.out = length(series_levels)),
+    name   = "True Series"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Predicted Series Map with Validation Points",
+    subtitle = "Point shape/color = true series; background = model prediction"
+  )
+
+ggsave("../outputs/spatial/predicted_series_validation_overlay.png",
+       width = 10, height = 8, dpi = 200)
+```
+
+```{r variable-importance}
+# ============================================================
+# VARIABLE IMPORTANCE
+# ============================================================
+
+# Extract importance from fitted ranger model
+rf_engine <- rf_spatial_final %>%
+  extract_fit_engine()
+
+importance_df <- tibble(
+  variable   = names(rf_engine$variable.importance),
+  importance = rf_engine$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(variable = fct_reorder(variable, importance))
+
+cat("\nTop 20 most important covariates:\n")
+importance_df %>%
+  slice_head(n = 20) %>%
+  as.data.frame() %>%
+  print()
+
+ggplot(importance_df %>% slice_head(n = 20),
+       aes(x = importance, y = variable)) +
+  geom_col(fill = "#2c7bb6") +
+  theme_minimal() +
+  labs(
+    title = "Variable Importance — Spatial RF Series Model",
+    x     = "Permutation Importance",
+    y     = NULL
+  )
+
+ggsave("../outputs/spatial/variable_importance.png",
+       width = 8, height = 6, dpi = 200)
+```
+
+```{r summary-metrics}
+# ============================================================
+# SUMMARY
+# ============================================================
+
+cat("\n============================================================\n")
+cat("SPATIAL SERIES PREDICTION SUMMARY\n")
+cat("============================================================\n")
+cat("Training pedons:", nrow(train_spatial), "\n")
+cat("Test pedons:    ", nrow(test_spatial), "\n")
+cat("Series modeled: ", length(series_levels), "\n")
+cat("Covariates used:", length(cov_cols), "\n")
+cat("Variograms fitted for:", length(krige_models), "series\n")
+cat("\nTest set performance:\n")
+print(metrics_spatial_rf)
+print(f1_spatial_rf)
+cat("\nVariogram ranges (spatial autocorrelation distance):\n")
+for (s in names(variogram_fits)) {
+  cat(" ", s, ":", round(variogram_fits[[s]]$fitted$range[2], 1), "units\n")
+}
+
+beep("wilhelm")
+```
+
+
+
+#Back to the drawing board....
+
+```{r load-inputs}
+# ============================================================
+# LOAD ALL INPUTS
+# ============================================================
+
+# 1. Covariate stack (already loaded, but reload if fresh session)
+if (!exists("cov_stack")) {
+  cov_stack <- terra::rast(
+    "../data/spatial/covariate_stack_3m_all_with_SR_indices.tif"
+  )
+}
+
+# 2. Perry pedon points (already loaded, but reload if fresh session)
+if (!exists("soil_pts")) {
+  soil_pts <- sf::st_read(
+    "../data/spatial/perry_pedon_locs.shp", quiet = TRUE
+  ) %>%
+    sf::st_transform(crs = sf::st_crs(terra::crs(cov_stack))) %>%
+    rename(Point = Point_ID) %>%
+    mutate(Point = as.character(Point))
+}
+
+# 3. Perry pedon pack (morphology features -- for NCSS model)
+if (!exists("perry_pack_150")) {
+  perry_pack_150 <- read.csv("../outputs/perry_pack_150_saved.rds") %>%
+    mutate(peiid = as.character(peiid))
+}
+
+# 4. Covariates at pedon locations (already extracted)
+if (!exists("cov_at_pedons")) {
+  cov_at_pedons <- read.csv(
+    "../outputs/spatial/covariates_at_pedons.csv"
+  ) %>%
+    mutate(Point = as.character(Point))
+}
+
+# 5. Series truth
+perry_fp_clean <- read.csv(
+  "../data/Perry_FP_data_with_taxa_02_20_2026.csv"
+) %>%
+  mutate(Point = as.character(Point))
+
+perry_series_truth <- perry_fp_clean %>%
+  mutate(
+    series = na_if(str_squish(as.character(series_clean)), ""),
+    series = na_if(series, "Fill"),
+    series = na_if(series, "fill"),
+    series = str_to_title(series)
+  ) %>%
+  group_by(Point) %>%
+  summarise(
+    series = {
+      y <- series[!is.na(series)]
+      if (length(y) == 0) NA_character_
+      else names(sort(table(y), decreasing = TRUE))[1]
+    },
+    .groups = "drop"
+  )
+
+# 6. NCSS series RF bundle
+ncss_bundle <- readRDS(
+  "../outputs/models/taxseries_rf_plain_bundle.rds"
+)
+
+cat("All inputs loaded.\n")
+cat("Perry pedon pack rows:", nrow(perry_pack_150), "\n")
+cat("Covariates at pedons rows:", nrow(cov_at_pedons), "\n")
+cat("Series truth rows:", nrow(perry_series_truth), "\n")
+```
+
+```{r ncss-predictions-at-pedons}
+# ============================================================
+# STAGE 1: RUN PERRY PEDONS THROUGH NCSS SERIES RF MODEL
+# Get morphology-informed series probabilities at each pedon
+# ============================================================
+
+# Helper from deploy script -- pad missing columns to match training data
+pad_like_train_raw <- function(new_df, train_df, outcome) {
+  req <- setdiff(names(train_df), outcome)
+  out <- new_df
+  missing <- setdiff(req, names(out))
+
+  for (nm in missing) {
+    tmpl <- train_df[[nm]]
+    if (str_detect(nm, "^prop_hzbase_")) {
+      out[[nm]] <- 0
+    } else if (str_detect(nm, "^(any_|has_)")) {
+      out[[nm]] <- FALSE
+    } else if (is.logical(tmpl))  { out[[nm]] <- FALSE
+    } else if (is.integer(tmpl))  { out[[nm]] <- NA_integer_
+    } else if (is.numeric(tmpl))  { out[[nm]] <- NA_real_
+    } else                         { out[[nm]] <- NA_character_ }
+  }
+
+  out %>%
+    mutate(across(where(is.logical), ~ tidyr::replace_na(.x, FALSE))) %>%
+    select(any_of(c("peiid", req)))
+}
+
+# Add top1/margin helper
+add_top1_margin <- function(pred_df) {
+  pred_cols <- names(pred_df)[
+    str_detect(names(pred_df), "^\\.pred_") & names(pred_df) != ".pred_class"
+  ]
+  pred_df %>%
+    rowwise() %>%
+    mutate(
+      probs  = list(c_across(all_of(pred_cols))),
+      top1   = max(probs, na.rm = TRUE),
+      top2   = ifelse(length(probs) > 1,
+                      sort(probs, decreasing = TRUE)[2], NA_real_),
+      margin = ifelse(length(probs) > 1, top1 - top2, NA_real_)
+    ) %>%
+    ungroup() %>%
+    select(-probs)
+}
+
+# Pad Perry pack to match NCSS training columns
+perry_padded <- pad_like_train_raw(
+  new_df   = perry_pack_150 %>% mutate(peiid = as.character(peiid)),
+  train_df = ncss_bundle$train_raw,
+  outcome  = ncss_bundle$outcome
+)
+
+# Force column classes to match training data
+for (nm in intersect(names(perry_padded), names(ncss_bundle$train_raw))) {
+  tmpl <- ncss_bundle$train_raw[[nm]]
+  if (is.integer(tmpl))   perry_padded[[nm]] <- as.integer(perry_padded[[nm]])
+  else if (is.logical(tmpl))  perry_padded[[nm]] <- as.logical(perry_padded[[nm]])
+  else if (is.numeric(tmpl))  perry_padded[[nm]] <- as.numeric(perry_padded[[nm]])
+  else if (is.character(tmpl)) perry_padded[[nm]] <- as.character(perry_padded[[nm]])
+  else if (is.factor(tmpl))    perry_padded[[nm]] <- factor(
+    as.character(perry_padded[[nm]]), levels = levels(tmpl)
+  )
+}
+
+# Run NCSS predictions
+ncss_probs <- predict(ncss_bundle$final_fit, perry_padded, type = "prob") %>%
+  bind_cols(predict(ncss_bundle$final_fit, perry_padded, type = "class")) %>%
+  bind_cols(perry_padded %>% select(peiid)) %>%
+  add_top1_margin()
+
+cat("NCSS predictions generated for", nrow(ncss_probs), "Perry pedons.\n")
+cat("Predicted series distribution:\n")
+ncss_probs %>%
+  count(.pred_class, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+# Get probability column names (one per series)
+prob_cols <- names(ncss_probs)[str_detect(names(ncss_probs), "^\\.pred_") &
+                                 names(ncss_probs) != ".pred_class"]
+series_levels <- str_remove(prob_cols, "^\\.pred_")
+cat("Series in NCSS model:", paste(series_levels, collapse = ", "), "\n")
+```
+
+```{r build-bridge-df}
+# ============================================================
+# BUILD BRIDGE DATASET
+# Combine NCSS predictions + spatial covariates at pedon locations
+# This is what we train the spatial bridge model on
+# ============================================================
+
+# Perry pack has peiid; we need to link to Point (field ID)
+# Use the perry_fp_clean Point -> peiid mapping
+point_to_peiid <- perry_fp_clean %>%
+  select(Point, peiid = Point) %>%   # peiid in perry context = Point
+  distinct() #%>%
+  # mutate(Point = as.character(Point),
+  #        peiid = as.character(peiid))
+
+# Actually perry_pack_150$peiid IS the Point number in Perry context
+# Confirm:
+cat("perry_pack_150 peiid examples:", 
+    paste(head(perry_pack_150$peiid, 5), collapse = ", "), "\n")
+cat("cov_at_pedons Point examples:", 
+    paste(head(cov_at_pedons$Point, 5), collapse = ", "), "\n")
+
+# Join: ncss_probs (peiid) + covariates (Point) + series truth (Point)
+# peiid in perry_pack_150 = Point in soil_pts
+bridge_df <- ncss_probs %>%
+  mutate(Point = as.character(peiid)) %>%
+  left_join(cov_at_pedons %>% mutate(Point = as.character(Point)),
+            by = "Point") %>%
+  left_join(perry_series_truth %>% mutate(Point = as.character(Point)),
+            by = "Point") %>%
+  mutate(
+    series_truth = factor(series),
+    ncss_pred    = as.character(.pred_class)
+  )
+
+cat("Bridge dataset rows:", nrow(bridge_df), "\n")
+cat("Rows with covariate data:", sum(!is.na(bridge_df$elevation)), "\n")
+cat("Rows with series truth:", sum(!is.na(bridge_df$series_truth)), "\n")
+
+# XY coordinates for kriging
+pts_xy <- soil_pts %>%
+  st_drop_geometry() %>%
+  bind_cols(
+    st_coordinates(soil_pts) %>%
+      as.data.frame() %>%
+      rename(coord_X = X, coord_Y = Y)
+  ) %>%
+  mutate(Point = as.character(Point)) %>%
+  select(Point, coord_X, coord_Y)
+
+bridge_df <- bridge_df %>%
+  left_join(pts_xy, by = "Point")
+
+cat("Rows with XY coordinates:", sum(!is.na(bridge_df$coord_X)), "\n")
+```
+
+```{r train-test-split}
+# ============================================================
+# TRAIN / TEST SPLIT
+# Use only pedons that have both covariate data AND series truth
+# ============================================================
+
+model_ready <- bridge_df %>%
+  filter(!is.na(series_truth), !is.na(elevation),
+         !is.na(coord_X)) %>%
+  droplevels()
+
+cat("Model-ready pedons:", nrow(model_ready), "\n")
+cat("Series distribution:\n")
+model_ready %>%
+  count(series_truth, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+set.seed(42)
+split_bridge <- initial_split(model_ready, prop = 0.8)
+train_bridge <- training(split_bridge)
+test_bridge  <- testing(split_bridge)
+
+cat("Train:", nrow(train_bridge), "| Test:", nrow(test_bridge), "\n")
+```
+
+```{r bridge-rf}
+# ============================================================
+# STAGE 2: BRIDGE RF MODEL
+# Predict series from spatial covariates, informed by NCSS probs
+# Two versions:
+#   A) covariates only (pure spatial)
+#   B) covariates + NCSS predicted probabilities (hybrid)
+# ============================================================
+
+cov_cols <- setdiff(names(cov_at_pedons), "Point")
+
+# Remove zero-variance covariates
+cov_cols <- cov_cols[
+  vapply(train_bridge[cov_cols],
+         function(x) length(unique(x[is.finite(x)])) > 1, logical(1))
+]
+
+cat("Spatial covariates used:", length(cov_cols), "\n")
+
+# ---- Version A: covariates only ----
+rec_cov_only <- recipe(series_truth ~ ., 
+                       data = train_bridge %>%
+                         select(series_truth, all_of(cov_cols))) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+rf_spec <- rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_cov <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rec_cov_only)
+
+min_n_train <- train_bridge %>%
+  count(series_truth) %>%
+  summarise(mn = min(n)) %>%
+  pull(mn)
+
+v <- max(2, min(5, min_n_train))
+
+set.seed(43)
+folds_cov <- vfold_cv(
+  train_bridge %>% select(series_truth, all_of(cov_cols)),
+  v = v
+)
+
+grid_cov <- grid_regular(
+  mtry(range = c(2, min(15, length(cov_cols)))),
+  min_n(range = c(2, 15)),
+  levels = 4
+)
+
+cat("Tuning covariates-only RF...\n")
+tuned_cov <- tune_grid(
+  wf_cov,
+  resamples = folds_cov,
+  grid      = grid_cov,
+  metrics   = metric_set(kap, accuracy)
+)
+
+best_cov <- select_best(tuned_cov, metric = "kap")
+rf_final_cov <- finalize_workflow(wf_cov, best_cov) %>%
+  fit(train_bridge %>% select(series_truth, all_of(cov_cols)))
+
+pred_cov <- predict(rf_final_cov,
+                    test_bridge %>% select(all_of(cov_cols)),
+                    type = "prob") %>%
+  bind_cols(predict(rf_final_cov,
+                    test_bridge %>% select(all_of(cov_cols)),
+                    type = "class")) %>%
+  bind_cols(test_bridge %>% select(series_truth))
+
+cat("\n--- BRIDGE RF (covariates only) ---\n")
+print(metric_set(accuracy, kap)(pred_cov,
+                                truth    = series_truth,
+                                estimate = .pred_class))
+print(f_meas(pred_cov, truth = series_truth,
+             estimate = .pred_class, estimator = "macro"))
+
+# ---- Version B: covariates + NCSS probabilities (hybrid) ----
+hybrid_cols <- c(cov_cols, prob_cols)
+
+rec_hybrid <- recipe(series_truth ~ .,
+                     data = train_bridge %>%
+                       select(series_truth, all_of(hybrid_cols))) %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+wf_hybrid <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(rec_hybrid)
+
+set.seed(44)
+folds_hybrid <- vfold_cv(
+  train_bridge %>% select(series_truth, all_of(hybrid_cols)),
+  v = v
+)
+
+grid_hybrid <- grid_regular(
+  mtry(range = c(2, min(15, length(hybrid_cols)))),
+  min_n(range = c(2, 15)),
+  levels = 4
+)
+
+cat("\nTuning hybrid RF (covariates + NCSS probs)...\n")
+tuned_hybrid <- tune_grid(
+  wf_hybrid,
+  resamples = folds_hybrid,
+  grid      = grid_hybrid,
+  metrics   = metric_set(kap, accuracy)
+)
+
+best_hybrid <- select_best(tuned_hybrid, metric = "kap")
+rf_final_hybrid <- finalize_workflow(wf_hybrid, best_hybrid) %>%
+  fit(train_bridge %>% select(series_truth, all_of(hybrid_cols)))
+
+pred_hybrid <- predict(rf_final_hybrid,
+                       test_bridge %>% select(all_of(hybrid_cols)),
+                       type = "prob") %>%
+  bind_cols(predict(rf_final_hybrid,
+                    test_bridge %>% select(all_of(hybrid_cols)),
+                    type = "class")) %>%
+  bind_cols(test_bridge %>% select(series_truth))
+
+cat("\n--- HYBRID RF (covariates + NCSS probs) ---\n")
+print(metric_set(accuracy, kap)(pred_hybrid,
+                                truth    = series_truth,
+                                estimate = .pred_class))
+print(f_meas(pred_hybrid, truth = series_truth,
+             estimate = .pred_class, estimator = "macro"))
+
+# Per-class accuracy for best model
+cat("\nPer-class accuracy (hybrid):\n")
+pred_hybrid %>%
+  mutate(across(c(series_truth, .pred_class), as.character)) %>%
+  group_by(series_truth) %>%
+  summarise(n = n(), n_correct = sum(series_truth == .pred_class),
+            acc = round(n_correct / n, 2), .groups = "drop") %>%
+  arrange(desc(acc)) %>%
+  as.data.frame() %>%
+  print()
+```
+
+```{r variogram-kriging}
+# ============================================================
+# STAGE 3: REGRESSION KRIGING ON RESIDUALS
+# Fit variogram on residuals from the hybrid RF
+# ============================================================
+
+# Get predicted probabilities for ALL training pedons
+train_probs_hybrid <- predict(
+  rf_final_hybrid,
+  train_bridge %>% select(all_of(hybrid_cols)),
+  type = "prob"
+) %>%
+  bind_cols(train_bridge %>% select(Point, series_truth, coord_X, coord_Y))
+
+variogram_fits <- list()
+krige_models   <- list()
+
+for (s in series_levels) {
+  prob_col <- paste0(".pred_", s)
+  if (!prob_col %in% names(train_probs_hybrid)) next
+
+  resid_df <- train_probs_hybrid %>%
+    mutate(
+      observed = as.integer(as.character(series_truth) == s),
+      residual = observed - .data[[prob_col]]
+    ) %>%
+    select(coord_X, coord_Y, residual) %>%
+    filter(is.finite(residual))
+
+  if (nrow(resid_df) < 5) {
+    cat("Skipping", s, "-- fewer than 5 training points.\n")
+    next
+  }
+
+  resid_sf <- sf::st_as_sf(resid_df,
+                            coords = c("coord_X", "coord_Y"),
+                            crs    = sf::st_crs(soil_pts))
+
+  vgm_emp <- tryCatch(
+    gstat::variogram(residual ~ 1, data = resid_sf),
+    error = function(e) NULL
+  )
+  if (is.null(vgm_emp)) next
+
+  vgm_fit <- tryCatch(
+    gstat::fit.variogram(vgm_emp, gstat::vgm(c("Sph", "Exp"))),
+    error = function(e) tryCatch(
+      gstat::fit.variogram(vgm_emp, gstat::vgm("Exp")),
+      error = function(e2) NULL
+    )
+  )
+  if (is.null(vgm_fit)) next
+
+  variogram_fits[[s]] <- list(empirical = vgm_emp, fitted = vgm_fit)
+  krige_models[[s]]   <- list(data = resid_sf, vgm = vgm_fit)
+
+  cat("Variogram fitted:", s,
+      "| Model:", vgm_fit$model[2],
+      "| Range:", round(vgm_fit$range[2], 1), "\n")
+}
+
+# Plot variograms
+for (s in names(variogram_fits)) {
+  p <- plot(variogram_fits[[s]]$empirical,
+            variogram_fits[[s]]$fitted,
+            main = paste("Variogram:", s))
+  print(p)
+}
+```
+
+```{r wall-to-wall}
+# ============================================================
+# STAGE 4: WALL-TO-WALL PREDICTION
+# ============================================================
+
+cat("Converting raster to data frame for prediction...\n")
+
+# Get NCSS predicted probabilities for ALL Perry pedons
+# (not just the model-ready subset)
+ncss_probs_all <- ncss_probs %>%
+  mutate(Point = as.character(peiid)) %>%
+  select(Point, all_of(prob_cols))
+
+# Build full pixel data frame from raster
+cov_df <- terra::as.data.frame(cov_stack[[cov_cols]], xy = TRUE, na.rm = FALSE)
+n_pixels <- nrow(cov_df)
+cat("Total pixels:", n_pixels, "\n")
+
+# For hybrid prediction we need NCSS probs at every pixel.
+# We don't have morphology data at every pixel, so we use
+# spatial interpolation of NCSS probs from pedon locations.
+# Simple approach: krige each NCSS probability surface from pedons.
+
+cat("Interpolating NCSS probabilities across raster extent...\n")
+
+# Prediction grid
+pred_grid <- terra::as.data.frame(cov_stack[[1]], xy = TRUE, na.rm = TRUE) %>%
+  select(x, y) %>%
+  sf::st_as_sf(coords = c("x", "y"), crs = sf::st_crs(soil_pts))
+
+# Interpolate each NCSS probability surface
+ncss_prob_rasters <- list()
+
+# Join probs to spatial points
+ncss_pts_sf <- soil_pts %>%
+  left_join(ncss_probs_all, by = "Point")
+
+# Replace the interpolation loop's raster-building with this approach:
+for (prob_col in prob_cols) {
+  s <- str_remove(prob_col, "^\\.pred_")
+  
+  pts_s <- ncss_pts_sf %>%
+    filter(!is.na(.data[[prob_col]])) %>%
+    rename(prob_val = all_of(prob_col))
+  
+  if (nrow(pts_s) < 3) next
+  
+  # IDW interpolation
+  idw_result <- tryCatch(
+    gstat::idw(prob_val ~ 1, locations = pts_s,
+               newdata = pred_grid, idp = 2, debug.level = 0),
+    error = function(e) NULL
+  )
+  if (is.null(idw_result)) next
+  
+  # Convert result to raster using rasterize instead of cellFromXY
+  idw_sf <- idw_result %>%
+    mutate(interp_val = pmax(0, pmin(1, var1.pred))) %>%
+    select(interp_val)
+  
+  r <- terra::rasterize(
+    terra::vect(idw_sf),
+    cov_stack[[1]],
+    field = "interp_val",
+    fun   = "mean"
+  )
+  names(r) <- prob_col
+  ncss_prob_rasters[[prob_col]] <- r
+  cat("Interpolated:", s, "\n")
+}
+
+# Then rebuild the stack only from non-empty rasters
+ncss_prob_rasters <- Filter(
+  function(r) !all(is.na(terra::values(r))), 
+  ncss_prob_rasters
+)
+ncss_prob_stack <- terra::rast(ncss_prob_rasters)
+cat("NCSS prob stack layers:", terra::nlyr(ncss_prob_stack), "\n")
+# Build probability raster stack from chunk predictions
+prob_raster_list <- list()
+
+for (j in seq_along(series_levels)) {
+  col <- paste0(".pred_", series_levels[j])
+  if (!col %in% names(all_probs)) next
+  
+  r <- terra::rast(cov_stack[[1]])  # fresh template
+  terra::values(r) <- all_probs[[col]]
+  names(r) <- paste0("prob_", series_levels[j])
+  
+  if (!all(is.na(terra::values(r)))) {
+    prob_raster_list[[series_levels[j]]] <- r
+  }
+}
+
+prob_rasters <- terra::rast(prob_raster_list)
+cat("Probability raster layers:", terra::nlyr(prob_rasters), "\n")
+cat("Layer names:", paste(names(prob_rasters), collapse = ", "), "\n")
+```
+
+```{r krige-correction}
+# ============================================================
+# ADD KRIGED RESIDUAL CORRECTION TO PROBABILITY RASTERS
+# ============================================================
+
+if (length(krige_models) > 0) {
+
+  pred_grid_krige <- terra::as.data.frame(
+    cov_stack[[1]], xy = TRUE, na.rm = TRUE
+  ) %>%
+    select(x, y) %>%
+    sf::st_as_sf(coords = c("x", "y"), crs = sf::st_crs(soil_pts))
+
+  for (s in names(krige_models)) {
+    cat("Kriging residuals for:", s, "...\n")
+
+    krige_result <- tryCatch(
+      gstat::krige(
+        formula   = residual ~ 1,
+        locations = krige_models[[s]]$data,
+        newdata   = pred_grid_krige,
+        model     = krige_models[[s]]$vgm,
+        debug.level = 0
+      ),
+      error = function(e) {
+        cat("  Kriging failed:", conditionMessage(e), "\n")
+        NULL
+      }
+    )
+
+    if (is.null(krige_result)) next
+
+    # Build correction raster
+    krige_rast <- terra::rast(cov_stack[[1]])
+    cells <- terra::cellFromXY(
+      krige_rast,
+      st_coordinates(pred_grid_krige) %>% as.matrix()
+    )
+    terra::values(krige_rast)[cells] <- krige_result$var1.pred
+
+    # Apply correction and clamp
+    layer_nm <- paste0("prob_", s)
+    if (layer_nm %in% names(prob_rasters)) {
+      corrected <- terra::clamp(
+        prob_rasters[[layer_nm]] + krige_rast,
+        lower = 0, upper = 1
+      )
+      prob_rasters[[layer_nm]] <- corrected
+      cat("  Correction applied:", s, "\n")
+    }
+  }
+} else {
+  cat("No variogram models fitted -- skipping kriging correction.\n")
+}
+
+# ---- Final classified map ----
+predicted_class_idx <- terra::which.lyr(prob_rasters)
+names(predicted_class_idx) <- "predicted_series_idx"
+
+series_lookup_df <- tibble(
+  idx    = seq_along(series_levels),
+  series = series_levels
+)
+
+# Save outputs
+terra::writeRaster(prob_rasters,
+                   "../outputs/spatial/series_prob_stack_hybrid_rk.tif",
+                   overwrite = TRUE)
+terra::writeRaster(predicted_class_idx,
+                   "../outputs/spatial/series_predicted_class_hybrid_rk.tif",
+                   overwrite = TRUE)
+write.csv(series_lookup_df,
+          "../outputs/spatial/series_index_lookup.csv",
+          row.names = FALSE)
+
+cat("Rasters saved.\n")
+```
+
+```{r visualize}
+# ============================================================
+# VISUALIZATION
+# ============================================================
+
+# Factor raster for plotting
+predicted_class_factor <- terra::as.factor(predicted_class_idx)
+levels(predicted_class_factor) <- data.frame(
+  value  = seq_along(series_levels),
+  series = series_levels
+)
+
+# 1. Predicted series map
+p_map <- ggplot() +
+  tidyterra::geom_spatraster(data = predicted_class_factor) +
+  scale_fill_viridis_d(option = "turbo", na.value = "grey90",
+                       name = "Series") +
+  theme_minimal() +
+  labs(
+    title    = "Predicted Soil Series — Perry Site",
+    subtitle = "Hybrid NCSS + Spatial Covariates + Regression Kriging (3m)"
+  )
+print(p_map)
+ggsave("../outputs/spatial/predicted_series_map_hybrid.png",
+       p_map, width = 10, height = 8, dpi = 200)
+
+# 2. Probability maps per series
+for (s in series_levels) {
+  layer_nm <- paste0("prob_", s)
+  if (!layer_nm %in% names(prob_rasters)) next
+
+  p <- ggplot() +
+    tidyterra::geom_spatraster(data = prob_rasters[[layer_nm]]) +
+    scale_fill_distiller(palette = "RdYlGn", direction = 1,
+                         na.value = "grey90", limits = c(0, 1),
+                         name = "Probability") +
+    theme_minimal() +
+    labs(title    = paste("Predicted probability:", s),
+         subtitle = "Hybrid model + kriging correction")
+  print(p)
+  ggsave(
+    paste0("../outputs/spatial/prob_",
+           str_replace_all(s, " ", "_"), "_hybrid.png"),
+    p, width = 8, height = 6, dpi = 200
+  )
+}
+
+# 3. Validation overlay -- true series at test pedon locations
+test_sf <- test_bridge %>%
+  sf::st_as_sf(coords = c("coord_X", "coord_Y"),
+               crs = sf::st_crs(soil_pts))
+
+p_val <- ggplot() +
+  tidyterra::geom_spatraster(data = predicted_class_factor) +
+  scale_fill_viridis_d(option = "turbo", na.value = "grey90",
+                       name = "Predicted") +
+  geom_sf(data = test_sf,
+          aes(color = as.character(series_truth),
+              shape = as.character(series_truth)),
+          size = 3, stroke = 1.2) +
+  scale_color_manual(
+    values = scales::hue_pal()(length(series_levels)),
+    name   = "True Series"
+  ) +
+  scale_shape_manual(
+    values = rep(c(16, 17, 15, 18, 8), length.out = length(series_levels)),
+    name   = "True Series"
+  ) +
+  theme_minimal() +
+  labs(
+    title    = "Predicted Series with Validation Points",
+    subtitle = "Background = model prediction; points = true series"
+  )
+print(p_val)
+ggsave("../outputs/spatial/predicted_series_validation_hybrid.png",
+       p_val, width = 10, height = 8, dpi = 200)
+
+# 4. Variable importance
+rf_engine <- rf_final_hybrid %>% extract_fit_engine()
+importance_df <- tibble(
+  variable   = names(rf_engine$variable.importance),
+  importance = rf_engine$variable.importance
+) %>%
+  arrange(desc(importance)) %>%
+  mutate(
+    variable = fct_reorder(variable, importance),
+    source   = if_else(str_detect(variable, "^\\.pred_"),
+                       "NCSS probability", "Spatial covariate")
+  )
+
+p_imp <- ggplot(importance_df %>% slice_head(n = 25),
+                aes(x = importance, y = variable, fill = source)) +
+  geom_col() +
+  scale_fill_manual(values = c("NCSS probability"   = "#d73027",
+                               "Spatial covariate"  = "#2c7bb6")) +
+  theme_minimal() +
+  labs(title = "Variable Importance — Hybrid Spatial RF",
+       x = "Permutation Importance", y = NULL, fill = "Feature type")
+print(p_imp)
+ggsave("../outputs/spatial/variable_importance_hybrid.png",
+       p_imp, width = 9, height = 7, dpi = 200)
+```
+
+```{r summary}
+# ============================================================
+# SUMMARY
+# ============================================================
+
+cat("\n============================================================\n")
+cat("SPATIAL SERIES PREDICTION SUMMARY (HYBRID MODEL)\n")
+cat("============================================================\n")
+cat("Perry pedons used:        ", nrow(model_ready), "\n")
+cat("Training pedons:          ", nrow(train_bridge), "\n")
+cat("Test pedons:              ", nrow(test_bridge), "\n")
+cat("Series predicted:         ", length(series_levels), "\n")
+cat("Spatial covariates:       ", length(cov_cols), "\n")
+cat("NCSS prob features added: ", length(prob_cols), "\n")
+cat("Variograms fitted:        ", length(krige_models), "\n")
+
+cat("\nCovariates-only RF:\n")
+print(metric_set(accuracy, kap)(pred_cov,
+                                truth    = series_truth,
+                                estimate = .pred_class))
+
+cat("\nHybrid RF (covariates + NCSS probs):\n")
+print(metric_set(accuracy, kap)(pred_hybrid,
+                                truth    = series_truth,
+                                estimate = .pred_class))
+
+cat("\nVariogram ranges:\n")
+for (s in names(variogram_fits)) {
+  cat(" ", s, ":", round(variogram_fits[[s]]$fitted$range[2], 1),
+      "map units\n")
+}
+```

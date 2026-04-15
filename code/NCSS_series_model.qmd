@@ -1,0 +1,794 @@
+---
+title: "NCSS_series_model"
+format: html
+---
+
+```{r setup}
+library(beepr)
+library(tidyverse)
+library(tidymodels)
+library(recipes)
+library(uwot)
+library(forcats)
+library(yardstick)
+library(dbscan)
+library(rlang)
+library(xgboost)
+library(bonsai)
+
+dir.create("../outputs/models", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r load-data}
+# ============================================================
+# LOAD DATA
+# ============================================================
+pedon_pack_150_p <- read.csv("../outputs/pedon_pack_150_03_05_2026.csv") %>%
+  mutate(peiid = as.character(peiid))
+
+# taxonname_clean is already in pedon_pack_150_p as taxonname_clean
+# (it may have come through as taxonname_clean or taxonname_clean.x depending
+# on your session — this handles both)
+if ("taxonname_clean.x" %in% names(pedon_pack_150_p) && 
+    !"taxonname_clean" %in% names(pedon_pack_150_p)) {
+  pedon_pack_150_p <- pedon_pack_150_p %>%
+    rename(taxonname_clean = taxonname_clean.x)
+}
+
+pedon_pack_series <- pedon_pack_150_p
+
+cat("Pedons with series name: ",
+    sum(!is.na(pedon_pack_series$taxonname_clean)), "/", nrow(pedon_pack_series), "\n")
+```
+
+```{r helpers}
+# ============================================================
+# HELPERS  (same pattern as other model scripts)
+# ============================================================
+
+`%||%` <- function(x, y) {
+  if (is.null(x) || length(x) == 0) y else x
+}
+
+# ---- bundle constructors ----
+build_plain_bundle <- function(name, outcome, train_raw, prep_rec, final_fit) {
+  x_cols <- bake(prep_rec, new_data = train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    names()
+
+  list(
+    name = name, outcome = outcome, model_type = "plain",
+    train_raw = train_raw, prep_rec = prep_rec,
+    x_cols = x_cols, final_fit = final_fit
+  )
+}
+
+build_umap_hdb_bundle <- function(name, outcome, train_raw, prep_rec, final_fit,
+                                   umap_model_file, hdb_fit, z_train,
+                                   umap_n_components, umap_n_neighbors,
+                                   umap_min_dist = 0.1, umap_metric = "euclidean",
+                                   umap_seed = NA_integer_) {
+  x_cols <- bake(prep_rec, new_data = train_raw) %>%
+    select(-any_of(c(outcome, "peiid"))) %>%
+    mutate(across(where(is.logical), as.double)) %>%
+    select(where(is.numeric)) %>%
+    names()
+
+  list(
+    name = name, outcome = outcome, model_type = "umap_hdb",
+    train_raw = train_raw, prep_rec = prep_rec, x_cols = x_cols,
+    final_fit = final_fit, umap_model_file = umap_model_file,
+    hdb_fit = hdb_fit, train_umap_features = as.matrix(z_train),
+    umap_colnames = colnames(z_train),
+    umap_settings = list(
+      n_components = umap_n_components, n_neighbors = umap_n_neighbors,
+      min_dist = umap_min_dist, metric = umap_metric, seed = umap_seed
+    )
+  )
+}
+
+# ---- HDBSCAN feature addition ----
+add_hdbscan_features <- function(train_umap, test_umap, outcome, minPts = 10) {
+  x_train <- train_umap %>% select(-all_of(outcome))
+  x_test  <- test_umap  %>% select(-all_of(outcome))
+
+  hdb_fit <- dbscan::hdbscan(as.matrix(x_train), minPts = minPts)
+
+  # Nearest-neighbor cluster assignment for test set
+  # (more stable than dbscan::predict which isn't exported in all versions)
+  train_mat <- as.matrix(x_train)
+  test_mat  <- as.matrix(x_test)
+
+  test_cluster <- apply(test_mat, 1, function(z) {
+    dists <- rowSums((train_mat - matrix(z, nrow = nrow(train_mat),
+                                         ncol = ncol(train_mat), byrow = TRUE))^2)
+    hdb_fit$cluster[which.min(dists)]
+  })
+
+  levs <- sort(unique(c(hdb_fit$cluster, test_cluster)))
+
+  train_hdb <- train_umap %>%
+    mutate(
+      hdb_cluster = factor(hdb_fit$cluster, levels = levs),
+      hdb_noise   = factor(if_else(hdb_fit$cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+
+  test_hdb <- test_umap %>%
+    mutate(
+      hdb_cluster = factor(test_cluster, levels = levs),
+      hdb_noise   = factor(if_else(test_cluster == 0, "noise", "cluster"),
+                           levels = c("cluster", "noise"))
+    )
+
+  list(train = train_hdb, test = test_hdb, fit = hdb_fit)
+}
+# ---- column/class cleaning before model fitting ----
+drop_bad_predictors <- function(train_df, test_df, outcome,
+                                id_col = "peiid", drop_cols = NULL) {
+  train_df <- train_df %>% select(-any_of(drop_cols))
+  test_df  <- test_df  %>% select(-any_of(drop_cols))
+
+  train_df <- train_df %>% mutate(across(where(is.logical), as.integer))
+  test_df  <- test_df  %>% mutate(across(where(is.logical), as.integer))
+
+  char_preds <- setdiff(
+    names(train_df)[vapply(train_df, is.character, logical(1))],
+    c(id_col, outcome)
+  )
+
+  if (length(char_preds) > 0) {
+    train_df <- train_df %>% select(-all_of(char_preds))
+    test_df  <- test_df  %>% select(-all_of(char_preds))
+  }
+
+  pred_names <- setdiff(names(train_df), c(id_col, outcome))
+  one_val <- pred_names[
+    vapply(train_df[pred_names],
+           function(x) length(unique(x[!is.na(x)])) <= 1, logical(1))
+  ]
+
+  if (length(one_val) > 0) {
+    train_df <- train_df %>% select(-all_of(one_val))
+    test_df  <- test_df  %>% select(-all_of(one_val))
+  }
+
+  list(train = train_df, test = test_df)
+}
+
+# ---- helper: columns to drop (all taxonomy labels) ----
+taxonomy_drop_cols <- c(
+  "taxonname_clean", "taxonname_key", "taxclname",
+  "taxorder", "taxsuborder", "taxgrtgroup",
+  "taxsubgrp", "taxsubgrp_mod1", "taxsubgrp_mod2", "taxsubgrp_mod3",
+  "taxsubgrp_mod_group", "taxgrtgroup_mod_group", "taxsuborder_mod_group",
+  "taxpartsize"
+)
+```
+
+```{r prep-series-data}
+# ============================================================
+# PREPARE SERIES DATA
+# ============================================================
+
+MIN_N_PER_SERIES <- 5   # <-- adjust if you want more/fewer classes
+
+df_series <- pedon_pack_series %>%
+  mutate(
+    taxonname_clean = str_squish(as.character(taxonname_clean)),
+    taxonname_clean = na_if(taxonname_clean, "")
+  ) %>%
+  filter(!is.na(taxonname_clean)) %>%
+  # Normalize: Title Case, strip trailing/leading whitespace
+  mutate(taxonname_clean = str_to_title(taxonname_clean)) %>%
+  # Remove any remaining "SND" / "Snd" placeholders from cleaning script
+  filter(!str_detect(taxonname_clean, regex("\\bsnd\\b", ignore_case = TRUE))) %>%
+  # Apply minimum class size filter (drop rare series entirely -- do NOT lump to Other)
+  add_count(taxonname_clean, name = "series_n") %>%
+  filter(series_n >= MIN_N_PER_SERIES) %>%
+  select(-series_n) %>%
+  mutate(taxonname_clean = factor(taxonname_clean)) %>%
+  droplevels()
+
+cat("Final: ", n_distinct(df_series$peiid), "pedons across",
+    nlevels(df_series$taxonname_clean), "series\n")
+
+
+```
+
+```{r split}
+# ============================================================
+# TRAIN / TEST SPLIT
+# ============================================================
+
+set.seed(99)
+
+split_series <- initial_split(df_series, prop = 0.8, strata = taxonname_clean)
+train_series <- training(split_series)
+test_series  <- testing(split_series)
+
+cat("Train:", nrow(train_series), "| Test:", nrow(test_series), "\n")
+```
+
+```{r model1-rf-plain}
+# ============================================================
+# MODEL 1: RANDOM FOREST (PLAIN)
+# ============================================================
+# No taxonomy leakage: all taxonomy label columns are dropped.
+# Only morphology + texture + color + depth/thickness features used.
+
+set.seed(101)
+
+# Drop taxonomy cols BUT keep the outcome
+taxonomy_drop_cols_no_outcome <- setdiff(taxonomy_drop_cols, "taxonname_clean")
+
+clean_series_rf <- drop_bad_predictors(
+  train_df  = train_series,
+  test_df   = test_series,
+  outcome   = "taxonname_clean",
+  id_col    = "peiid",
+  drop_cols = taxonomy_drop_cols_no_outcome   # <-- outcome not in drop list
+)
+
+# Confirm outcome survived
+stopifnot("taxonname_clean" %in% names(clean_series_rf$train))
+cat("Outcome levels:", nlevels(clean_series_rf$train$taxonname_clean), "\n")
+cat("Outcome class:", class(clean_series_rf$train$taxonname_clean), "\n")
+
+# Recipe using the data directly, not a pre-built formula object
+rec_series_rf <- recipe(taxonname_clean ~ ., data = clean_series_rf$train) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_series_rf <- prep(rec_series_rf, training = clean_series_rf$train)
+
+x_train_rf <- bake(prep_rec_series_rf, new_data = clean_series_rf$train) %>%
+  select(-taxonname_clean, -peiid)
+p_rf <- ncol(x_train_rf)
+
+min_class_n_rf <- clean_series_rf$train %>%
+  count(taxonname_clean) %>%
+  summarise(mn = min(n)) %>%
+  pull(mn)
+
+v_rf <- max(2, min(5, min_class_n_rf))
+
+rf_spec_series <- rand_forest(
+  trees = 1500,
+  mtry  = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", probability = TRUE, importance = "permutation") %>%
+  set_mode("classification")
+
+wf_rf_series <- workflow() %>%
+  add_model(rf_spec_series) %>%
+  add_recipe(rec_series_rf)
+
+folds_rf_series <- vfold_cv(clean_series_rf$train, v = v_rf,
+                             strata = taxonname_clean)
+
+grid_rf_series <- grid_regular(
+  mtry(range = c(2, min(12, p_rf))),
+  min_n(range = c(2, 20)),
+  levels = 4
+)
+
+cat("Tuning RF (series plain) ...\n")
+tuned_rf_series <- tune_grid(
+  wf_rf_series,
+  resamples = folds_rf_series,
+  grid      = grid_rf_series,
+  metrics   = metric_set(bal_accuracy, kap, accuracy)
+)
+
+best_rf_series <- select_best(tuned_rf_series, metric = "bal_accuracy")
+cat("Best RF params:\n"); print(best_rf_series)
+
+rf_final_series <- finalize_workflow(wf_rf_series, best_rf_series) %>%
+  fit(clean_series_rf$train)
+
+pred_rf_series <- predict(rf_final_series, clean_series_rf$test, type = "prob") %>%
+  bind_cols(predict(rf_final_series, clean_series_rf$test, type = "class")) %>%
+  bind_cols(clean_series_rf$test %>% select(taxonname_clean))
+
+# ---- bundle ----
+taxseries_rf_bundle <- build_plain_bundle(
+  name       = "taxseries_rf_plain",
+  outcome    = "taxonname_clean",
+  train_raw  = clean_series_rf$train,
+  prep_rec   = prep_rec_series_rf,
+  final_fit  = rf_final_series
+)
+
+taxseries_rf_bundle$metrics <- metric_set(accuracy, kap, bal_accuracy)(
+  pred_rf_series,
+  truth    = taxonname_clean,
+  estimate = .pred_class
+)
+
+taxseries_rf_bundle$f_meas <- f_meas(
+  pred_rf_series,
+  truth     = taxonname_clean,
+  estimate  = .pred_class,
+  estimator = "macro"
+)
+
+taxseries_rf_bundle$conf_mat <- conf_mat(
+  pred_rf_series,
+  truth    = taxonname_clean,
+  estimate = .pred_class
+)
+
+saveRDS(taxseries_rf_bundle,
+        "../outputs/models/taxseries_rf_plain_bundle.rds")
+
+cat("\n--- RF SERIES PLAIN ---\n")
+print(taxseries_rf_bundle$metrics)
+print(taxseries_rf_bundle$f_meas)
+
+beep("wilhelm")
+```
+
+```{r model2-xgb-umap-hdbscan}
+# ============================================================
+# MODEL 2: XGBoost + UMAP + HDBSCAN
+# ============================================================
+
+set.seed(201)
+
+clean_series_xgb <- drop_bad_predictors(
+  train_df  = train_series,
+  test_df   = test_series,
+  outcome   = "taxonname_clean",
+  id_col    = "peiid",
+  drop_cols = taxonomy_drop_cols_no_outcome   # <-- same as model 1
+)
+
+# Confirm outcome survived
+stopifnot("taxonname_clean" %in% names(clean_series_xgb$train))
+cat("Outcome levels:", nlevels(clean_series_xgb$train$taxonname_clean), "\n")
+
+# Recipe without the step_mutate_at/step_log for now
+rec_series_xgb <- recipe(taxonname_clean ~ ., data = clean_series_xgb$train) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_series_xgb <- prep(rec_series_xgb, training = clean_series_xgb$train)
+
+x_train_xgb <- bake(prep_rec_series_xgb, new_data = clean_series_xgb$train) %>%
+  select(-taxonname_clean, -peiid) %>%
+  mutate(across(where(is.logical), as.double)) %>%
+  select(where(is.numeric))
+
+x_test_xgb <- bake(prep_rec_series_xgb, new_data = clean_series_xgb$test) %>%
+  select(-taxonname_clean, -peiid) %>%
+  mutate(across(where(is.logical), as.double)) %>%
+  select(where(is.numeric))
+
+# Replace non-finite with 0 for UMAP safety
+x_train_xgb[!is.finite(as.matrix(x_train_xgb))] <- 0
+x_test_xgb[!is.finite(as.matrix(x_test_xgb))]   <- 0
+
+# ---- UMAP ----
+# n_neighbors: use ~15 for series (many classes, want tight neighborhoods)
+# n_components: 20 gives more room for many-class separation
+UMAP_SEED       <- 202
+UMAP_N_COMP     <- 20
+UMAP_N_NEIGHBORS <- 15
+UMAP_MIN_DIST   <- 0.05
+
+cat("Fitting UMAP for series XGB ...\n")
+set.seed(UMAP_SEED)
+umap_fit_series <- uwot::umap(
+  as.matrix(x_train_xgb),
+  n_components = UMAP_N_COMP,
+  n_neighbors  = UMAP_N_NEIGHBORS,
+  min_dist     = UMAP_MIN_DIST,
+  metric       = "euclidean",
+  ret_model    = TRUE
+)
+
+uwot::save_uwot(
+  umap_fit_series,
+  file = "../outputs/models/taxseries2_xgb_umap_hdb_umap.uwot"
+)
+
+z_train_series <- as.data.frame(umap_fit_series$embedding)
+z_test_series  <- as.data.frame(
+  uwot::umap_transform(as.matrix(x_test_xgb), umap_fit_series)
+)
+names(z_train_series) <- paste0("U", seq_len(ncol(z_train_series)))
+names(z_test_series)  <- names(z_train_series)
+
+train_umap_series <- bind_cols(z_train_series,
+                               taxonname_clean = clean_series_xgb$train$taxonname_clean)
+test_umap_series  <- bind_cols(z_test_series,
+                               taxonname_clean = clean_series_xgb$test$taxonname_clean)
+
+# ---- HDBSCAN ----
+# minPts = 5 is reasonable for series (some classes will be small)
+hdb_series <- add_hdbscan_features(
+  train_umap = train_umap_series,
+  test_umap  = test_umap_series,
+  outcome    = "taxonname_clean",
+  minPts     = 5
+)
+
+# ---- XGBoost tuning ----
+xgb_spec_series <- boost_tree(
+  trees       = tune(),
+  tree_depth  = tune(),
+  learn_rate  = tune(),
+  loss_reduction = tune(),
+  min_n       = tune(),
+  sample_size = tune(),
+  mtry        = tune(),
+  stop_iter   = 25
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf_series <- workflow() %>%
+  add_model(xgb_spec_series) %>%
+  add_formula(taxonname_clean ~ .)
+
+min_class_n_xgb <- hdb_series$train %>%
+  count(taxonname_clean) %>%
+  summarise(mn = min(n)) %>%
+  pull(mn)
+
+v_xgb <- max(2, min(5, min_class_n_xgb))
+
+# Use 3-fold CV to keep more samples per class per fold
+set.seed(203)
+folds_xgb_series <- vfold_cv(hdb_series$train, v = 3,
+                              strata = taxonname_clean)
+
+# Smaller grid to reduce chance of bad configurations
+xgb_params_series <- parameters(
+  trees(range          = c(200L, 1000L)),
+  tree_depth(range     = c(2L, 6L)),
+  learn_rate(range     = c(-2, -0.5)),
+  loss_reduction(range = c(-2, 0)),
+  min_n(range          = c(2L, 10L)),
+  sample_prop(range    = c(0.6, 1.0)),
+  finalize(mtry(), hdb_series$train %>% select(-taxonname_clean))
+)
+
+set.seed(204)
+grid_xgb_series <- grid_latin_hypercube(xgb_params_series, size = 15)
+
+cat("Tuning XGBoost + UMAP+HDBSCAN (series) ...\n")
+tuned_xgb_series <- tune_grid(
+  xgb_wf_series,
+  resamples = folds_xgb_series,
+  grid      = grid_xgb_series,
+  metrics   = metric_set(bal_accuracy, kap, accuracy)
+)
+
+best_xgb_series <- select_best(tuned_xgb_series, metric = "kap")
+cat("Best XGB params:\n"); print(best_xgb_series)
+
+xgb_final_series <- finalize_workflow(xgb_wf_series, best_xgb_series) %>%
+  fit(hdb_series$train)
+
+pred_xgb_series <- predict(xgb_final_series, hdb_series$test, type = "prob") %>%
+  bind_cols(predict(xgb_final_series, hdb_series$test, type = "class")) %>%
+  bind_cols(hdb_series$test %>% select(taxonname_clean))
+
+# ---- bundle ----
+taxseries_xgb_bundle <- build_umap_hdb_bundle(
+  name              = "taxseries_xgb_umap_hdb",
+  outcome           = "taxonname_clean",
+  train_raw         = clean_series_xgb$train,
+  prep_rec          = prep_rec_series_xgb,
+  final_fit         = xgb_final_series,
+  umap_model_file   = "../outputs/models/taxseries_xgb_umap_hdb_umap.uwot",
+  hdb_fit           = hdb_series$fit,
+  z_train           = z_train_series,
+  umap_n_components = UMAP_N_COMP,
+  umap_n_neighbors  = UMAP_N_NEIGHBORS,
+  umap_min_dist     = UMAP_MIN_DIST,
+  umap_metric       = "euclidean",
+  umap_seed         = UMAP_SEED
+)
+
+taxseries_xgb_bundle$metrics <- metric_set(accuracy, kap)(
+  pred_xgb_series,
+  truth    = taxonname_clean,
+  estimate = .pred_class
+)
+
+taxseries_xgb_bundle$f_meas <- f_meas(
+  pred_xgb_series,
+  truth     = taxonname_clean,
+  estimate  = .pred_class,
+  estimator = "macro"
+)
+
+taxseries_xgb_bundle$conf_mat <- conf_mat(
+  pred_xgb_series,
+  truth    = taxonname_clean,
+  estimate = .pred_class
+)
+
+saveRDS(taxseries_xgb_bundle,
+        "../outputs/models/taxseries2_xgb_umap_hdb_bundle.rds")
+
+cat("\n--- XGB + UMAP + HDBSCAN SERIES ---\n")
+print(taxseries_xgb_bundle$metrics)
+print(taxseries_xgb_bundle$f_meas)
+beep("wilhelm")
+```
+```{r model3-xgb-plain}
+# ============================================================
+# MODEL 3: XGBoost PLAIN (no UMAP/HDBSCAN)
+# ============================================================
+
+set.seed(301)
+
+clean_series_xgb_plain <- drop_bad_predictors(
+  train_df  = train_series,
+  test_df   = test_series,
+  outcome   = "taxonname_clean",
+  id_col    = "peiid",
+  drop_cols = taxonomy_drop_cols_no_outcome
+)
+
+stopifnot("taxonname_clean" %in% names(clean_series_xgb_plain$train))
+
+rec_series_xgb_plain <- recipe(taxonname_clean ~ ., data = clean_series_xgb_plain$train) %>%
+  update_role(peiid, new_role = "id") %>%
+  step_zv(all_predictors()) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec_series_xgb_plain <- prep(rec_series_xgb_plain,
+                                   training = clean_series_xgb_plain$train)
+
+baked_train_xgb_plain <- bake(prep_rec_series_xgb_plain,
+                               new_data = clean_series_xgb_plain$train) %>%
+  select(-taxonname_clean, -peiid)
+
+xgb_spec_plain <- boost_tree(
+  trees          = tune(),
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  loss_reduction = tune(),
+  min_n          = tune(),
+  sample_size    = tune(),
+  mtry           = tune(),
+  stop_iter      = 25
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+
+xgb_wf_plain <- workflow() %>%
+  add_model(xgb_spec_plain) %>%
+  add_recipe(rec_series_xgb_plain)
+
+set.seed(302)
+folds_xgb_plain <- vfold_cv(clean_series_xgb_plain$train, v = 3,
+                              strata = taxonname_clean)
+
+xgb_params_plain <- parameters(
+  trees(range          = c(200L, 1000L)),
+  tree_depth(range     = c(2L, 6L)),
+  learn_rate(range     = c(-2, -0.5)),
+  loss_reduction(range = c(-2, 0)),
+  min_n(range          = c(2L, 10L)),
+  sample_prop(range    = c(0.6, 1.0)),
+  finalize(mtry(), baked_train_xgb_plain)
+)
+
+set.seed(303)
+grid_xgb_plain <- grid_latin_hypercube(xgb_params_plain, size = 15)
+
+cat("Tuning XGBoost plain (series) ...\n")
+tuned_xgb_plain <- tune_grid(
+  xgb_wf_plain,
+  resamples = folds_xgb_plain,
+  grid      = grid_xgb_plain,
+  metrics   = metric_set(kap, accuracy)
+)
+
+best_xgb_plain <- select_best(tuned_xgb_plain, metric = "kap")
+cat("Best XGB plain params:\n"); print(best_xgb_plain)
+
+xgb_final_plain <- finalize_workflow(xgb_wf_plain, best_xgb_plain) %>%
+  fit(clean_series_xgb_plain$train)
+
+pred_xgb_plain <- predict(xgb_final_plain, clean_series_xgb_plain$test, type = "prob") %>%
+  bind_cols(predict(xgb_final_plain, clean_series_xgb_plain$test, type = "class")) %>%
+  bind_cols(clean_series_xgb_plain$test %>% select(taxonname_clean))
+
+# ---- bundle ----
+taxseries_xgb_plain_bundle <- build_plain_bundle(
+  name      = "taxseries_xgb_plain",
+  outcome   = "taxonname_clean",
+  train_raw = clean_series_xgb_plain$train,
+  prep_rec  = prep_rec_series_xgb_plain,
+  final_fit = xgb_final_plain
+)
+
+taxseries_xgb_plain_bundle$metrics <- metric_set(accuracy, kap)(
+  pred_xgb_plain,
+  truth    = taxonname_clean,
+  estimate = .pred_class
+)
+
+taxseries_xgb_plain_bundle$f_meas <- f_meas(
+  pred_xgb_plain,
+  truth     = taxonname_clean,
+  estimate  = .pred_class,
+  estimator = "macro"
+)
+
+taxseries_xgb_plain_bundle$conf_mat <- conf_mat(
+  pred_xgb_plain,
+  truth    = taxonname_clean,
+  estimate = .pred_class
+)
+
+saveRDS(taxseries_xgb_plain_bundle,
+        "../outputs/models/taxseries_xgb_plain_bundle.rds")
+
+cat("\n--- XGB PLAIN SERIES ---\n")
+print(taxseries_xgb_plain_bundle$metrics)
+print(taxseries_xgb_plain_bundle$f_meas)
+
+# ---- per-class accuracy ----
+pred_xgb_plain %>%
+  mutate(across(c(taxonname_clean, .pred_class), as.character)) %>%
+  group_by(taxonname_clean) %>%
+  summarise(
+    n = n(),
+    n_correct = sum(taxonname_clean == .pred_class),
+    accuracy  = round(n_correct / n, 2),
+    .groups   = "drop"
+  ) %>%
+  arrange(desc(accuracy)) %>%
+  as.data.frame() %>%
+  print()
+
+beep("wilhelm")
+```
+
+
+```{r compare-models}
+# ============================================================
+# COMPARISON TABLE
+# ============================================================
+
+series_model_list <- list(
+  taxseries_rf_plain       = taxseries_rf_bundle,
+  taxseries_xgb_umap_hdb  = taxseries_xgb_bundle,
+  taxseries_xgb_plain     = taxseries_xgb_plain_bundle
+)
+
+series_metric_summary <- purrr::map_dfr(series_model_list, function(x) {
+  met_tbl <- x$metrics %>%
+    select(.metric, .estimate) %>%
+    tidyr::pivot_wider(names_from = .metric, values_from = .estimate)
+
+  f1_tbl <- x$f_meas %>% select(f_meas_macro = .estimate)
+
+  bind_cols(
+    tibble(model = x$name, outcome = x$outcome),
+    met_tbl, f1_tbl
+  )
+})
+
+cat("\n============================================\n")
+cat("SERIES MODEL COMPARISON\n")
+cat("============================================\n")
+print(series_metric_summary)
+```
+
+```{r per-class-accuracy}
+# ============================================================
+# PER-CLASS ACCURACY (useful for many-class problems)
+# ============================================================
+
+per_class_acc <- function(pred_df, truth_col = "taxonname_clean",
+                           pred_col = ".pred_class") {
+  pred_df %>%
+    rename(truth = all_of(truth_col), pred = all_of(pred_col)) %>%
+    group_by(truth) %>%
+    summarise(
+      n = n(),
+      n_correct = sum(as.character(truth) == as.character(pred)),
+      acc = n_correct / n,
+      .groups = "drop"
+    ) %>%
+    arrange(desc(acc))
+}
+
+cat("\n--- Per-class accuracy: RF plain ---\n")
+print(per_class_acc(pred_rf_series), n = 50)
+
+cat("\n--- Per-class accuracy: XGB + UMAP/HDBSCAN ---\n")
+print(per_class_acc(pred_xgb_series), n = 50)
+
+cat("\n--- Per-class accuracy: XGB plain ---\n")
+print(per_class_acc(pred_xgb_plain), n = 50)
+```
+
+```{r save-best-bundle}
+# ============================================================
+# SAVE COMBINED SERIES BUNDLES
+# ============================================================
+
+saveRDS(
+  series_model_list,
+  "../outputs/models/taxseries_all_bundles.rds"
+)
+
+cat("All series bundles saved.\n")
+```
+
+```{r umap-viz}
+# ============================================================
+# OPTIONAL: UMAP VISUALIZATION COLORED BY SERIES
+# ============================================================
+
+# Only shows training data to avoid data leakage in the plot
+umap_viz_df <- bind_cols(
+  z_train_series,
+  series = clean_series_xgb$train$taxonname_clean
+)
+
+# Limit to top N series for legibility
+TOP_N <- 20
+top_series <- umap_viz_df %>%
+  count(series, sort = TRUE) %>%
+  slice_head(n = TOP_N) %>%
+  pull(series)
+
+umap_viz_df2 <- umap_viz_df %>%
+  mutate(series_plot = if_else(series %in% top_series,
+                               as.character(series), "Other"))
+
+ggplot(umap_viz_df2, aes(U1, U2, color = series_plot)) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  theme_minimal() +
+  labs(
+    title = "UMAP of NCSS pedon features (0–150 cm), colored by series",
+    subtitle = paste0("Top ", TOP_N, " series shown; remaining = 'Other'"),
+    color = "Series"
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 3), ncol = 2))
+```
+```{r what's wrong? }
+# Where do misclassified pedons end up?
+pred_rf_series %>%
+  mutate(across(c(taxonname_clean, .pred_class), as.character)) %>%
+  filter(taxonname_clean != .pred_class) %>%
+  count(taxonname_clean, .pred_class, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+#orangeburg norfolk mix up is interesting
+
+# Dothan → Orangeburg / Tifton — these three are the classic "Dothan-Orangeburg-Tifton" complex of the Southern Coastal Plain, separated primarily by plinthite depth and particle size control section. Morphologically nearly identical in many pedons
+
+# Bonifay → Fuquay and Leefield → Fuquay — all three are Arenic or Grossarenic Paleudults with thick sandy mantles over Bt; the distinction is subtle subsurface criteria
+
+# Blanton → Troup — both grossarenic, both sandy throughout, very similar morphology
+
+# Eustis → Lakeland — both excessively drained sandy soils, Lakeland just lacks the Bt entirely
+
+# Hornsville → Craven — both poorly drained, fine-textured, makes sense
+
+# Albany → Blanton — both have thick sandy epipedons over loamy Bt
+
+#Orangeburg → Norfolk — these are genuinely similar fine-loamy Hapludults/Kandiudults and this confusion shows up in real-world mapping too
+```
+

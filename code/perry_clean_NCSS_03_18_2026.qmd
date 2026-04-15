@@ -21,7 +21,7 @@ out_dir   <- "outputs"
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 ```
 
-```{r}
+```{r helpers}
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -67,7 +67,7 @@ parse_top_bottom <- function(x) {
 }
 ```
 
-```{r}
+```{r terminology_helpers}
 # ============================================================
 # HORIZON / MORPHOLOGY HELPERS
 # ============================================================
@@ -160,7 +160,7 @@ parse_subgrp_mods <- function(subgrp, gg_hint = NA_character_) {
 }
 ```
 
-```{r}
+```{r idx func}
 # ============================================================
 # INDEX FUNCTIONS USED IN PERRY PACK
 # ============================================================
@@ -372,7 +372,7 @@ calc_argillic_kandic_pale_indices <- function(df, upper = 150) {
 }
 ```
 
-```{r}
+```{r load}
 # ============================================================
 # LOAD AND CLEAN PERRY DATA
 # ============================================================
@@ -399,7 +399,7 @@ perry_fp_clean <- perry_fp %>%
   select(-subgrp_gg)
 ```
 
-```{r}
+```{r pedon pack}
 # ============================================================
 # BUILD PERRY PEDON PACK 0-150 CM
 # ============================================================
@@ -533,7 +533,7 @@ build_perry_pedon_pack_0_150 <- function(perry_fp) {
 }
 ```
 
-```{r}
+```{r idx build}
 # ============================================================
 # BUILD AUXILIARY HORIZON TABLE FOR INDEX FUNCTIONS
 # ============================================================
@@ -570,7 +570,7 @@ perry_hz_for_indices <- perry_fp_clean %>%
 ```
 
 
-```{r}
+```{r final perry pack}
 # ============================================================
 # FINAL PERRY PACK
 # ============================================================
@@ -613,7 +613,7 @@ perry_fp_clean <- perry_fp_clean %>%
   mutate(peiid = as.character(Point))
 ```
 
-```{r}
+```{r pull for saves}
 # ============================================================
 # DEPLOYMENT HELPERS FOR SAVED BUNDLES
 # ============================================================
@@ -792,7 +792,7 @@ deploy_bundle_to_perry <- function(bundle, perry_pack) {
 
 ```
 
-```{r}
+```{r best}
 # ============================================================
 # LOAD SAVED BEST BUNDLES
 # ============================================================
@@ -862,7 +862,7 @@ bundle_check <- purrr::map_dfr(best_model_bundles, function(x) {
 bundle_check
 ```
 
-```{r}
+```{r predict}
 # ============================================================
 # RUN PREDICTIONS ON PERRY
 # ============================================================
@@ -986,7 +986,168 @@ for (nm in names(best_model_bundles)) {
 }
 ```
 
-```{r}
+
+```{r series}
+# ============================================================
+# PERRY SERIES DEPLOYMENT
+# ============================================================
+
+# Load all three series bundles
+series_bundles <- list(
+  taxseries_rf_plain     = readRDS("../outputs/models/taxseries_rf_plain_bundle.rds"),
+  taxseries_xgb_plain    = readRDS("../outputs/models/taxseries_xgb_plain_bundle.rds"),
+  taxseries_xgb_umap_hdb = readRDS("../outputs/models/taxseries2_xgb_umap_hdb_bundle.rds")
+)
+
+# Load UMAP model for the umap_hdb bundle
+series_bundles$taxseries_xgb_umap_hdb$umap_fit <- uwot::load_uwot(
+  "../outputs/models/taxseries_xgb_umap_hdb_umap.uwot"
+)
+
+# ---- Run predictions ----
+perry_series_preds <- purrr::imap(
+  series_bundles,
+  ~ deploy_bundle_to_perry(.x, perry_pack_150)
+)
+
+perry_series_preds <- purrr::map(
+  perry_series_preds,
+  ~ .x %>% mutate(peiid = as.character(peiid))
+)
+
+# ---- Build Perry series truth ----
+perry_series_truth <- perry_fp_clean %>%
+  mutate(
+    peiid = as.character(Point),
+    series_clean = na_if(str_squish(as.character(series_clean)), ""),
+    series_clean = na_if(series_clean, "Fill"),   # treat Fill as NA
+    series_clean = na_if(series_clean, "fill"),
+    series_clean = str_to_title(series_clean)      # match NCSS Title Case
+  ) %>%
+  group_by(peiid) %>%
+  summarise(
+    n_hz           = n(),
+    n_truth_nonNA  = sum(!is.na(series_clean)),
+    n_truth_unique = n_distinct(series_clean[!is.na(series_clean)]),
+    truth          = mode_non_na(series_clean),
+    .groups = "drop"
+  )
+
+cat("Perry pedons with series truth:", sum(!is.na(perry_series_truth$truth)), "\n")
+cat("Unique series in Perry truth:\n")
+perry_series_truth %>%
+  filter(!is.na(truth)) %>%
+  count(truth, sort = TRUE) %>%
+  as.data.frame() %>%
+  print()
+
+# ---- Validate each model against Perry truth ----
+perry_series_validations <- list()
+
+for (nm in names(series_bundles)) {
+  pred_i  <- perry_series_preds[[nm]]
+  outcome_i <- series_bundles[[nm]]$outcome   # "taxonname_clean"
+
+  # Perry truth uses series_clean; rename to match outcome column
+  truth_i <- perry_series_truth %>%
+    rename(!!outcome_i := truth) %>%
+    select(peiid, all_of(outcome_i), n_truth_unique)
+
+  # Join predictions to truth
+  val_df <- pred_i %>%
+    mutate(peiid = as.character(peiid)) %>%
+    left_join(truth_i, by = "peiid") %>%
+    filter(!is.na(.data[[outcome_i]]), n_truth_unique == 1)
+
+  cat("\n====================================================\n")
+  cat("MODEL:", nm, "\n")
+  cat("Pedons with evaluable truth:", nrow(val_df), "\n")
+  cat("====================================================\n")
+
+  if (nrow(val_df) < 2) {
+    cat("Not enough truth rows to evaluate.\n")
+    next
+  }
+
+  # Align factor levels
+  lvl <- union(
+    levels(factor(val_df[[outcome_i]])),
+    levels(factor(as.character(val_df$.pred_class)))
+  )
+
+  val_df <- val_df %>%
+    mutate(
+      truth_fct = factor(.data[[outcome_i]], levels = lvl),
+      pred_fct  = factor(as.character(.pred_class), levels = lvl)
+    )
+
+  metrics_i <- metric_set(accuracy, kap)(
+    val_df, truth = truth_fct, estimate = pred_fct
+  )
+  print(metrics_i)
+
+  f1_i <- f_meas(val_df, truth = truth_fct, estimate = pred_fct,
+                 estimator = "macro")
+  print(f1_i)
+
+  # Per-class breakdown
+  cat("\nPer-class accuracy:\n")
+  val_df %>%
+    mutate(across(c(truth_fct, pred_fct), as.character)) %>%
+    group_by(truth_fct) %>%
+    summarise(
+      n         = n(),
+      n_correct = sum(truth_fct == pred_fct),
+      acc       = round(n_correct / n, 2),
+      .groups   = "drop"
+    ) %>%
+    arrange(desc(acc)) %>%
+    as.data.frame() %>%
+    print()
+
+  # Confusion pairs (misclassifications only)
+  cat("\nMisclassification pairs:\n")
+  val_df %>%
+    mutate(across(c(truth_fct, pred_fct), as.character)) %>%
+    filter(truth_fct != pred_fct) %>%
+    count(truth_fct, pred_fct, sort = TRUE) %>%
+    as.data.frame() %>%
+    print()
+
+  perry_series_validations[[nm]] <- list(
+    data     = val_df,
+    metrics  = metrics_i,
+    f_meas   = f1_i
+  )
+}
+
+# ---- Combined prediction table (all three models, wide format) ----
+perry_series_preds_combined <- purrr::map_dfr(
+  perry_series_preds,
+  ~ .x %>% select(peiid, model_name, .pred_class, top1, margin)
+) %>%
+  pivot_wider(
+    names_from  = model_name,
+    values_from = c(.pred_class, top1, margin),
+    names_sep   = "__"
+  ) %>%
+  left_join(
+    perry_series_truth %>% select(peiid, series_truth = truth),
+    by = "peiid"
+  )
+
+cat("\nCombined Perry series predictions (first 20 rows):\n")
+perry_series_preds_combined %>%
+  as.data.frame() %>%
+  head(20) %>%
+  print()
+
+# Optionally save
+# readr::write_csv(perry_series_preds_combined,
+#                  "../outputs/perry_series_predictions.csv")
+```
+
+```{r save}
 # ============================================================
 # SAVE OUTPUTS
 # ============================================================
@@ -1004,6 +1165,175 @@ for (nm in names(best_model_bundles)) {
 
 
 
+```{r final metrics}
+#bring it arounnnnd town
+# ============================================================
+# FINAL SUMMARY TABLE: ALL TAXONOMY LEVELS
+# NCSS INTERNAL + PERRY EXTERNAL VALIDATION
+# ============================================================
+
+# ---- NCSS internal metrics (from saved bundles) ----
+ncss_bundle_files <- c(
+  "../outputs/models/taxorder_rf_umap_hdb_bundle.rds",
+  "../outputs/models/taxsuborder_rf_plain_bundle.rds",
+  "../outputs/models/taxgrtgroup_xgb_umap_hdb_bundle.rds",
+  "../outputs/models/taxsubgrp_mod1_xgb_plain_bundle.rds",
+  "../outputs/models/taxpartsize_rf_plain_bundle.rds",
+  "../outputs/models/taxseries_rf_plain_bundle.rds",
+  "../outputs/models/taxseries_xgb_plain_bundle.rds",
+  "../outputs/models/taxseries_xgb_umap_hdb_bundle.rds"
+)
+
+ncss_summary <- purrr::map_dfr(ncss_bundle_files, function(path) {
+  if (!file.exists(path)) {
+    cat("Missing:", path, "\n")
+    return(NULL)
+  }
+  x <- readRDS(path)
+
+  met <- x$metrics %>%
+    select(.metric, .estimate) %>%
+    tidyr::pivot_wider(names_from = .metric, values_from = .estimate)
+
+  f1 <- if (!is.null(x$f_meas)) {
+    x$f_meas %>% select(f_meas_macro = .estimate)
+  } else {
+    tibble(f_meas_macro = NA_real_)
+  }
+
+  n_classes <- if (!is.null(x$conf_mat)) {
+    nrow(x$conf_mat$table)
+  } else NA_integer_
+
+  bind_cols(
+    tibble(
+      dataset    = "NCSS (internal)",
+      model      = x$name,
+      outcome    = x$outcome,
+      model_type = x$model_type,
+      n_classes  = n_classes
+    ),
+    met, f1
+  )
+})
+
+# ---- Perry external metrics (from validation objects) ----
+# Collect from all perry validation lists
+perry_all_validations <- c(
+  perry_validations,        # order/suborder/grtgroup/subgrp/partsize
+  perry_series_validations  # series models
+)
+
+perry_summary <- purrr::imap_dfr(perry_all_validations, function(x, nm) {
+  if (is.null(x) || is.null(x$metrics)) return(NULL)
+
+  met <- x$metrics %>%
+    select(.metric, .estimate) %>%
+    tidyr::pivot_wider(names_from = .metric, values_from = .estimate)
+
+  f1 <- if (!is.null(x$f_meas)) {
+    x$f_meas %>% select(f_meas_macro = .estimate)
+  } else {
+    tibble(f_meas_macro = NA_real_)
+  }
+
+  n_classes <- if (!is.null(x$data)) {
+    n_distinct(x$data$truth_fct, na.rm = TRUE)
+  } else NA_integer_
+
+  bind_cols(
+    tibble(
+      dataset    = "Perry (external)",
+      model      = nm,
+      outcome    = if (!is.null(x$data)) names(x$data)[3] else NA_character_,
+      model_type = NA_character_,
+      n_classes  = n_classes
+    ),
+    met, f1
+  )
+})
+
+# ---- Combine and clean ----
+# Taxonomy level order for sorting
+tax_level_order <- c(
+  "taxorder", "taxsuborder", "taxgrtgroup",
+  "taxsubgrp_mod1", "taxpartsize", "taxonname_clean"
+)
+
+all_summary <- bind_rows(ncss_summary, perry_summary) %>%
+  mutate(
+    # Extract taxonomy level from outcome for sorting
+    tax_level = case_when(
+      str_detect(outcome, "taxorder")       ~ "1_taxorder",
+      str_detect(outcome, "taxsuborder")    ~ "2_taxsuborder",
+      str_detect(outcome, "taxgrtgroup")    ~ "3_taxgrtgroup",
+      str_detect(outcome, "taxsubgrp")      ~ "4_taxsubgrp_mod1",
+      str_detect(outcome, "taxpartsize")    ~ "5_taxpartsize",
+      str_detect(outcome, "taxonname")      ~ "6_series",
+      TRUE                                  ~ "7_other"
+    ),
+    # Clean model name for display
+    model_short = model %>%
+      str_remove("^tax(order|suborder|grtgroup|subgrp_mod1|partsize|series)_") %>%
+      str_replace("rf_plain",      "RF") %>%
+      str_replace("rf_umap_hdb",   "RF + UMAP/HDBSCAN") %>%
+      str_replace("xgb_plain",     "XGB") %>%
+      str_replace("xgb_umap_hdb",  "XGB + UMAP/HDBSCAN"),
+    # Round for display
+    across(c(accuracy, kap, bal_accuracy, f_meas_macro), ~ round(.x, 3))
+  ) %>%
+  arrange(tax_level, dataset, model_short) %>%
+  select(
+    dataset, tax_level, outcome, model_short, model_type,
+    n_classes, accuracy, kap, bal_accuracy, f_meas_macro
+  )
+
+cat("\n============================================================\n")
+cat("FULL TAXONOMY MODEL SUMMARY\n")
+cat("============================================================\n")
+all_summary %>%
+  as.data.frame() %>%
+  print()
+
+# ---- Clean thesis-ready version ----
+thesis_table <- all_summary %>%
+  mutate(
+    tax_level = str_remove(tax_level, "^\\d_"),
+    Level = case_when(
+      tax_level == "taxorder"      ~ "Order",
+      tax_level == "taxsuborder"   ~ "Suborder",
+      tax_level == "taxgrtgroup"   ~ "Great Group",
+      tax_level == "taxsubgrp_mod1"~ "Subgroup Modifier",
+      tax_level == "taxpartsize"   ~ "Particle Size Class",
+      tax_level == "series"        ~ "Series",
+      TRUE                         ~ tax_level
+    )
+  ) %>%
+  select(
+    Dataset    = dataset,
+    Level,
+    Model      = model_short,
+    `N Classes` = n_classes,
+    Accuracy   = accuracy,
+    Kappa      = kap,
+    `Bal. Accuracy` = bal_accuracy,
+    `Macro F1` = f_meas_macro
+  )
+
+cat("\n============================================================\n")
+cat("THESIS-READY SUMMARY TABLE\n")
+cat("============================================================\n")
+thesis_table %>%
+  as.data.frame() %>%
+  print()
+
+# ---- Save as CSV for easy export to Word/Excel ----
+write.csv(thesis_table,
+          "../outputs/thesis_taxonomy_model_summary.csv",
+          row.names = FALSE)
+
+cat("\nSaved to ../outputs/thesis_taxonomy_model_summary.csv\n")
+```
 
 
 
