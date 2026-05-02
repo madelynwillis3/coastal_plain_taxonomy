@@ -611,6 +611,12 @@ perry_pack_150 <- perry_pack_150 %>%
 
 perry_fp_clean <- perry_fp_clean %>%
   mutate(peiid = as.character(Point))
+
+#save as todays date perry pack:
+write_csv(perry_pack_150, file.path("../outputs/", paste0("perry_pack_150_", Sys.Date(), ".csv")))
+
+#save perry_fp_clean
+write_csv(perry_fp_clean, file.path("../outputs/", paste0("perry_fp_clean_", Sys.Date(), ".csv")))
 ```
 
 ```{r pull for saves}

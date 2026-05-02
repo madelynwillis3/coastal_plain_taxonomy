@@ -909,43 +909,22 @@ cat("Series in NCSS model:", paste(series_levels, collapse = ", "), "\n")
 ```
 
 ```{r build-bridge-df}
-# ============================================================
-# BUILD BRIDGE DATASET
-# Combine NCSS predictions + spatial covariates at pedon locations
-# This is what we train the spatial bridge model on
-# ============================================================
+# Collapse perry_series_truth to one row per Point
+perry_series_truth_dedup <- perry_series_truth %>%
+  distinct(Point, .keep_all = TRUE)
 
-# Perry pack has peiid; we need to link to Point (field ID)
-# Use the perry_fp_clean Point -> peiid mapping
-point_to_peiid <- perry_fp_clean %>%
-  select(Point, peiid = Point) %>%   # peiid in perry context = Point
-  distinct() #%>%
-  # mutate(Point = as.character(Point),
-  #        peiid = as.character(peiid))
-
-# Actually perry_pack_150$peiid IS the Point number in Perry context
-# Confirm:
-cat("perry_pack_150 peiid examples:", 
-    paste(head(perry_pack_150$peiid, 5), collapse = ", "), "\n")
-cat("cov_at_pedons Point examples:", 
-    paste(head(cov_at_pedons$Point, 5), collapse = ", "), "\n")
-
-# Join: ncss_probs (peiid) + covariates (Point) + series truth (Point)
-# peiid in perry_pack_150 = Point in soil_pts
-bridge_df <- ncss_probs %>%
+# Collapse ncss_probs to one row per Point
+ncss_probs_dedup <- ncss_probs %>%
   mutate(Point = as.character(peiid)) %>%
-  left_join(cov_at_pedons %>% mutate(Point = as.character(Point)),
-            by = "Point") %>%
-  left_join(perry_series_truth %>% mutate(Point = as.character(Point)),
-            by = "Point") %>%
-  mutate(
-    series_truth = factor(series),
-    ncss_pred    = as.character(.pred_class)
-  )
+  distinct(Point, .keep_all = TRUE)
 
-cat("Bridge dataset rows:", nrow(bridge_df), "\n")
-cat("Rows with covariate data:", sum(!is.na(bridge_df$elevation)), "\n")
-cat("Rows with series truth:", sum(!is.na(bridge_df$series_truth)), "\n")
+# Collapse cov_at_pedons to one row per Point
+# (average covariates if somehow duplicated)
+cov_dedup <- cov_at_pedons %>%
+  mutate(Point = as.character(Point)) %>%
+  group_by(Point) %>%
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)),
+            .groups = "drop")
 
 # XY coordinates for kriging
 pts_xy <- soil_pts %>%
@@ -958,11 +937,23 @@ pts_xy <- soil_pts %>%
   mutate(Point = as.character(Point)) %>%
   select(Point, coord_X, coord_Y)
 
-bridge_df <- bridge_df %>%
+# Join everything -- should give one row per pedon location
+bridge_df <- ncss_probs_dedup %>%
+  left_join(cov_dedup, by = "Point") %>%
+  left_join(perry_series_truth_dedup, by = "Point") %>%
+  mutate(
+    series_truth = factor(series),
+    ncss_pred    = as.character(.pred_class)
+  ) %>%
   left_join(pts_xy, by = "Point")
 
-cat("Rows with XY coordinates:", sum(!is.na(bridge_df$coord_X)), "\n")
+cat("Bridge df rows (should be ~59):", nrow(bridge_df), "\n")
+cat("Unique Points:", n_distinct(bridge_df$Point), "\n")
+cat("Rows with covariates:", sum(!is.na(bridge_df$elevation)), "\n")
+cat("Rows with series truth:", sum(!is.na(bridge_df$series_truth)), "\n")
+cat("Rows with XY:", sum(!is.na(bridge_df$coord_X)), "\n")
 ```
+
 
 ```{r train-test-split}
 # ============================================================
@@ -1518,3 +1509,7 @@ for (s in names(variogram_fits)) {
       "map units\n")
 }
 ```
+```{r}
+
+```
+
