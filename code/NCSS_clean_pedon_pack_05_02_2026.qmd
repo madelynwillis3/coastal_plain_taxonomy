@@ -1,0 +1,427 @@
+---
+title: "NCSS_clean_pedon_pack"
+format: html
+---
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(tibble)
+library(aqp)
+
+# Source the SHARED pedon-pack module (used by both NCSS and Perry).
+source("../code/pedon_pack_functions_05_02_2026.R")
+```
+
+```{r load-raw}
+# -----------------------------------------------------------------------------
+# Load raw NCSS tables
+# -----------------------------------------------------------------------------
+ncss_pedon         <- read.csv("../data/ncss_pedon_SCP.csv")
+ncss_phorizon      <- read.csv("../data/ncss_phorizon.csv")
+ncss_color         <- read.csv("../data/ncss_phcolor.csv")
+ncss_mottles       <- read.csv("../data/ncss_phmottles.csv")
+ncss_ped_taxa      <- read.csv("../data/petaxhistory.csv")
+ncss_pedonlabdata  <- read.csv("../data/ncss_pedonlabdata.csv")
+ncss_layerlabdata  <- read.csv("../data/ncss_layerlabdata.csv")
+ncss_phsample      <- read.csv("../data/ncss_phsample.csv")
+```
+
+```{r merge-taxonomy}
+# -----------------------------------------------------------------------------
+# Build pedon-level taxonomy table (one row per peiid)
+# -----------------------------------------------------------------------------
+
+ncss_pedon <- ncss_pedon %>%
+  select(siteobsiidref, upedonid, taxonname, taxclname, taxonkind,
+         pedontype, pedbiidref, grpiidref, peiid, POINT_X, POINT_Y)
+
+ncss_ped_taxa <- ncss_ped_taxa %>%
+  select(peiidref, taxonname, taxonkind, seriesstatus, taxclname, taxorder,
+         taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize, taxpartsizemod,
+         taxceactcl, taxreaction, taxtempcl, taxmoistscl, taxtempregime,
+         petaxhistoryiid)
+
+# Pick best (most complete, most recent) taxonomy row per pedon
+taxa_best <- ncss_ped_taxa %>%
+  mutate(
+    across(where(is.character), ~ na_if(str_trim(.x), "")),
+    filled = rowSums(!is.na(across(c(
+      taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize, taxclname, taxonname
+    ))))
+  ) %>%
+  group_by(peiidref) %>%
+  arrange(desc(filled), desc(petaxhistoryiid)) %>%
+  dplyr::slice(1) %>%
+  ungroup()
+
+pedon_taxa <- ncss_pedon %>%
+  left_join(
+    taxa_best %>%
+      select(peiidref, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize),
+    by = c("peiid" = "peiidref")
+  )
+```
+
+```{r normalize-fill-taxonomy}
+# -----------------------------------------------------------------------------
+# Normalize blanks, build series key, and fill taxonomy from series-level lookup
+# -----------------------------------------------------------------------------
+
+pedon_taxa2 <- pedon_taxa %>%
+  mutate(
+    taxonname = na_if(str_squish(taxonname), ""),
+    taxclname = na_if(str_squish(taxclname), ""),
+    taxclname = ifelse(taxclname == "Not Classified", NA_character_, taxclname),
+    across(c(taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize),
+           ~ na_if(str_squish(.x), "")),
+    taxonname_key   = toupper(taxonname),
+    taxonname_clean = str_to_title(taxonname_key)
+  )
+
+# Series-level lookup INSIDE the coastal plain table
+series_tax_lookup <- pedon_taxa2 %>%
+  group_by(taxonname_key) %>%
+  summarise(
+    taxorder    = first(na.omit(taxorder)),
+    taxsuborder = first(na.omit(taxsuborder)),
+    taxgrtgroup = first(na.omit(taxgrtgroup)),
+    taxsubgrp   = first(na.omit(taxsubgrp)),
+    taxpartsize = first(na.omit(taxpartsize)),
+    taxclname   = first(na.omit(taxclname)),
+    .groups = "drop"
+  )
+
+pedon_taxa_filled <- pedon_taxa2 %>%
+  left_join(series_tax_lookup, by = "taxonname_key", suffix = c("", "_series")) %>%
+  mutate(
+    taxorder    = coalesce(taxorder,    taxorder_series),
+    taxsuborder = coalesce(taxsuborder, taxsuborder_series),
+    taxgrtgroup = coalesce(taxgrtgroup, taxgrtgroup_series),
+    taxsubgrp   = coalesce(taxsubgrp,   taxsubgrp_series),
+    taxpartsize = coalesce(taxpartsize, taxpartsize_series),
+    taxclname   = coalesce(taxclname,   taxclname_series)
+  ) %>%
+  select(-ends_with("_series"))
+
+# GLOBAL (whole-history) series lookup, then fill again
+taxa_series_lookup <- ncss_ped_taxa %>%
+  mutate(
+    taxonname     = na_if(str_squish(taxonname), ""),
+    taxonname_key = toupper(taxonname),
+    across(c(taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize),
+           ~ na_if(str_squish(.x), ""))
+  ) %>%
+  filter(!is.na(taxonname_key)) %>%
+  group_by(taxonname_key) %>%
+  summarise(
+    taxclname   = first(na.omit(taxclname)),
+    taxorder    = first(na.omit(taxorder)),
+    taxsuborder = first(na.omit(taxsuborder)),
+    taxgrtgroup = first(na.omit(taxgrtgroup)),
+    taxsubgrp   = first(na.omit(taxsubgrp)),
+    taxpartsize = first(na.omit(taxpartsize)),
+    .groups = "drop"
+  )
+
+pedon_taxa_globalfilled <- pedon_taxa_filled %>%
+  left_join(taxa_series_lookup, by = "taxonname_key", suffix = c("", "_global")) %>%
+  mutate(
+    taxclname   = coalesce(taxclname,   taxclname_global),
+    taxorder    = coalesce(taxorder,    taxorder_global),
+    taxsuborder = coalesce(taxsuborder, taxsuborder_global),
+    taxgrtgroup = coalesce(taxgrtgroup, taxgrtgroup_global),
+    taxsubgrp   = coalesce(taxsubgrp,   taxsubgrp_global),
+    taxpartsize = coalesce(taxpartsize, taxpartsize_global)
+  ) %>%
+  select(-ends_with("_global")) %>%
+  mutate(
+    taxclname = ifelse(
+      !is.na(taxclname),
+      str_replace(str_squish(taxclname), "\\.+$", ""),
+      taxclname
+    )
+  )
+```
+
+```{r derive-missing-ranks}
+# -----------------------------------------------------------------------------
+# Derive missing taxonomic ranks from taxclname suffixes when needed
+# -----------------------------------------------------------------------------
+
+gg_to_suborder <- function(gg) {
+  gg0 <- str_replace_all(tolower(str_squish(gg)), "[^a-z]", "")
+  case_when(
+    str_detect(gg0, "udults$")   ~ "Udults",
+    str_detect(gg0, "ustults$")  ~ "Ustults",
+    str_detect(gg0, "xerults$")  ~ "Xerults",
+    str_detect(gg0, "torults$")  ~ "Torults",
+    str_detect(gg0, "aquults$")  ~ "Aquults",
+    str_detect(gg0, "humults$")  ~ "Humults",
+    str_detect(gg0, "paleudults$") ~ "Udults",
+    str_detect(gg0, "paleults$") ~ "Udults",
+    str_detect(gg0, "udalfs$")   ~ "Udalfs",
+    str_detect(gg0, "ustalfs$")  ~ "Ustalfs",
+    str_detect(gg0, "xeralfs$")  ~ "Xeralfs",
+    str_detect(gg0, "aqualfs$")  ~ "Aqualfs",
+    str_detect(gg0, "udepts$")   ~ "Udepts",
+    str_detect(gg0, "ustepts$")  ~ "Ustepts",
+    str_detect(gg0, "xerepts$")  ~ "Xerepts",
+    str_detect(gg0, "aquepts$")  ~ "Aquepts",
+    TRUE ~ NA_character_
+  )
+}
+
+suborder_to_order <- function(so) {
+  so0 <- str_replace_all(tolower(str_squish(so)), "[^a-z]", "")
+  case_when(
+    str_detect(so0, "ults$") ~ "Ultisols",
+    str_detect(so0, "alfs$") ~ "Alfisols",
+    str_detect(so0, "epts$") ~ "Inceptisols",
+    str_detect(so0, "ents$") ~ "Entisols",
+    str_detect(so0, "olls$") ~ "Mollisols",
+    str_detect(so0, "ods$")  ~ "Spodosols",
+    str_detect(so0, "ists$") ~ "Histosols",
+    TRUE ~ NA_character_
+  )
+}
+
+pedon_taxa_fixed <- pedon_taxa_globalfilled %>%
+  transmute(
+    siteobsiidref, upedonid, peiid,
+    taxonname, taxonname_key, taxonname_clean,
+    taxclname, taxorder, taxsuborder, taxgrtgroup, taxsubgrp, taxpartsize,
+    POINT_X, POINT_Y
+  ) %>%
+  mutate(
+    taxclname = na_if(str_squish(taxclname), ""),
+    taxclname = ifelse(!is.na(taxclname), str_replace(taxclname, "\\.+$", ""), taxclname),
+
+    subgrp_from_taxcl = ifelse(
+      (is.na(taxsubgrp) | is.na(taxgrtgroup) | is.na(taxsuborder) | is.na(taxorder)) & !is.na(taxclname),
+      str_trim(str_extract(taxclname, "^[^,]+")),
+      NA_character_
+    ),
+    gg_from_taxcl       = ifelse(!is.na(subgrp_from_taxcl), word(subgrp_from_taxcl, -1), NA_character_),
+    suborder_from_taxcl = ifelse(is.na(taxsuborder) & !is.na(gg_from_taxcl),
+                                 gg_to_suborder(gg_from_taxcl), NA_character_),
+    order_from_taxcl    = ifelse(is.na(taxorder)    & !is.na(suborder_from_taxcl),
+                                 suborder_to_order(suborder_from_taxcl), NA_character_)
+  ) %>%
+  mutate(
+    taxsubgrp   = coalesce(taxsubgrp,   subgrp_from_taxcl),
+    taxgrtgroup = coalesce(taxgrtgroup, gg_from_taxcl),
+    taxsuborder = coalesce(taxsuborder, suborder_from_taxcl),
+    taxorder    = coalesce(taxorder,    order_from_taxcl)
+  ) %>%
+  select(-subgrp_from_taxcl, -gg_from_taxcl, -suborder_from_taxcl, -order_from_taxcl) %>%
+  filter(!str_detect(taxonname, "SND"), !str_detect(taxonname, "Snd"))
+```
+
+```{r parse-subgroup}
+# -----------------------------------------------------------------------------
+# Parse taxsubgrp into modifier slots: taxsubgrp_mod1/2/3
+# -----------------------------------------------------------------------------
+
+parse_subgrp_mods <- function(subgrp, gg_hint = NA_character_) {
+  x0 <- subgrp %>% as.character() %>% str_squish() %>% na_if("")
+  if (is.na(x0)) {
+    return(tibble(
+      subgrp_gg = gg_hint %||% NA_character_,
+      taxsubgrp_mod1 = NA_character_,
+      taxsubgrp_mod2 = NA_character_,
+      taxsubgrp_mod3 = NA_character_
+    ))
+  }
+  toks <- str_split(x0, "\\s+", simplify = FALSE)[[1]]
+  toks <- toks[toks != ""]
+  if (length(toks) == 0) {
+    return(tibble(
+      subgrp_gg = gg_hint %||% NA_character_,
+      taxsubgrp_mod1 = NA_character_,
+      taxsubgrp_mod2 = NA_character_,
+      taxsubgrp_mod3 = NA_character_
+    ))
+  }
+
+  gg   <- if (!is.na(gg_hint) && str_squish(gg_hint) != "") gg_hint else toks[length(toks)]
+  mods <- if (length(toks) >= 2) toks[1:(length(toks) - 1)] else character(0)
+
+  tibble(
+    subgrp_gg      = gg,
+    taxsubgrp_mod1 = mods[1] %||% NA_character_,
+    taxsubgrp_mod2 = mods[2] %||% NA_character_,
+    taxsubgrp_mod3 = mods[3] %||% NA_character_
+  )
+}
+
+pedon_taxa_parsed <- pedon_taxa_fixed %>%
+  mutate(parsed = map2(taxsubgrp, taxgrtgroup, parse_subgrp_mods)) %>%
+  unnest_wider(parsed) %>%
+  mutate(taxgrtgroup = coalesce(taxgrtgroup, subgrp_gg)) %>%
+  select(-subgrp_gg)
+```
+
+```{r build-horizon-table}
+# -----------------------------------------------------------------------------
+# Build NCSS horizon-level table: lab data + horizon depths + color
+# This is the table that, after a few derivations, will conform to
+# PEDON_PACK_HZ_SCHEMA.
+# -----------------------------------------------------------------------------
+
+# 1) Lab rows joined to phiid (via phsample)
+layerlab_with_peiid <- ncss_layerlabdata %>%
+  left_join(ncss_phsample %>% select(labsampnum, phiidref), by = "labsampnum") %>%
+  select(phiidref, labsampnum, layerseqnum, hzdept, hzdepb, hzname, texcl,
+         ncsslayerlabdataiid, sandtotmeasured, silttotmeasured,
+         claytotmeasured, cec7)
+
+# 2) Add pedon id (peiid) via phorizon
+layerlab_with_pedid <- layerlab_with_peiid %>%
+  left_join(ncss_phorizon %>% select(phiid, peiidref), by = c("phiidref" = "phiid")) %>%
+  rename(peiid = peiidref)
+
+# 3) Pick best matrix color per horizon (moist/interior preferred)
+color_best <- ncss_color %>%
+  mutate(
+    moist_rank = case_when(
+      str_to_lower(colormoistst) == "moist" ~ 1L,
+      str_to_lower(colormoistst) == "dry"   ~ 2L,
+      TRUE ~ 3L
+    ),
+    phys_rank = case_when(
+      str_to_lower(colorphysst) == "interior" ~ 1L,
+      str_to_lower(colorphysst) == "exterior" ~ 2L,
+      TRUE ~ 3L
+    )
+  ) %>%
+  arrange(phiidref, moist_rank, phys_rank) %>%
+  group_by(phiidref) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  select(phiidref, colorhue, colorvalue, colorchroma)
+
+ncss_hz_raw <- layerlab_with_pedid %>%
+  left_join(color_best, by = "phiidref")
+```
+
+```{r parse-hzname}
+# -----------------------------------------------------------------------------
+# Parse horizon designations into master / suffix / hz_base / hzname_clean.
+# Uses the SHARED parser (parse_hznames) defined in pedon_pack_functions.R
+# so NCSS and Perry produce identical hz_base label sets.
+# -----------------------------------------------------------------------------
+
+ncss_hz_parsed <- ncss_hz_raw %>%
+  bind_cols(
+    parse_hznames(.$hzname) %>% select(hzname_clean, L_master, L_suffix, hz_base)
+  )
+```
+
+```{r color-rgb}
+# -----------------------------------------------------------------------------
+# Convert Munsell color -> R, G, B in [0, 1]
+# -----------------------------------------------------------------------------
+
+ncss_hz_color <- ncss_hz_parsed %>%
+  mutate(
+    munsell = if_else(
+      !is.na(colorhue) & !is.na(colorvalue) & !is.na(colorchroma),
+      paste0(str_squish(colorhue), " ", colorvalue, "/", colorchroma),
+      NA_character_
+    ),
+    munsell_hex = aqp::parseMunsell(munsell)
+  )
+
+idx <- which(!is.na(ncss_hz_color$munsell_hex) & ncss_hz_color$munsell_hex != "")
+rgb_mat <- matrix(NA_real_, nrow(ncss_hz_color), 3,
+                  dimnames = list(NULL, c("R","G","B")))
+rgb_mat[idx, ] <- t(grDevices::col2rgb(ncss_hz_color$munsell_hex[idx])) / 255
+
+ncss_hz_color <- ncss_hz_color %>%
+  mutate(R = rgb_mat[, "R"], G = rgb_mat[, "G"], B = rgb_mat[, "B"])
+```
+
+```{r assemble-schema}
+# -----------------------------------------------------------------------------
+# Assemble the two tables that build_pedon_pack() needs:
+#
+#   (a) ncss_hz_table  -- horizon-level, conforms to PEDON_PACK_HZ_SCHEMA
+#   (b) ncss_ped_table -- pedon-level taxonomy, conforms to PEDON_PACK_PED_SCHEMA
+# -----------------------------------------------------------------------------
+
+ncss_hz_table <- ncss_hz_color %>%
+  transmute(
+    peiid           = as.character(peiid),
+    hzdept          = as.numeric(hzdept),
+    hzdepb          = as.numeric(hzdepb),
+    hzname          = as.character(hzname),
+    hzname_clean    = as.character(hzname_clean),
+    hz_base         = as.character(hz_base),
+    L_master        = as.character(L_master),
+    L_suffix        = as.character(L_suffix),
+    texcl           = as.character(texcl),
+    sandtotmeasured = as.numeric(sandtotmeasured),
+    silttotmeasured = as.numeric(silttotmeasured),
+    claytotmeasured = as.numeric(claytotmeasured),
+    cec7            = as.numeric(cec7),
+    R               = as.numeric(R),
+    G               = as.numeric(G),
+    B               = as.numeric(B)
+  )
+
+ncss_ped_table <- pedon_taxa_parsed %>%
+  transmute(
+    peiid           = as.character(peiid),
+    taxonname_clean = as.character(taxonname_clean),
+    taxorder        = as.character(taxorder),
+    taxsuborder     = as.character(taxsuborder),
+    taxgrtgroup     = as.character(taxgrtgroup),
+    taxsubgrp_mod1  = as.character(taxsubgrp_mod1),
+    taxsubgrp_mod2  = as.character(taxsubgrp_mod2),
+    taxsubgrp_mod3  = as.character(taxsubgrp_mod3),
+    taxpartsize     = as.character(taxpartsize),
+    POINT_X         = as.numeric(POINT_X),
+    POINT_Y         = as.numeric(POINT_Y)
+  )
+
+# Restrict horizon table to pedons present in the taxonomy table (and vice versa)
+ncss_hz_table  <- ncss_hz_table  %>% filter(peiid %in% ncss_ped_table$peiid)
+ncss_ped_table <- ncss_ped_table %>% filter(peiid %in% ncss_hz_table$peiid |
+                                            peiid %in% ncss_hz_table$peiid)
+
+# Validate against the contract before passing in
+validate_hz_schema(ncss_hz_table,   source_name = "NCSS horizon table")
+validate_ped_schema(ncss_ped_table, source_name = "NCSS pedon table")
+```
+
+```{r build-pedon-pack}
+# -----------------------------------------------------------------------------
+# Build the NCSS pedon_pack_150 using the SHARED builder.
+# Perry will call build_pedon_pack() with its own hz_table / ped_table.
+# -----------------------------------------------------------------------------
+
+pedon_pack_150 <- build_pedon_pack(
+  hz_table     = ncss_hz_table,
+  ped_table    = ncss_ped_table,
+  max_depth_cm = 150,
+  source_name  = "NCSS"
+)
+
+glimpse(pedon_pack_150)
+
+# Save outputs
+write.csv(ncss_hz_table,
+          paste0("../outputs/ncss_hz_table_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+
+write.csv(ncss_ped_table,
+          paste0("../outputs/ncss_ped_table_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+
+write.csv(pedon_pack_150,
+          paste0("../outputs/pedon_pack_150_", Sys.Date(), ".csv"),
+          row.names = FALSE)
+```

@@ -1,0 +1,541 @@
+---
+title: "NCSS_model_05_02_2026"
+format: html
+---
+
+
+```{r setup}
+library(beepr)
+source("../code/modeling_functions_05_02_2026.R")
+source("../code/pedon_pack_functions_05_02_2026.R")  # for `%||%` and helpers
+
+dir.create("../outputs/models_05_02",  showWarnings = FALSE, recursive = TRUE)
+dir.create("../outputs/reports_05_02", showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r config}
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Set to TRUE to skip nested CV and only fit final production bundles.
+# Useful for fast iteration; set to FALSE for thesis-grade reporting.
+FAST_MODE <- FALSE
+
+# Outer/inner fold counts for nested CV
+OUTER_V <- 5
+INNER_V <- 5
+GRID_SIZE <- 12   # hyperparameters per inner-fold tune (latin hypercube for XGB)
+
+# Min-class-size thresholds (raised for nested-CV stability;
+# series uses two thresholds — see prep-outcomes chunk).
+MIN_N_MAP <- c(
+  taxorder        = 15,
+  taxsuborder     = 15,
+  taxgrtgroup     = 15,
+  taxsubgrp_mod1  = 12,   # was 20 — rescues Rhodic, Aeric
+  taxpartsize     = 20,
+  taxonname_clean = 15    # nested-CV; deployment uses min_n=5
+)
+# Variants to fit per outcome
+MODEL_VARIANTS <- tribble(
+  ~engine, ~space,
+  "rf",    "plain",
+  "xgb",   "plain",
+  "rf",    "umap_hdb",
+  "xgb",   "umap_hdb"
+)
+
+# Outcomes to model (ordered: easy -> hard)
+OUTCOMES <- c("taxorder", "taxsuborder", "taxgrtgroup",
+              "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+```
+
+```{r load-data}
+# ============================================================
+# LOAD DATA
+# ============================================================
+ncss_pack_files <- list.files("../outputs",
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_files[which.max(file.mtime(ncss_pack_files))]
+cat("Loading:", ncss_pack_path, "\n")
+
+pedon_pack_150 <- read.csv(ncss_pack_path) %>%
+  mutate(peiid = as.character(peiid))
+
+cat("Pedons loaded:", nrow(pedon_pack_150), "\n")
+cat("Columns:",       ncol(pedon_pack_150), "\n")
+```
+
+```{r class-coverage-report}
+# ============================================================
+# CLASS-COVERAGE REPORT
+# Runs BEFORE any modeling. Documents what survives each
+# threshold and what gets dropped.
+# ============================================================
+
+class_coverage_report <- function(df, outcome, min_n) {
+  total_pedons  <- sum(!is.na(df[[outcome]]))
+  class_counts  <- df %>%
+    filter(!is.na(.data[[outcome]])) %>%
+    count(.data[[outcome]], name = "n_pedons", sort = TRUE)
+
+  kept    <- class_counts %>% filter(n_pedons >= min_n)
+  dropped <- class_counts %>% filter(n_pedons <  min_n)
+
+  list(
+    outcome      = outcome,
+    min_n        = min_n,
+    total_pedons = total_pedons,
+    total_classes = nrow(class_counts),
+    kept_classes  = nrow(kept),
+    kept_pedons   = sum(kept$n_pedons),
+    dropped_classes = nrow(dropped),
+    dropped_pedons  = sum(dropped$n_pedons),
+    coverage_pct  = round(100 * sum(kept$n_pedons) / total_pedons, 1),
+    kept_table    = kept,
+    dropped_table = dropped
+  )
+}
+
+coverage_reports <- map(
+  OUTCOMES,
+  ~ class_coverage_report(pedon_pack_150, .x, MIN_N_MAP[[.x]])
+) %>% set_names(OUTCOMES)
+
+# ---- Summary table (thesis-ready) ----
+coverage_summary <- map_dfr(coverage_reports, function(r) {
+  tibble(
+    outcome           = r$outcome,
+    threshold_min_n   = r$min_n,
+    total_classes     = r$total_classes,
+    kept_classes      = r$kept_classes,
+    dropped_classes   = r$dropped_classes,
+    total_pedons      = r$total_pedons,
+    kept_pedons       = r$kept_pedons,
+    dropped_pedons    = r$dropped_pedons,
+    coverage_pct      = r$coverage_pct
+  )
+})
+
+cat("\n========================================\n")
+cat("CLASS COVERAGE SUMMARY (NCSS)\n")
+cat("========================================\n")
+print(coverage_summary)
+
+# ---- Per-outcome detail: which classes were dropped? ----
+for (oc in OUTCOMES) {
+  r <- coverage_reports[[oc]]
+  cat("\n--- ", oc, " (min_n = ", r$min_n, ") ---\n", sep = "")
+  cat("KEPT (", r$kept_classes, " classes, ", r$kept_pedons, " pedons):\n", sep = "")
+  print(r$kept_table)
+  if (nrow(r$dropped_table) > 0) {
+    cat("\nDROPPED (", r$dropped_classes, " classes, ",
+        r$dropped_pedons, " pedons):\n", sep = "")
+    print(r$dropped_table)
+  } else {
+    cat("\nDROPPED: none\n")
+  }
+}
+
+# ---- Save ----
+write.csv(coverage_summary,
+          "../outputs/reports_05_02/class_coverage_summary_ncss.csv",
+          row.names = FALSE)
+
+# Per-outcome dropped classes (long format, for thesis appendix)
+dropped_long <- map_dfr(coverage_reports, function(r) {
+  if (nrow(r$dropped_table) == 0) return(NULL)
+  r$dropped_table %>%
+    mutate(outcome = r$outcome, threshold_min_n = r$min_n) %>%
+    rename(class = !!sym(r$outcome)) %>%
+    select(outcome, threshold_min_n, class, n_pedons)
+})
+
+write.csv(dropped_long,
+          "../outputs/reports_05_02/dropped_classes_ncss.csv",
+          row.names = FALSE)
+
+cat("\nCoverage reports saved to ../outputs/reports_05_02/\n")
+```
+
+```{r prep-outcomes}
+# ============================================================
+# PREP DATA PER OUTCOME
+# Filter, factorize, droplevels.
+# ============================================================
+prepped_data <- map(
+  OUTCOMES,
+  function(oc) {
+    df <- pedon_pack_150 %>%
+      select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))) %>%
+      prep_outcome(oc, min_n = MIN_N_MAP[[oc]])
+
+    list(
+      outcome = oc,
+      df      = df,
+      n       = nrow(df),
+      n_class = nlevels(df[[oc]])
+    )
+  }
+) %>% set_names(OUTCOMES)
+
+cat("\n--- Final modeling data per outcome ---\n")
+walk(prepped_data, ~ cat(.x$outcome, ": n =", .x$n,
+                          "| classes =", .x$n_class, "\n"))
+```
+
+```{r split}
+# ============================================================
+# 80/20 train/test split per outcome
+# Used for the FINAL production bundles. Nested CV uses its own
+# outer folds on the FULL prepped data.
+# ============================================================
+set.seed(2026)
+splits <- map(prepped_data, function(p) {
+  s <- initial_split(p$df, prop = 0.8, strata = !!sym(p$outcome))
+  list(train = training(s), test = testing(s))
+})
+
+cat("\n--- Split sizes ---\n")
+walk2(splits, names(splits), ~ cat(.y, ": train =", nrow(.x$train),
+                                     "| test =", nrow(.x$test), "\n"))
+```
+
+```{r nested-cv}
+# ============================================================
+# NESTED CV: outer 5 x inner 5 for each {outcome, engine, space}
+# This produces honest performance estimates with hyperparameter
+# tuning happening inside each outer fold.
+# ============================================================
+
+if (!FAST_MODE) {
+
+  cat("\n========================================\n")
+  cat("NESTED CV (5 outer x 5 inner)\n")
+  cat("This will take a while -- estimated hours.\n")
+  cat("========================================\n")
+
+  nested_cv_results <- list()
+
+  for (oc in OUTCOMES) {
+    p <- prepped_data[[oc]]
+    cat("\n>>> Outcome:", oc, "(", p$n, "pedons,", p$n_class, "classes)\n")
+
+    for (i in seq_len(nrow(MODEL_VARIANTS))) {
+      eng <- MODEL_VARIANTS$engine[i]
+      sp  <- MODEL_VARIANTS$space[i]
+      key <- paste(oc, eng, sp, sep = "_")
+
+      cat("  -- Variant:", eng, sp, "...\n")
+      t0 <- Sys.time()
+
+      fold_metrics <- tryCatch(
+        nested_cv_one_variant(
+          df = p$df %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+          outcome = oc, engine = eng, space = sp,
+          outer_v = OUTER_V, inner_v = INNER_V,
+          grid_size = GRID_SIZE, seed = 100 + i
+        ),
+        error = function(e) {
+          cat("     ERROR:", e$message, "\n")
+          tibble(fold = NA, accuracy = NA_real_, kap = NA_real_,
+                 bal_accuracy = NA_real_, f_meas_macro = NA_real_,
+                 n_test = NA_integer_, engine = eng, space = sp,
+                 outcome = oc)
+        }
+      )
+
+      dt <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+      cat("     done in", dt, "min\n")
+
+      nested_cv_results[[key]] <- fold_metrics
+    }
+  }
+
+  nested_cv_long <- bind_rows(nested_cv_results)
+
+  # ---- Summary: mean +/- SD across outer folds ----
+  nested_cv_summary <- nested_cv_long %>%
+    filter(!is.na(fold)) %>%
+    group_by(outcome, engine, space) %>%
+    summarise(
+      n_folds          = n(),
+      accuracy_mean    = mean(accuracy,     na.rm = TRUE),
+      accuracy_sd      = sd(accuracy,       na.rm = TRUE),
+      kap_mean         = mean(kap,          na.rm = TRUE),
+      kap_sd           = sd(kap,            na.rm = TRUE),
+      bal_acc_mean     = mean(bal_accuracy, na.rm = TRUE),
+      bal_acc_sd       = sd(bal_accuracy,   na.rm = TRUE),
+      f_meas_mean      = mean(f_meas_macro, na.rm = TRUE),
+      f_meas_sd        = sd(f_meas_macro,   na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    arrange(outcome, desc(kap_mean))
+
+  cat("\n========================================\n")
+  cat("NESTED-CV SUMMARY\n")
+  cat("========================================\n")
+  print(nested_cv_summary, n = Inf)
+
+  write.csv(nested_cv_long,
+            "../outputs/reports_05_02/nested_cv_long_ncss.csv",
+            row.names = FALSE)
+  write.csv(nested_cv_summary,
+            "../outputs/reports_05_02/nested_cv_summary_ncss.csv",
+            row.names = FALSE)
+
+  saveRDS(nested_cv_results,
+          "../outputs/reports_05_02/nested_cv_results_ncss.rds")
+
+  beep("wilhelm")
+} else {
+  cat("FAST_MODE = TRUE: skipping nested CV.\n")
+  nested_cv_summary <- tibble()
+}
+```
+
+```{r final-bundles}
+# ============================================================
+# FINAL PRODUCTION BUNDLES
+# One fit per {outcome, engine, space} on the 80% training split,
+# evaluated on the 20% test split. These are what get saved and
+# deployed to Perry.
+# ============================================================
+
+cat("\n========================================\n")
+cat("FINAL PRODUCTION BUNDLES (80/20 split)\n")
+cat("========================================\n")
+
+all_bundles <- list()
+all_test_metrics <- list()
+
+for (oc in OUTCOMES) {
+  s <- splits[[oc]]
+  cat("\n>>> Outcome:", oc, "\n")
+
+  for (i in seq_len(nrow(MODEL_VARIANTS))) {
+    eng <- MODEL_VARIANTS$engine[i]
+    sp  <- MODEL_VARIANTS$space[i]
+    bundle_name <- paste(oc, eng, sp, sep = "_")
+
+    cat("  -- Fitting:", bundle_name, "\n")
+    t0 <- Sys.time()
+
+    res <- tryCatch(
+      fit_one_model(
+        train_df = s$train %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+        test_df  = s$test  %>% select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))),
+        outcome = oc, engine = eng, space = sp,
+        inner_v = INNER_V, grid_size = GRID_SIZE, seed = 200 + i
+      ),
+      error = function(e) {
+        cat("     ERROR:", e$message, "\n")
+        NULL
+      }
+    )
+
+    if (is.null(res)) next
+
+    # ---- evaluate ----
+    eval_metrics <- evaluate_predictions(
+      res$pred, truth_col = oc,
+      k_for_topk = if (oc == "taxonname_clean") 5 else 3
+    ) %>%
+      mutate(outcome = oc, engine = eng, space = sp,
+             bundle_name = bundle_name)
+
+    all_test_metrics[[bundle_name]] <- eval_metrics
+
+    # ---- build bundle ----
+    if (sp == "plain") {
+      bundle <- build_plain_bundle(
+        name = bundle_name, outcome = oc,
+        train_raw = res$train_raw,
+        prep_rec  = res$prep_rec,
+        final_fit = res$final_fit
+      )
+    } else {
+      umap_path <- paste0("../outputs/models_05_02/", bundle_name, "_umap.uwot")
+      uwot::save_uwot(res$umap_fit, file = umap_path)
+
+      bundle <- build_umap_hdb_bundle(
+        name = bundle_name, outcome = oc,
+        train_raw = res$train_raw,
+        prep_rec  = res$prep_rec,
+        final_fit = res$final_fit,
+        umap_model_file = umap_path,
+        hdb_fit = res$hdb_fit, z_train = res$z_train,
+        umap_settings = list(n_components = 10, n_neighbors = 15,
+                             min_dist = 0.1, metric = "euclidean")
+      )
+    }
+
+    # attach metrics
+    bundle$test_metrics <- eval_metrics
+    bundle$conf_mat <- conf_mat(
+      res$pred %>% rename(.truth = all_of(oc)),
+      truth = .truth, estimate = .pred_class
+    )
+
+    saveRDS(bundle, paste0("../outputs/models_05_02/", bundle_name, "_bundle.rds"))
+    all_bundles[[bundle_name]] <- bundle
+
+    dt <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+    cat("     done in", dt, "min |",
+        "kap =", round(eval_metrics$kap, 3),
+        "| bal_acc =", round(eval_metrics$bal_accuracy, 3),
+        "| f1 =", round(eval_metrics$f_meas_macro, 3), "\n")
+  }
+}
+
+test_metrics_long <- bind_rows(all_test_metrics)
+
+write.csv(test_metrics_long,
+          "../outputs/reports_05_02/test_metrics_ncss.csv",
+          row.names = FALSE)
+
+cat("\nAll final bundles saved to ../outputs/models_05_02/\n")
+beep("wilhelm")
+```
+
+```{r series-final-bundle-low-threshold}
+# ============================================================
+# OPTIONAL: refit series with min_n=5 for higher coverage,
+# stored as a separate set of bundles.
+# Use these for actual deployment if you want broader series
+# coverage; nested-CV results above are at min_n=15.
+# ============================================================
+
+if ("taxonname_clean" %in% OUTCOMES) {
+
+  cat("\n>>> Refitting series at min_n=5 for deployment coverage\n")
+
+  df_series_lowthresh <- pedon_pack_150 %>%
+    select(-any_of(setdiff(TAXONOMY_DROP_COLS, "taxonname_clean"))) %>%
+    prep_outcome("taxonname_clean", min_n = 5) # nested CV used min_n=15, but we can fit more classes for deployment since we won't be doing nested CV there. This is a bit hacky but it lets us reuse the same code and compare results easily. (this is useful for the Greenville series n = 8, which is important to include in deployment but too small for nested CV).
+
+  cat("   n =", nrow(df_series_lowthresh),
+      "| classes =", nlevels(df_series_lowthresh$taxonname_clean), "\n")
+
+  set.seed(2027)
+  s5 <- initial_split(df_series_lowthresh, prop = 0.8, strata = taxonname_clean)
+  train_5 <- training(s5); test_5 <- testing(s5)
+
+  for (i in seq_len(nrow(MODEL_VARIANTS))) {
+    eng <- MODEL_VARIANTS$engine[i]
+    sp  <- MODEL_VARIANTS$space[i]
+    bn  <- paste("taxonname_clean_min5", eng, sp, sep = "_")
+
+    cat("  -- Fitting:", bn, "\n")
+    res <- tryCatch(
+      fit_one_model(
+        train_df = train_5, test_df = test_5,
+        outcome = "taxonname_clean", engine = eng, space = sp,
+        inner_v = 3,  # smaller because per-class N is small
+        grid_size = 10, seed = 300 + i
+      ),
+      error = function(e) { cat("     ERROR:", e$message, "\n"); NULL }
+    )
+    if (is.null(res)) next
+
+    eval_metrics <- evaluate_predictions(
+      res$pred, truth_col = "taxonname_clean", k_for_topk = 5
+    ) %>% mutate(bundle_name = bn)
+
+    if (sp == "plain") {
+      bundle <- build_plain_bundle(
+        name = bn, outcome = "taxonname_clean",
+        train_raw = res$train_raw,
+        prep_rec  = res$prep_rec,
+        final_fit = res$final_fit
+      )
+    } else {
+      umap_path <- paste0("../outputs/models_05_02/", bn, "_umap.uwot")
+      uwot::save_uwot(res$umap_fit, file = umap_path)
+      bundle <- build_umap_hdb_bundle(
+        name = bn, outcome = "taxonname_clean",
+        train_raw = res$train_raw, prep_rec = res$prep_rec,
+        final_fit = res$final_fit, umap_model_file = umap_path,
+        hdb_fit = res$hdb_fit, z_train = res$z_train,
+        umap_settings = list(n_components = 10, n_neighbors = 15,
+                             min_dist = 0.1, metric = "euclidean")
+      )
+    }
+    bundle$test_metrics <- eval_metrics
+    bundle$threshold_note <- "min_n=5 (deployment); nested CV used min_n=15"
+
+    saveRDS(bundle, paste0("../outputs/models_05_02/", bn, "_bundle.rds"))
+    cat("     kap =", round(eval_metrics$kap, 3),
+        "| top-5 =", round(eval_metrics$top_k, 3), "\n")
+  }
+}
+```
+
+```{r combined-summary}
+# ============================================================
+# COMBINED RESULTS TABLE: nested CV + test metrics + best per outcome
+# ============================================================
+
+if (!FAST_MODE && nrow(nested_cv_summary) > 0) {
+
+  combined <- nested_cv_summary %>%
+    left_join(
+      test_metrics_long %>%
+        select(outcome, engine, space,
+               test_accuracy = accuracy,
+               test_kap = kap,
+               test_bal_acc = bal_accuracy,
+               test_f1 = f_meas_macro,
+               test_topk = top_k),
+      by = c("outcome", "engine", "space")
+    )
+
+  cat("\n========================================\n")
+  cat("COMBINED RESULTS: NESTED CV + TEST SET\n")
+  cat("========================================\n")
+  print(combined, n = Inf)
+
+  write.csv(combined,
+            "../outputs/reports_05_02/combined_results_ncss.csv",
+            row.names = FALSE)
+
+  # ---- Best per outcome by each metric ----
+  cat("\n--- Best variant per outcome by KAP ---\n")
+  combined %>%
+    group_by(outcome) %>%
+    slice_max(kap_mean, n = 1, with_ties = FALSE) %>%
+    select(outcome, engine, space, kap_mean, kap_sd,
+           bal_acc_mean, f_meas_mean, test_kap) %>%
+    print()
+
+  cat("\n--- Best variant per outcome by BAL_ACCURACY ---\n")
+  combined %>%
+    group_by(outcome) %>%
+    slice_max(bal_acc_mean, n = 1, with_ties = FALSE) %>%
+    select(outcome, engine, space, bal_acc_mean, bal_acc_sd,
+           kap_mean, f_meas_mean, test_bal_acc) %>%
+    print()
+
+  cat("\n--- Best variant per outcome by MACRO F1 ---\n")
+  combined %>%
+    group_by(outcome) %>%
+    slice_max(f_meas_mean, n = 1, with_ties = FALSE) %>%
+    select(outcome, engine, space, f_meas_mean, f_meas_sd,
+           kap_mean, bal_acc_mean, test_f1) %>%
+    print()
+}
+
+cat("\n========================================\n")
+cat("DONE.\n")
+cat("- Class coverage: ../outputs/reports_05_02/class_coverage_summary_ncss.csv\n")
+cat("- Dropped classes: ../outputs/reports_05_02/dropped_classes_ncss.csv\n")
+cat("- Nested CV (long): ../outputs/reports_05_02/nested_cv_long_ncss.csv\n")
+cat("- Nested CV (summary): ../outputs/reports_05_02/nested_cv_summary_ncss.csv\n")
+cat("- Test metrics: ../outputs/reports_05_02/test_metrics_ncss.csv\n")
+cat("- Combined results: ../outputs/reports_05_02/combined_results_ncss.csv\n")
+cat("- Bundles: ../outputs/models_05_02/*_bundle.rds\n")
+cat("========================================\n")
+beep("complete")
+```
