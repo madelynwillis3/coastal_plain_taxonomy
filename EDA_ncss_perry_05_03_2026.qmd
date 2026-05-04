@@ -1,0 +1,362 @@
+---
+title: "EDA_ncss_perry_05_03_2026"
+format: html
+---
+
+
+
+```{r setup}
+library(tidyverse)
+library(patchwork)
+
+# In setup chunk:
+fig_dir <- here("outputs", "figures_05_02", "eda")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# In the class-distributions-data chunk:
+perry_fp_files <- list.files(here("outputs"),
+                              pattern = "^perry_fp_clean_.*\\.csv$",
+                              full.names = TRUE)
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.text = element_text(size = 10)
+  )
+
+# Consistent dataset colors throughout
+ds_colors <- c("NCSS" = "#2C7BB6", "Perry" = "#D7191C")
+```
+
+```{r load-data}
+library(here)
+
+# Load most recent NCSS pack
+ncss_files <- list.files(here("outputs"),
+                         pattern = "^pedon_pack_150_.*\\.csv$",
+                         full.names = TRUE)
+ncss_path <- ncss_files[which.max(file.mtime(ncss_files))]
+ncss <- read.csv(ncss_path) %>% mutate(dataset = "NCSS")
+cat("NCSS:", nrow(ncss), "pedons from", basename(ncss_path), "\n")
+
+# Load most recent Perry pack
+perry_files <- list.files(here("outputs"),
+                          pattern = "^perry_pack_150_.*\\.csv$",
+                          full.names = TRUE)
+perry_path <- perry_files[which.max(file.mtime(perry_files))]
+perry <- read.csv(perry_path) %>% mutate(dataset = "Perry")
+cat("Perry:", nrow(perry), "pedons from", basename(perry_path), "\n")
+
+# Stacked for plotting
+both <- bind_rows(
+  ncss %>% mutate(peiid = as.character(peiid)),
+  perry %>% mutate(peiid = as.character(peiid))
+) %>%
+  mutate(dataset = factor(dataset, levels = c("NCSS", "Perry")))
+
+
+```
+
+```{r class-distributions-data}
+# Need NCSS taxonomic columns + Perry truth (from perry_fp_clean)
+# Perry doesn't have these as columns in perry_pack — need to merge truth in
+
+perry_fp_files <- list.files(here("outputs"),
+                              pattern = "^perry_fp_clean_.*\\.csv$",
+                              full.names = TRUE)
+
+perry_fp_path <- perry_fp_files[which.max(file.mtime(perry_fp_files))]
+perry_fp <- read.csv(perry_fp_path)
+
+# Build per-pedon truth for Perry (most-frequent rule, matching modeling pipeline)
+build_truth <- function(df, col) {
+  if (!col %in% names(df)) return(tibble(peiid = character(), truth = character()))
+  dat <- df %>%
+    mutate(truth_val = na_if(str_squish(as.character(.data[[col]])), ""),
+           peiid = as.character(Point))
+  if (col == "taxpartsize") dat <- dat %>% mutate(truth_val = str_to_lower(truth_val))
+  if (col == "series_clean") {
+    dat <- dat %>% mutate(truth_val = na_if(truth_val, "Fill"),
+                          truth_val = str_to_title(truth_val))
+  }
+  dat %>%
+    group_by(peiid) %>%
+    summarise(
+      truth = {
+        nv <- truth_val[!is.na(truth_val)]
+        if (length(nv) == 0) NA_character_ else
+          names(sort(table(nv), decreasing = TRUE))[1]
+      },
+      .groups = "drop"
+    )
+}
+
+# Define what we want and where it lives
+outcome_map <- tibble::tribble(
+  ~outcome,           ~ncss_col,         ~perry_col,
+  "taxorder",         "taxorder",        "taxorder",
+  "taxsuborder",      "taxsuborder",     "taxsuborder",
+  "taxgrtgroup",      "taxgrtgroup",     "taxgrtgroup",
+  "taxsubgrp_mod1",   "taxsubgrp_mod1",  "taxsubgrp_mod1",
+  "taxpartsize",      "taxpartsize",     "taxpartsize",
+  "taxonname_clean",  "taxonname_clean", "series_clean"
+)
+
+# Long-format class counts: outcome x dataset x class -> n
+class_counts <- map_dfr(seq_len(nrow(outcome_map)), function(i) {
+  oc <- outcome_map$outcome[i]
+  ncss_col <- outcome_map$ncss_col[i]
+  perry_col <- outcome_map$perry_col[i]
+
+  ncss_part <- if (ncss_col %in% names(ncss)) {
+    ncss %>%
+      filter(!is.na(.data[[ncss_col]])) %>%
+      mutate(class = as.character(.data[[ncss_col]])) %>%
+      count(class) %>%
+      mutate(dataset = "NCSS", outcome = oc)
+  } else NULL
+
+  perry_truth <- build_truth(perry_fp, perry_col)
+  perry_part <- if (nrow(perry_truth) > 0) {
+    perry_truth %>%
+      filter(!is.na(truth)) %>%
+      count(truth) %>%
+      rename(class = truth) %>%
+      mutate(dataset = "Perry", outcome = oc)
+  } else NULL
+
+  bind_rows(ncss_part, perry_part)
+})
+
+# Standardize taxpartsize case
+class_counts <- class_counts %>%
+  mutate(class = if_else(outcome == "taxpartsize", str_to_lower(class), class))
+```
+
+```{r master-fig-1-class-distributions}
+# ============================================================
+# MASTER FIGURE 1: Class distributions, NCSS vs Perry
+# Faceted by outcome, top-N classes per outcome
+# ============================================================
+
+# For each outcome, take top 10 classes by total count across both datasets
+top_classes <- class_counts %>%
+  group_by(outcome, class) %>%
+  summarise(total = sum(n), .groups = "drop") %>%
+  group_by(outcome) %>%
+  slice_max(total, n = 10, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(outcome, class)
+
+class_plot_data <- class_counts %>%
+  semi_join(top_classes, by = c("outcome", "class")) %>%
+  mutate(
+    outcome = factor(outcome,
+                     levels = c("taxorder", "taxsuborder", "taxgrtgroup",
+                                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean"),
+                     labels = c("Order", "Suborder", "Great Group",
+                                "Subgroup", "Particle Size", "Series (top 10)")),
+    dataset = factor(dataset, levels = c("NCSS", "Perry"))
+  )
+
+# Order classes within each facet by total count
+class_plot_data <- class_plot_data %>%
+  group_by(outcome, class) %>%
+  mutate(facet_total = sum(n)) %>%
+  ungroup() %>%
+  arrange(outcome, desc(facet_total)) %>%
+  group_by(outcome) %>%
+  mutate(class = factor(class, levels = unique(class))) %>%
+  ungroup()
+
+master_fig1 <- ggplot(class_plot_data,
+                      aes(x = class, y = n, fill = dataset)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = n),
+            position = position_dodge(width = 0.8),
+            vjust = -0.3, size = 2.8) +
+  facet_wrap(~ outcome, scales = "free", ncol = 2) +
+  scale_fill_manual(values = ds_colors, name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = NULL, y = "Number of pedons",
+       title = "Class distributions across taxonomic levels: NCSS vs Perry",
+       subtitle = "NCSS = full Coastal Plain training set; Perry = Georgia agricultural field") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 9))
+
+print(master_fig1)
+ggsave(file.path(fig_dir, "master_fig1_class_distributions.png"),
+       master_fig1, width = 13, height = 11, dpi = 300)
+```
+
+```{r master-fig-2-feature-distributions}
+# ============================================================
+# MASTER FIGURE 2: Feature distributions, NCSS vs Perry
+# Density plots for key continuous predictors
+# ============================================================
+
+# Pick the predictors that matter most for taxonomic distinctions
+key_features <- tibble::tribble(
+  ~feature,                ~label,                          ~category,
+  "clay_w",                "Clay (%)",                      "Texture",
+  "sand_w",                "Sand (%)",                      "Texture",
+  "silt_w",                "Silt (%)",                      "Texture",
+  "R_w",                   "Red channel (RGB)",             "Color",
+  "G_w",                   "Green channel (RGB)",           "Color",
+  "B_w",                   "Blue channel (RGB)",            "Color",
+  "depth_to_Bt_cm",        "Depth to Bt (cm)",              "Morphology",
+  "bt_thickness_cm",       "Bt thickness (cm)",             "Morphology",
+  "max_clay_ratio_0_150",  "Max clay ratio (0–150 cm)",     "Argillic",
+  "max_clay_delta_0_150",  "Max clay delta (0–150 cm)",     "Argillic",
+  "depth_to_argillic_cm",  "Depth to argillic (cm)",        "Argillic",
+  "argillic_thickness_cm", "Argillic thickness (cm)",       "Argillic"
+)
+
+# Verify all features exist in both datasets
+missing <- setdiff(key_features$feature, intersect(names(ncss), names(perry)))
+if (length(missing) > 0) {
+  cat("WARNING: features missing from one dataset:", paste(missing, collapse = ", "), "\n")
+  key_features <- key_features %>% filter(!feature %in% missing)
+}
+
+feat_long <- both %>%
+  select(dataset, all_of(key_features$feature)) %>%
+  pivot_longer(cols = -dataset, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value), is.finite(value)) %>%
+  left_join(key_features, by = "feature") %>%
+  mutate(label = factor(label, levels = key_features$label))
+
+master_fig2 <- ggplot(feat_long, aes(x = value, fill = dataset, color = dataset)) +
+  geom_density(alpha = 0.35, linewidth = 0.5) +
+  facet_wrap(~ label, scales = "free", ncol = 4) +
+  scale_fill_manual(values = ds_colors, name = NULL) +
+  scale_color_manual(values = ds_colors, name = NULL) +
+  labs(x = NULL, y = "Density",
+       title = "Feature distributions: NCSS vs Perry",
+       subtitle = "Domain shift visible in clay translocation, color, and Bt morphology") +
+  thesis_theme +
+  theme(strip.text = element_text(size = 9.5))
+
+print(master_fig2)
+ggsave(file.path(fig_dir, "master_fig2_feature_distributions.png"),
+       master_fig2, width = 14, height = 9, dpi = 300)
+```
+
+```{r missingness-summary}
+# ============================================================
+# Missingness comparison: which features are missing where
+# ============================================================
+
+# Just continuous features (skip prop_hzbase_* — they're sparse by design)
+candidate_features <- key_features$feature
+chemistry_features <- c("cec7_w", "pct_hz_with_cec7",
+                        "min_cec_per_kg_clay_0_150",
+                        "median_cec_per_kg_clay_bt_zone")
+
+all_check <- c(candidate_features, chemistry_features)
+all_check <- intersect(all_check, intersect(names(ncss), names(perry)))
+
+missingness <- map_dfr(all_check, function(f) {
+  tibble(
+    feature = f,
+    pct_missing_NCSS = round(100 * mean(is.na(ncss[[f]])), 1),
+    pct_missing_Perry = round(100 * mean(is.na(perry[[f]])), 1)
+  )
+}) %>%
+  arrange(desc(pmax(pct_missing_NCSS, pct_missing_Perry)))
+
+print(missingness, n = Inf)
+write.csv(missingness, file.path(fig_dir, "missingness_comparison.csv"),
+          row.names = FALSE)
+
+missingness_clean <- tibble::tribble(
+  ~Feature,                          ~Description,                                                ~`% Missing NCSS`, ~`% Missing Perry`,
+  "cec7_w",                          "Cation exchange capacity at pH 7 (cmol/kg, weighted)",      80.9,             100.0,
+  "min_cec_per_kg_clay_0_150",       "Minimum CEC per kg clay in 0-150 cm zone",                   81.3,             100.0,
+  "median_cec_per_kg_clay_bt_zone",  "Median CEC per kg clay within Bt zone",                      83.9,             100.0,
+  "pct_hz_with_cec7",                "Proportion of horizons with measured CEC7",                  0.2,              0.0,
+  "sand_w",                          "Sand fraction (%, depth-weighted 0-150 cm)",                 29.6,             1.3,
+  "silt_w",                          "Silt fraction (%, depth-weighted 0-150 cm)",                 0.8,              1.3,
+  "clay_w",                          "Clay fraction (%, depth-weighted 0-150 cm)",                 1.0,              1.3,
+  "R_w",                             "Red channel from Munsell-to-sRGB (depth-weighted)",          15.5,             0.0,
+  "G_w",                             "Green channel from Munsell-to-sRGB (depth-weighted)",        15.5,             0.0,
+  "B_w",                             "Blue channel from Munsell-to-sRGB (depth-weighted)",         15.5,             0.0,
+  "depth_to_Bt_cm",                  "Depth to top of any Bt horizon (cm)",                        21.8,             5.1,
+  "depth_to_argillic_cm",            "Depth to top of argillic horizon (cm)",                      21.8,             5.1,
+  "argillic_thickness_cm",           "Argillic thickness (cm)",                                    1.0,              1.3,
+  "bt_thickness_cm",                 "Total Bt thickness (cm)",                                    0.0,              0.0,
+  "max_clay_ratio_0_150",            "Maximum clay ratio in 0-150 cm",                             12.0,             2.6,
+  "max_clay_delta_0_150",            "Maximum absolute clay increase (%, 0-150 cm)",               12.0,             2.6
+)
+
+print(missingness_clean, n = Inf)
+
+write.csv(missingness_clean,
+          here("outputs", "figures_05_02", "eda", "missingness_comparison_clean.csv"),
+          row.names = FALSE)
+```
+
+```{r summary-stats-table}
+# ============================================================
+# Summary statistics: median ± IQR for each feature, per dataset
+# ============================================================
+
+summary_stats <- both %>%
+  select(dataset, all_of(key_features$feature)) %>%
+  pivot_longer(-dataset, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value), is.finite(value)) %>%
+  group_by(feature, dataset) %>%
+  summarise(
+    n = n(),
+    median = round(median(value), 2),
+    q25 = round(quantile(value, 0.25), 2),
+    q75 = round(quantile(value, 0.75), 2),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = dataset,
+    values_from = c(n, median, q25, q75),
+    names_glue = "{dataset}_{.value}"
+  ) %>%
+  left_join(key_features %>% select(feature, label, category), by = "feature") %>%
+  select(category, feature, label, everything()) %>%
+  arrange(category, feature)
+
+print(summary_stats, n = Inf)
+write.csv(summary_stats, file.path(fig_dir, "feature_summary_stats.csv"),
+          row.names = FALSE)
+```
+
+```{r feature-differences}
+# ============================================================
+# Quantitative summary of distributional differences
+# Median shift between Perry and NCSS for each continuous predictor
+# ============================================================
+
+median_shifts <- both %>%
+  select(dataset, all_of(key_features$feature)) %>%
+  pivot_longer(-dataset, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value), is.finite(value)) %>%
+  group_by(feature, dataset) %>%
+  summarise(median_val = median(value), .groups = "drop") %>%
+  pivot_wider(names_from = dataset, values_from = median_val,
+              names_prefix = "median_") %>%
+  mutate(
+    median_shift = median_Perry - median_NCSS,
+    abs_shift = abs(median_shift)
+  ) %>%
+  left_join(key_features %>% select(feature, label, category),
+            by = "feature") %>%
+  select(category, feature, label, median_NCSS, median_Perry,
+         median_shift, abs_shift) %>%
+  arrange(desc(abs_shift))
+
+print(median_shifts, n = Inf)
+write.csv(median_shifts,
+          here("outputs", "figures_05_02", "eda", "median_shifts.csv"),
+          row.names = FALSE)
+```
+
