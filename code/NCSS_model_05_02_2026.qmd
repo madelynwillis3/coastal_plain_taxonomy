@@ -49,6 +49,8 @@ MODEL_VARIANTS <- tribble(
 # Outcomes to model (ordered: easy -> hard)
 OUTCOMES <- c("taxorder", "taxsuborder", "taxgrtgroup",
               "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+
+
 ```
 
 ```{r load-data}
@@ -597,4 +599,147 @@ print(fig_ncss_heat)
 ggsave("../outputs/figures_05_02/fig_ncss_heatmap.png",
        fig_ncss_heat, width = 10, height = 6, dpi = 300)
 ```
+
+```{r}
+library(tidyverse)
+library(here)
+
+# Load both files
+nested_cv <- read.csv(here("outputs", "reports_05_02", "nested_cv_summary_ncss.csv"))
+ncss_pack_path <- list.files(here("outputs"),
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_path[which.max(file.mtime(ncss_pack_path))]
+ncss <- read.csv(ncss_pack_path)
+
+# Per-outcome thresholds (what you actually deployed)
+threshold_map <- tibble::tribble(
+  ~outcome,           ~min_n,
+  "taxorder",         15,
+  "taxsuborder",      15,
+  "taxgrtgroup",      15,
+  "taxsubgrp_mod1",   12,
+  "taxpartsize",      20,
+  "taxonname_clean",  5    # using min_n=5 as the primary series threshold
+)
+
+# Compute class and pedon retention for each outcome
+coverage <- ncss %>%
+  pivot_longer(c(taxorder, taxsuborder, taxgrtgroup, taxsubgrp_mod1,
+                 taxpartsize, taxonname_clean),
+               names_to = "outcome", values_to = "class") %>%
+  filter(!is.na(class), class != "") %>%
+  count(outcome, class) %>%
+  left_join(threshold_map, by = "outcome") %>%
+  mutate(retained = n >= min_n) %>%
+  group_by(outcome) %>%
+  summarise(
+    n_classes_total      = n(),
+    n_classes_retained   = sum(retained),
+    n_classes_dropped    = sum(!retained),
+    n_pedons_total       = sum(n),
+    n_pedons_retained    = sum(n[retained]),
+    n_pedons_dropped     = sum(n[!retained]),
+    pct_classes_retained = round(100 * n_classes_retained / n_classes_total, 1),
+    pct_pedons_retained  = round(100 * n_pedons_retained / n_pedons_total, 1),
+    .groups = "drop"
+  )
+
+print(coverage)
+
+# Pivot to long for plotting
+coverage_long <- coverage %>%
+  select(outcome,
+         `Classes` = pct_classes_retained,
+         `Pedons` = pct_pedons_retained,
+         n_classes_dropped, n_classes_retained,
+         n_pedons_dropped, n_pedons_retained) %>%
+  pivot_longer(cols = c(Classes, Pedons),
+               names_to = "level", values_to = "pct_retained") %>%
+  mutate(
+    pct_dropped = 100 - pct_retained,
+    n_dropped = if_else(level == "Classes", n_classes_dropped, n_pedons_dropped),
+    n_retained = if_else(level == "Classes", n_classes_retained, n_pedons_retained)
+  )
+
+# Order outcomes coarse to fine
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+coverage_long <- coverage_long %>%
+  mutate(outcome = factor(outcome,
+                          levels = tax_order,
+                          labels = tax_labels[tax_order]),
+         level = factor(level, levels = c("Pedons", "Classes")))  # Pedons on top reads better
+
+# Build the plot
+fig_coverage <- ggplot(coverage_long,
+                       aes(x = outcome, y = pct_retained, fill = level)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(aes(label = paste0(pct_retained, "%")),
+            position = position_dodge(width = 0.8),
+            vjust = -0.4, size = 3.4, fontface = "bold") +
+  geom_text(aes(label = paste0("(", n_retained, "/", n_retained + n_dropped, ")")),
+            position = position_dodge(width = 0.8),
+            vjust = 1.5, size = 3, color = "white") +
+  scale_fill_manual(values = c("Pedons" = "#2C7BB6",
+                                "Classes" = "#D7191C"),
+                    name = NULL,
+                    labels = c("% pedons retained", "% classes retained")) +
+  scale_y_continuous(limits = c(0, 110),
+                     breaks = seq(0, 100, 25),
+                     expand = c(0, 0)) +
+  labs(x = NULL, y = "Retained (%)",
+       title = "Class and pedon retention after minimum-sample filtering",
+       subtitle = "Most pedons are retained even when most rare classes are dropped") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        axis.text.x = element_text(angle = 25, hjust = 1))
+
+print(fig_coverage)
+
+# Save
+ggsave(here("outputs", "figures_05_02", "ncss_class_coverage_pct.png"),
+       fig_coverage, width = 10, height = 6, dpi = 300)
+
+# Also save the underlying numbers as a CSV for the thesis
+write.csv(coverage,
+          here("outputs", "figures_05_02", "ncss_class_coverage_table.csv"),
+          row.names = FALSE)
+
+
+# Pedon-weighted retention
+dropped_summary <- dropped %>%
+  left_join(min_n_map, by = "outcome") %>%
+  filter(n_pedons < min_n) %>%
+  group_by(outcome) %>%
+  summarise(
+    n_classes_dropped = n(),
+    n_pedons_dropped = sum(n_pedons),
+    .groups = "drop"
+  )
+
+print(dropped_summary)
+
+# Apply min_n = 5 threshold for series only
+series_min5_summary <- ncss %>%
+  filter(!is.na(taxonname_clean)) %>%
+  count(taxonname_clean) %>%
+  mutate(retained = n >= 5) %>%
+  summarise(
+    n_classes_retained = sum(retained),
+    n_classes_dropped  = sum(!retained),
+    n_pedons_retained  = sum(n[retained]),
+    n_pedons_dropped   = sum(n[!retained]),
+    pct_pedons_retained = round(100 * n_pedons_retained /
+                                  (n_pedons_retained + n_pedons_dropped), 1)
+  )
+print(series_min5_summary)
+```
+
+
 

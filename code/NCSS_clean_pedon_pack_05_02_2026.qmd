@@ -425,3 +425,51 @@ write.csv(pedon_pack_150,
           paste0("../outputs/pedon_pack_150_", Sys.Date(), ".csv"),
           row.names = FALSE)
 ```
+
+```{r}
+#figure of distances between all NCSS pedons:
+library(geosphere)
+library(here)
+library(ggplot2)
+# Filter to pedons with valid coordinates
+ncss_geo <- pedon_pack_150 %>%
+  filter(!is.na(POINT_X), !is.na(POINT_Y),
+         is.finite(POINT_X), is.finite(POINT_Y)) %>%
+  select(peiid, POINT_X, POINT_Y)
+
+cat("Pedons with coordinates:", nrow(ncss_geo), "\n")
+
+# Pairwise distances in km using great-circle (Haversine) distance
+# distm() returns a matrix of distances in meters
+coords_mat <- as.matrix(ncss_geo %>% select(POINT_X, POINT_Y))
+dist_mat_m <- distm(coords_mat, fun = distHaversine)
+dist_km <- dist_mat_m[upper.tri(dist_mat_m)] / 1000
+
+cat("Number of pairwise distances:", length(dist_km), "\n")
+cat("Min:",   round(min(dist_km), 1),    "km\n")
+cat("Median:", round(median(dist_km), 1), "km\n")
+cat("Mean:",  round(mean(dist_km), 1),   "km\n")
+cat("Max:",   round(max(dist_km), 1),    "km\n")
+
+# Plot: distribution of pairwise distances
+fig_dist <- ggplot(data.frame(dist_km = dist_km), aes(x = dist_km)) +
+  geom_histogram(bins = 60, fill = "#2C7BB6", color = "white") +
+  geom_vline(xintercept = median(dist_km), linetype = "dashed", color = "red") +
+  annotate("text", x = median(dist_km), y = Inf, vjust = 2,
+           hjust = -0.1, color = "red",
+           label = paste0("median = ", round(median(dist_km)), " km")) +
+  scale_x_continuous(labels = scales::comma) +
+  labs(x = "Pairwise great-circle distance (km)",
+       y = "Number of pedon pairs",
+       title = "Geographic spread of NCSS Coastal Plain training pedons",
+       subtitle = paste0(nrow(ncss_geo), " pedons; ",
+                         format(length(dist_km), big.mark = ","),
+                         " pairwise distances")) +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+print(fig_dist)
+ggsave(here("outputs", "figures_05_02", "ncss_pairwise_distances.png"),
+       fig_dist, width = 9, height = 5.5, dpi = 300)
+```
+

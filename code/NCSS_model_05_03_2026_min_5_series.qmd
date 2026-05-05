@@ -1,0 +1,261 @@
+---
+title: "NCSS series min_n=5 nested CV"
+format: html
+---
+
+```{r setup}
+library(beepr)
+library(here)
+source(here("code", "modeling_functions_05_02_2026.R"))
+source(here("code", "pedon_pack_functions_05_02_2026.R"))
+
+dir.create(here("outputs", "reports_05_02"), showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r config}
+# ============================================================
+# CONFIGURATION
+# Run nested CV for series at min_n = 5 only.
+# Inner_v = 3 because per-class N is small at this threshold.
+# ============================================================
+
+OUTER_V   <- 5
+INNER_V   <- 3      # smaller because per-class N is small
+GRID_SIZE <- 10     # smaller grid for same reason
+SERIES_MIN_N <- 5
+
+MODEL_VARIANTS <- tribble(
+  ~engine, ~space,
+  "rf",    "plain",
+  "xgb",   "plain",
+  "rf",    "umap_hdb",
+  "xgb",   "umap_hdb"
+)
+```
+
+```{r load-data}
+# ============================================================
+# LOAD DATA
+# ============================================================
+ncss_pack_files <- list.files(here("outputs"),
+                              pattern = "^pedon_pack_150_.*\\.csv$",
+                              full.names = TRUE)
+ncss_pack_path <- ncss_pack_files[which.max(file.mtime(ncss_pack_files))]
+cat("Loading:", ncss_pack_path, "\n")
+
+pedon_pack_150 <- read.csv(ncss_pack_path) %>%
+  mutate(peiid = as.character(peiid))
+
+cat("Pedons loaded:", nrow(pedon_pack_150), "\n")
+```
+
+```{r prep-series-min5}
+# ============================================================
+# PREP SERIES DATA AT MIN_N = 5
+# ============================================================
+df_series_min5 <- pedon_pack_150 %>%
+  select(-any_of(setdiff(TAXONOMY_DROP_COLS, "taxonname_clean"))) %>%
+  prep_outcome("taxonname_clean", min_n = SERIES_MIN_N)
+
+cat("\n--- Series at min_n =", SERIES_MIN_N, "---\n")
+cat("n =", nrow(df_series_min5), "\n")
+cat("classes =", nlevels(df_series_min5$taxonname_clean), "\n")
+cat("class distribution:\n")
+print(table(df_series_min5$taxonname_clean))
+```
+
+```{r nested-cv-series-min5}
+# ============================================================
+# NESTED CV: series at min_n = 5
+# ============================================================
+
+cat("\n========================================\n")
+cat("NESTED CV: series @ min_n =", SERIES_MIN_N, "\n")
+cat("Outer:", OUTER_V, "| Inner:", INNER_V, "| Grid:", GRID_SIZE, "\n")
+cat("========================================\n")
+
+nested_cv_results_min5 <- list()
+
+for (i in seq_len(nrow(MODEL_VARIANTS))) {
+  eng <- MODEL_VARIANTS$engine[i]
+  sp  <- MODEL_VARIANTS$space[i]
+  key <- paste("taxonname_clean_min5", eng, sp, sep = "_")
+
+  cat("\n>>> Variant:", eng, sp, "...\n")
+  t0 <- Sys.time()
+
+  fold_metrics <- tryCatch(
+    nested_cv_one_variant(
+      df = df_series_min5,
+      outcome = "taxonname_clean", engine = eng, space = sp,
+      outer_v = OUTER_V, inner_v = INNER_V,
+      grid_size = GRID_SIZE, seed = 400 + i
+    ),
+    error = function(e) {
+      cat("    ERROR:", e$message, "\n")
+      tibble(fold = NA, accuracy = NA_real_, kap = NA_real_,
+             bal_accuracy = NA_real_, f_meas_macro = NA_real_,
+             n_test = NA_integer_, engine = eng, space = sp,
+             outcome = "taxonname_clean")
+    }
+  )
+
+  dt <- round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1)
+  cat("    done in", dt, "min\n")
+
+  nested_cv_results_min5[[key]] <- fold_metrics
+}
+
+# Tag with min_n_label so it's distinguishable when combined with the original
+nested_cv_long_min5 <- bind_rows(nested_cv_results_min5) %>%
+  mutate(min_n_label = "min_n=5")
+
+# ---- Summary: mean +/- SD across outer folds ----
+nested_cv_summary_min5 <- nested_cv_long_min5 %>%
+  filter(!is.na(fold)) %>%
+  group_by(outcome, engine, space) %>%
+  summarise(
+    n_folds          = n(),
+    accuracy_mean    = mean(accuracy,     na.rm = TRUE),
+    accuracy_sd      = sd(accuracy,       na.rm = TRUE),
+    kap_mean         = mean(kap,          na.rm = TRUE),
+    kap_sd           = sd(kap,            na.rm = TRUE),
+    bal_acc_mean     = mean(bal_accuracy, na.rm = TRUE),
+    bal_acc_sd       = sd(bal_accuracy,   na.rm = TRUE),
+    f_meas_mean      = mean(f_meas_macro, na.rm = TRUE),
+    f_meas_sd        = sd(f_meas_macro,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(min_n_label = "min_n=5") %>%
+  arrange(desc(kap_mean))
+
+cat("\n========================================\n")
+cat("NESTED CV SUMMARY: SERIES @ MIN_N = 5\n")
+cat("========================================\n")
+print(nested_cv_summary_min5, n = Inf)
+
+# ---- Save ----
+write.csv(nested_cv_long_min5,
+          here("outputs", "reports_05_02", "nested_cv_long_ncss_min5_series.csv"),
+          row.names = FALSE)
+write.csv(nested_cv_summary_min5,
+          here("outputs", "reports_05_02", "nested_cv_summary_ncss_min5_series.csv"),
+          row.names = FALSE)
+
+beep("wilhelm")
+```
+
+```{r combined-with-existing}
+# ============================================================
+# COMBINE WITH EXISTING NESTED CV RESULTS
+# So you have one canonical file with both thresholds.
+# ============================================================
+
+existing_summary <- read.csv(
+  here("outputs", "reports_05_02", "nested_cv_summary_ncss.csv")
+) %>%
+  mutate(min_n_label = if_else(outcome == "taxonname_clean",
+                                "min_n=15", "primary"))
+
+existing_long <- read.csv(
+  here("outputs", "reports_05_02", "nested_cv_long_ncss.csv")
+) %>%
+  mutate(min_n_label = if_else(outcome == "taxonname_clean",
+                                "min_n=15", "primary"))
+
+combined_summary <- bind_rows(existing_summary, nested_cv_summary_min5)
+combined_long    <- bind_rows(existing_long, nested_cv_long_min5)
+
+write.csv(combined_summary,
+          here("outputs", "reports_05_02", "nested_cv_summary_ncss_combined.csv"),
+          row.names = FALSE)
+write.csv(combined_long,
+          here("outputs", "reports_05_02", "nested_cv_long_ncss_combined.csv"),
+          row.names = FALSE)
+
+cat("\nCombined results saved with min_n_label distinguishing the two series models.\n")
+```
+
+```{r updated-figures}
+# ============================================================
+# REGENERATE FIGURES USING MIN_N = 5 AS PRIMARY SERIES THRESHOLD
+# ============================================================
+library(ggplot2)
+
+# Use min_n=5 for series, primary for everything else
+plot_data <- combined_summary %>%
+  filter(min_n_label %in% c("primary", "min_n=5"))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+plot_data <- plot_data %>%
+  mutate(
+    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    variant = paste(engine, space, sep = " / "),
+    variant = recode(variant,
+                     "rf / plain"     = "RF (plain)",
+                     "xgb / plain"    = "XGB (plain)",
+                     "rf / umap_hdb"  = "RF (UMAP+HDB)",
+                     "xgb / umap_hdb" = "XGB (UMAP+HDB)")
+  )
+
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+# --- Dot plot ---
+fig_ncss <- ggplot(plot_data,
+                   aes(x = outcome, y = kap_mean, color = engine, shape = space)) +
+  geom_errorbar(aes(ymin = kap_mean - kap_sd, ymax = kap_mean + kap_sd),
+                width = 0.25, position = position_dodge(width = 0.5)) +
+  geom_point(size = 3.5, position = position_dodge(width = 0.5)) +
+  scale_color_manual(values = c("rf" = "#2C7BB6", "xgb" = "#D7191C"),
+                     labels = c("Random Forest", "XGBoost"),
+                     name = "Engine") +
+  scale_shape_manual(values = c("plain" = 16, "umap_hdb" = 17),
+                     labels = c("Plain features", "UMAP + HDBSCAN"),
+                     name = "Feature space") +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(x = NULL, y = "Cohen's Kappa (mean ± SD across outer folds)",
+       title = "NCSS nested cross-validation: model variant comparison",
+       subtitle = "Series shown at min_n = 5 (28 classes)") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(fig_ncss)
+ggsave(here("outputs", "figures_05_02", "fig_ncss_model_compare_min5.png"),
+       fig_ncss, width = 10, height = 6, dpi = 300)
+
+# --- Heatmap ---
+fig_ncss_heat <- ggplot(plot_data,
+                        aes(x = outcome, y = variant, fill = kap_mean)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", kap_mean)), size = 3.5) +
+  scale_fill_gradient(low = "#FDAE61", high = "#1A9641",
+                      limits = c(0.30, 0.90), name = "Kappa") +
+  labs(x = NULL, y = NULL,
+       title = "NCSS nested CV: model variants × taxonomic levels",
+       subtitle = "Series shown at min_n = 5") +
+  thesis_theme +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+print(fig_ncss_heat)
+ggsave(here("outputs", "figures_05_02", "fig_ncss_heatmap_min5.png"),
+       fig_ncss_heat, width = 10, height = 6, dpi = 300)
+```
+
+```{r done}
+cat("\n========================================\n")
+cat("DONE.\n")
+cat("- Min_n=5 nested CV long: nested_cv_long_ncss_min5_series.csv\n")
+cat("- Min_n=5 nested CV summary: nested_cv_summary_ncss_min5_series.csv\n")
+cat("- Combined summary (both thresholds): nested_cv_summary_ncss_combined.csv\n")
+cat("- Updated figures: fig_ncss_*_min5.png\n")
+cat("========================================\n")
+beep("complete")
+```
