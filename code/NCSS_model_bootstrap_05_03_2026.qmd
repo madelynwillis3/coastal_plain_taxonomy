@@ -831,7 +831,6 @@ print(fig_coverage)
 # Save
 ggsave(here("outputs", "figures_05_02", "ncss_class_coverage_pct.png"),
        fig_coverage, width = 10, height = 6, dpi = 300)
-
 # Also save the underlying numbers as a CSV for the thesis
 write.csv(coverage,
           here("outputs", "figures_05_02", "ncss_class_coverage_table.csv"),
@@ -1278,7 +1277,7 @@ get_test_predictions <- function(bundle, full_data, rep_num) {
   
   min_n_lookup <- c(taxorder = 15, taxsuborder = 15, taxgrtgroup = 15,
                     taxsubgrp_mod1 = 12, taxpartsize = 20,
-                    taxonname_clean = 5)
+                    taxonname_clean = 5)  # using min_n=15 for series to match the main NCSS run
   
   df_prepped <- full_data %>%
     select(-any_of(setdiff(TAXONOMY_DROP_COLS, oc))) %>%
@@ -1300,7 +1299,17 @@ get_test_predictions <- function(bundle, full_data, rep_num) {
   preds
 }
 
-# Process all reps
+# Pick the best variant per outcome (any engine, any space) by median kappa
+best_per_outcome <- summary_clean %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bundle_root = paste(outcome, engine, space, sep = "_"))
+
+cat("Best variant per outcome:\n")
+print(best_per_outcome %>% select(outcome, engine, space, kap_median, bundle_root))
+
+# Build rep_meta from all replicate bundles, then filter to the best per outcome
 rep_meta <- tibble(
   filepath = rep_bundle_files,
   basename = basename(rep_bundle_files),
@@ -1308,13 +1317,7 @@ rep_meta <- tibble(
                             "_rep[0-9]+_bundle\\.rds$"),
   rep_num = as.integer(str_extract(basename(rep_bundle_files), "(?<=_rep)[0-9]+"))
 ) %>%
-  # Filter to plain models only (one variant per outcome to keep it clean)
-  filter(str_detect(bundle_root, "_plain$"))
-
-# We want best plain variant per outcome
-best_plain_root <- best_plain$bundle_name
-rep_meta <- rep_meta %>%
-  filter(bundle_root %in% best_plain_root)
+  filter(bundle_root %in% best_per_outcome$bundle_root)
 
 cat("Processing", nrow(rep_meta), "replicate bundles for rank-of-truth\n")
 
@@ -1445,7 +1448,7 @@ plot_rank_with_pred <- function(rank_df, outcome_label) {
   
   ggplot(rank_summary, aes(x = rank_category, y = truth, fill = prop)) +
     geom_tile(color = "white") +
-    geom_text(aes(label = cell_label), size = 2.5, lineheight = 0.85) +
+    geom_text(aes(label = cell_label), size = 4, lineheight = 0.85) +
     scale_fill_gradient2(low = "#D55E00", mid = "#E69F00", high = "#009E73",
                          midpoint = 0.3,
                          limits = c(0, 1),
@@ -1477,20 +1480,222 @@ for (oc in names(rank_plots)) {
          rank_plots[[oc]],
          width = 11, height = 8, dpi = 300)
 }
+library(cowplot)
 
-# Optionally combine into a multipanel — but heights vary by class count
-# so individual figures are usually cleaner for series/great group
+# Reorder by tax_order
+ordered_plots_NCSS <- rank_plots[tax_order]
+ordered_plots_NCSS <- ordered_plots_NCSS[!sapply(ordered_plots_NCSS, is.null)]
 
-#patchwork:
-fig_ranks <- wrap_plots(rank_plots, ncol = 2) +
+# Build a "with legend" version of the first plot just to extract the legend
+first_outcome <- names(ordered_plots_NCSS)[1]
+plot_with_legend <- plot_rank_with_pred(
+  ranks_full %>% filter(outcome == first_outcome),
+  tax_labels[first_outcome]
+)
+
+# Extract the legend grob
+shared_legend <- get_legend(plot_with_legend)
+
+# Remove legends from all panels
+ordered_plots_NCSS_no_legend <- map(ordered_plots_NCSS, function(p) {
+  p + scale_fill_gradient2(
+    low = "#D55E00", mid = "#E69F00", high = "#009E73",
+    midpoint = 0.3, limits = c(0, 1),
+    guide = "none"
+  )
+})
+
+# Build patchwork of panels (no legend on any)
+panels <- wrap_plots(ordered_plots_NCSS_no_legend, ncol = 2) +
   plot_annotation(
     title = "Rank of true class in NCSS test predictions (best variant, all reps)",
     subtitle = "Cell color = row-proportion; cell text = count + (most common predicted instead for misses)",
     theme = theme(plot.title = element_text(size = 14, face = "bold"))
   )
+
+# Combine panels + legend in a horizontal layout
+fig_ranks <- plot_grid(panels, shared_legend,
+                       ncol = 2,
+                       rel_widths = c(1, 0.08))
+
 print(fig_ranks)
+ggsave(file.path(fig_dir, "fig_ncss_rank_all.png"),
+       fig_ranks, width = 16, height = 18, dpi = 300)
 ```
 
 
+```{r}
+#vip plot
+library(tidyverse)
+library(here)
+library(patchwork)
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+thesis_theme <- theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+
+tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
+                "taxsubgrp_mod1", "taxpartsize", "taxonname_clean")
+tax_labels <- c("Order", "Suborder", "Great Group",
+                "Subgroup", "Particle Size", "Series")
+names(tax_labels) <- tax_order
+
+# ============================================================
+# IDENTIFY BEST PLAIN VARIANT PER OUTCOME
+# (no min5 override — uses whatever the bootstrap data shows is best)
+# ============================================================
+summary_clean <- read.csv(here("outputs", "reports_05_02",
+                                "test_metrics_summary_clean.csv"))
+
+best_plain_per_outcome <- summary_clean %>%
+  filter(space == "plain") %>%
+  group_by(outcome) %>%
+  slice_max(kap_median, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(bundle_root = paste(outcome, engine, space, sep = "_"))
+
+cat("Using bundles:\n")
+print(best_plain_per_outcome %>% select(outcome, engine, space, bundle_root))
+
+# ============================================================
+# EXTRACT VIP FROM ALL 10 REPLICATE BUNDLES, AVERAGE
+# ============================================================
+extract_vip_from_bundle <- function(bundle_path) {
+  b <- tryCatch(readRDS(bundle_path), error = function(e) NULL)
+  if (is.null(b)) return(NULL)
+
+  fit_obj <- workflows::extract_fit_engine(b$final_fit)
+
+  imp <- tryCatch({
+    if (inherits(fit_obj, "ranger")) {
+      tibble(
+        feature = names(fit_obj$variable.importance),
+        importance = as.numeric(fit_obj$variable.importance)
+      )
+    } else if (inherits(fit_obj, "xgb.Booster")) {
+      xgb_imp <- xgboost::xgb.importance(model = fit_obj)
+      tibble(feature = xgb_imp$Feature, importance = xgb_imp$Gain)
+    } else {
+      return(NULL)
+    }
+  }, error = function(e) return(NULL))
+
+  if (is.null(imp)) return(NULL)
+  imp %>% mutate(importance = importance / sum(importance, na.rm = TRUE))
+}
+
+all_vip <- map_dfr(seq_len(nrow(best_plain_per_outcome)), function(i) {
+  bundle_root <- best_plain_per_outcome$bundle_root[i]
+  oc <- best_plain_per_outcome$outcome[i]
+
+  cat("Processing", bundle_root, "...\n")
+
+  rep_files <- list.files(here("outputs", "models_05_02"),
+                          pattern = paste0("^", bundle_root,
+                                            "_rep[0-9]+_bundle\\.rds$"),
+                          full.names = TRUE)
+
+  if (length(rep_files) == 0) {
+    cat("  WARNING: no replicate bundles for", bundle_root, "\n")
+    return(NULL)
+  }
+
+  cat("  Found", length(rep_files), "replicate bundles\n")
+
+  rep_vips <- map_dfr(rep_files, function(fp) {
+    rep_num <- as.integer(str_extract(basename(fp), "(?<=_rep)[0-9]+"))
+    v <- extract_vip_from_bundle(fp)
+    if (is.null(v)) return(NULL)
+    v %>% mutate(replicate = rep_num)
+  })
+
+  if (nrow(rep_vips) == 0) return(NULL)
+
+  rep_vips %>%
+    group_by(feature) %>%
+    summarise(
+      importance_median = median(importance, na.rm = TRUE),
+      importance_lo     = quantile(importance, 0.25, na.rm = TRUE),
+      importance_hi     = quantile(importance, 0.75, na.rm = TRUE),
+      n_reps_present    = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(outcome = oc, bundle_root = bundle_root)
+})
+
+write.csv(all_vip,
+          here("outputs", "reports_05_02", "ncss_vip_median_across_reps.csv"),
+          row.names = FALSE)
+
+cat("\nAll outcomes processed. Found data for:\n")
+print(unique(all_vip$outcome))
+
+# ============================================================
+# PLOT WITH GRADIENT COLORS + SHARED X-AXIS LABEL PER COLUMN
+# ============================================================
+plot_vip <- function(vip_df, outcome_label, top_n = 15,
+                     show_x_axis = TRUE) {
+  d <- vip_df %>%
+    arrange(desc(importance_median)) %>%
+    slice_head(n = top_n) %>%
+    mutate(feature = fct_reorder(feature, importance_median))
+
+  p <- ggplot(d, aes(x = importance_median, y = feature,
+                     fill = importance_median)) +
+    geom_col() +
+    geom_errorbar(aes(xmin = importance_lo, xmax = importance_hi),
+                  width = 0.3, color = "grey30", linewidth = 0.4) +
+    scale_fill_gradient(low = "#FDAE61", high = "#08519C",
+                        name = NULL, guide = "none") +
+    labs(y = NULL, title = outcome_label) +
+    thesis_theme +
+    theme(axis.text.y = element_text(size = 8))
+
+  if (show_x_axis) {
+    p <- p + labs(x = "Median normalized importance (IQR across 10 reps)")
+  } else {
+    p <- p + labs(x = NULL) +
+      theme(axis.title.x = element_blank())
+  }
+
+  p
+}
+
+# Layout plan (2 columns):
+# Row 1: Order      | Suborder
+# Row 2: Great Grp  | Subgroup
+# Row 3: Part Size  | Series   <-- bottom row gets x-axis label
+vip_plots <- list()
+for (i in seq_along(tax_order)) {
+  oc <- tax_order[i]
+  d <- all_vip %>% filter(outcome == oc)
+  if (nrow(d) == 0) next
+
+  # Only the last two plots (bottom row) show x-axis label
+  is_bottom_row <- i %in% c(5, 6)
+  vip_plots[[oc]] <- plot_vip(d, tax_labels[oc], top_n = 15,
+                              show_x_axis = is_bottom_row)
+}
+
+# Combine — order matters for the row assignment
+ordered_plots <- vip_plots[tax_order]
+ordered_plots <- ordered_plots[!sapply(ordered_plots, is.null)]
+
+fig_vip <- wrap_plots(ordered_plots, ncol = 2) +
+  plot_annotation(
+    title = "Top 15 predictors per taxonomic level (median across 10 NCSS train/test replicates)",
+    subtitle = "Color gradient = median normalized importance; error bars = IQR across replicates",
+    theme = theme(plot.title = element_text(size = 14, face = "bold"),
+                  plot.subtitle = element_text(size = 11, color = "grey30"))
+  )
+
+print(fig_vip)
+ggsave(file.path(fig_dir, "fig_ncss_vip_median.png"),
+       fig_vip, width = 14, height = 16, dpi = 300)
+```
 
 
