@@ -168,7 +168,7 @@ fit_umap_hdb <- function(x_train, x_test, y_train, y_test, outcome,
 # Model specs
 # -----------------------------------------------------------------------------
 make_rf_spec <- function() {
-  rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>%
+  rand_forest(trees = 1000, mtry = tune(), min_n = tune()) %>% #RF performance plateaus quickly with trees; 1000 is well past the plateau for any reasonable problem size.
     set_engine("ranger", probability = TRUE, importance = "permutation") %>%
     set_mode("classification")
 }
@@ -212,7 +212,7 @@ make_grid <- function(engine, n_predictors, size = 12) {
 fit_one_model <- function(train_df, test_df, outcome,
                           engine = c("rf", "xgb"),
                           space  = c("plain", "umap_hdb"),
-                          inner_v = 5, grid_size = 12, seed = 1,
+                          inner_v = 5, grid_size = 12, seed = 1, #grid size = 12 due to computational budget
                           umap_settings = list()) {
   
   engine <- match.arg(engine)

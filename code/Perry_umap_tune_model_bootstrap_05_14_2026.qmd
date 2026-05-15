@@ -1,5 +1,5 @@
 ---
-title: "Perry_model_boostrap_05_12_2026"
+title: "Perry_model_boostrap_05_14_2026"
 format: html
 ---
 
@@ -384,7 +384,7 @@ perry_metric_summary <- map_dfr(perry_validations, function(v) {
 perry_metric_summary <- perry_metric_summary %>%
   mutate(
     outcome = bundle %>%
-      str_remove("_rf_plain$|_xgb_plain$|_rf_umap_hdb$|_xgb_umap_hdb$") %>%
+      str_remove("_rf_plain$|_xgb_plain$|_rf_umap_hdb$|_xgb_umap_hdb$|_rf_umap_hdb_tuned$|_xgb_umap_hdb_tuned$") %>%
       str_remove("_min5$"),
     is_min5 = str_detect(bundle, "_min5_"),
     engine = case_when(
@@ -392,8 +392,9 @@ perry_metric_summary <- perry_metric_summary %>%
       str_detect(bundle, "_xgb_") ~ "xgb"
     ),
     space = case_when(
-      str_detect(bundle, "_umap_hdb$") ~ "umap_hdb",
-      TRUE                              ~ "plain"
+      str_detect(bundle, "_umap_hdb_tuned$") ~ "umap_hdb_tuned",
+      str_detect(bundle, "_umap_hdb$")       ~ "umap_hdb",
+      TRUE                                    ~ "plain"
     )
   ) %>%
   select(outcome, engine, space, is_min5, bundle, n_pedons,
@@ -778,8 +779,9 @@ combined <- bind_rows(
       str_detect(bundle, "_xgb_") ~ "xgb"
     ),
     space = case_when(
-      str_detect(bundle, "_umap_hdb$") ~ "umap_hdb",
-      TRUE                              ~ "plain"
+      str_detect(bundle, "_umap_hdb_tuned$") ~ "umap_hdb_tuned",
+      str_detect(bundle, "_umap_hdb$")       ~ "umap_hdb",
+      TRUE                                    ~ "plain"
     ),
     is_min5 = str_detect(bundle, "_min5_")
   ) %>%
@@ -794,7 +796,7 @@ print(combined %>%
       n = Inf)
 
 write.csv(combined,
-          "../outputs/reports_05_02/combined_ncss_perry_results.csv",
+          "../outputs/reports_05_02/combined_ncss_perry_results_with_tune.csv",
           row.names = FALSE)
 
 # ---- Pivoted "thesis table" view ----
@@ -815,7 +817,7 @@ cat("\n--- THESIS-READY: best per outcome on each dataset ---\n")
 print(thesis_view, n = Inf)
 
 write.csv(thesis_view,
-          "../outputs/reports_05_02/thesis_summary_table.csv",
+          "../outputs/reports_05_02/thesis_summary_table_with_tune.csv",
           row.names = FALSE)
 
 
@@ -824,48 +826,48 @@ write.csv(thesis_view,
 ```
 
 ```{r}
-
-
-#combine with UMAP + tuning:
-# Load existing NCSS + Perry results
-existing_results <- read.csv(here("outputs", "reports_05_02",
-                                   "combined_ncss_perry_results.csv"))
-
-# Build "tuned UMAP" rows from sensitivity analysis
-tuned_umap_rows <- sensitivity_full %>%
-  filter(status == "ok") %>%
-  group_by(outcome, engine) %>%
-  slice_max(ncss_kap, n = 1, with_ties = FALSE) %>%
-  ungroup() %>%
-  # Two rows per outcome × engine — one for NCSS, one for Perry
-  pivot_longer(cols = c(ncss_kap, perry_kap, ncss_acc, perry_acc),
-               names_to = c("dataset_short", "metric"),
-               names_sep = "_") %>%
-  pivot_wider(names_from = metric, values_from = value) %>%
-  mutate(
-    dataset = if_else(dataset_short == "ncss",
-                      "NCSS (internal test)", "Perry (external)"),
-    space = "umap_hdb_tuned",   # distinct from plain umap_hdb
-    is_min5 = FALSE,
-    bundle = paste0(outcome, "_", engine, "_umap_tuned_nn",
-                     n_neighbors, "_md", min_dist, "_mpts", minPts),
-    bal_accuracy = NA_real_,
-    f_meas_macro = NA_real_,
-    top_k = NA_real_,
-    k = NA_real_,
-    n_pedons = NA_integer_
-  ) %>%
-  select(dataset, outcome, engine, space, is_min5, bundle,
-         accuracy = acc, kap, bal_accuracy, f_meas_macro,
-         top_k, k, n_pedons)
-
-# Combine
-combined_with_tuned <- bind_rows(existing_results, tuned_umap_rows)
-
-write.csv(combined_with_tuned,
-          here("outputs", "reports_05_02",
-                "combined_ncss_perry_with_tuned_umap.csv"),
-          row.names = FALSE)
+# 
+# 
+# #combine with UMAP + tuning:
+# # Load existing NCSS + Perry results
+# existing_results <- read.csv(here("outputs", "reports_05_02",
+#                                    "combined_ncss_perry_results.csv"))
+# 
+# # Build "tuned UMAP" rows from sensitivity analysis
+# tuned_umap_rows <- sensitivity_full %>%
+#   filter(status == "ok") %>%
+#   group_by(outcome, engine) %>%
+#   slice_max(ncss_kap, n = 1, with_ties = FALSE) %>%
+#   ungroup() %>%
+#   # Two rows per outcome × engine — one for NCSS, one for Perry
+#   pivot_longer(cols = c(ncss_kap, perry_kap, ncss_acc, perry_acc),
+#                names_to = c("dataset_short", "metric"),
+#                names_sep = "_") %>%
+#   pivot_wider(names_from = metric, values_from = value) %>%
+#   mutate(
+#     dataset = if_else(dataset_short == "ncss",
+#                       "NCSS (internal test)", "Perry (external)"),
+#     space = "umap_hdb_tuned",   # distinct from plain umap_hdb
+#     is_min5 = FALSE,
+#     bundle = paste0(outcome, "_", engine, "_umap_tuned_nn",
+#                      n_neighbors, "_md", min_dist, "_mpts", minPts),
+#     bal_accuracy = NA_real_,
+#     f_meas_macro = NA_real_,
+#     top_k = NA_real_,
+#     k = NA_real_,
+#     n_pedons = NA_integer_
+#   ) %>%
+#   select(dataset, outcome, engine, space, is_min5, bundle,
+#          accuracy = acc, kap, bal_accuracy, f_meas_macro,
+#          top_k, k, n_pedons)
+# 
+# # Combine
+# combined_with_tuned <- bind_rows(existing_results, tuned_umap_rows)
+# 
+# write.csv(combined_with_tuned,
+#           here("outputs", "reports_05_02",
+#                 "combined_ncss_perry_with_tuned_umap.csv"),
+#           row.names = FALSE)
 ```
 
 
@@ -992,74 +994,7 @@ print(fig2)
 ggsave(file.path(fig_dir, "fig2_hierarchical_accuracy.png"),
        fig2, width = 10, height = 5.5, dpi = 300)
 library(cowplot)
-# ============================================================
-# BUILD CONFUSION MATRIX PLOTS FOR EACH OUTCOME
-# Uses the best Perry-side bundle per outcome.
-# ============================================================
-cm_plots <- list()
 
-for (i in seq_len(nrow(best_perry_bundle))) {
-  bn <- best_perry_bundle$bundle[i]
-  oc <- best_perry_bundle$outcome[i]
-  
-  v <- perry_validations[[bn]]
-  if (is.null(v) || is.null(v$data)) next
-  
-  # Get the joined data with predictions and truth
-  joined <- v$data %>%
-    mutate(
-      truth_fct = as.character(truth_fct),
-      pred_fct = as.character(pred_fct)
-    )
-  
-  # Build confusion matrix counts
-  cm_data <- joined %>%
-    count(truth_fct, pred_fct, name = "n") %>%
-    group_by(truth_fct) %>%
-    mutate(prop = n / sum(n)) %>%
-    ungroup()
-  
-  # Get class order — sort by truth frequency (most common at top of y-axis)
-  class_order <- joined %>%
-    count(truth_fct, name = "n") %>%
-    arrange(n) %>%
-    pull(truth_fct)
-  
-  # Use union of truth and prediction classes for x-axis
-  all_classes <- union(unique(joined$truth_fct), unique(joined$pred_fct))
-  x_order <- intersect(class_order, all_classes)
-  if (length(setdiff(all_classes, x_order)) > 0) {
-    x_order <- c(x_order, setdiff(all_classes, x_order))
-  }
-  
-  cm_data <- cm_data %>%
-    mutate(
-      truth_fct = factor(truth_fct, levels = class_order),
-      pred_fct = factor(pred_fct, levels = x_order)
-    )
-  
-  # Build the plot
-  cm_plots[[oc]] <- ggplot(cm_data, aes(x = pred_fct, y = truth_fct, fill = prop)) +
-    geom_tile(color = "white", linewidth = 0.3) +
-    geom_text(aes(label = ifelse(n > 0, n, "")), size = 3) +
-    scale_fill_gradient(low = "white", high = "#2C7BB6",
-                        limits = c(0, 1),
-                        name = "Row prop") +
-    labs(title = tax_labels[oc],
-         x = "Predicted class",
-         y = "True class") +
-    thesis_theme +
-    theme(
-      axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
-      axis.text.y = element_text(size = 8),
-      panel.grid = element_blank(),
-      plot.title = element_text(size = 11, face = "bold"),
-      legend.position = "right"
-    )
-}
-
-cat("Built confusion matrix plots for outcomes:",
-    paste(names(cm_plots), collapse = ", "), "\n")
 # Reorder by tax_order
 ordered_cm_plots <- cm_plots[tax_order]
 ordered_cm_plots <- ordered_cm_plots[!sapply(ordered_cm_plots, is.null)]
@@ -1585,7 +1520,7 @@ ggsave(file.path(fig_dir, "fig1_kappa_by_level_with_ci.png"),
 ```
 
 ```{r}
-library(patchwork)
+
 fig_dir <- here("outputs", "figures_05_02")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 
