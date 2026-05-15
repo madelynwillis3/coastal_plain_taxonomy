@@ -2168,6 +2168,170 @@ print(fig_class_dist_with_legend)
 ggsave(file.path(fig_dir, "fig_class_distributions.png"),
        fig_class_dist_with_legend, width = 14, height = 16, dpi = 300)
 ```
+```{r}
+#density plots of both NCSS and perry for 12 predictors:
+# =============================================================================
+# fig_eda_density_ncss_perry.R
+#
+# Density-plot comparison of NCSS vs Perry for 12 key continuous predictors.
+# Updated version with:
+#   - Outlier-trimmed x-axes (Bt thickness, argillic thickness) using 99th percentile cap
+#   - Consistent ordering of panels (texture, color, depth, thickness, indices)
+#   - Single shared legend at top
+#   - NA handling
+# =============================================================================
+
+library(tidyverse)
+library(here)
+library(patchwork)
+
+fig_dir <- here("outputs", "figures_05_02")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+
+# -----------------------------------------------------------------------------
+# Load data
+# -----------------------------------------------------------------------------
+ncss_pack_files <- list.files(here("outputs"),
+                               pattern = "^pedon_pack_150_.*\\.csv$",
+                               full.names = TRUE)
+ncss_pack_path <- ncss_pack_files[which.max(file.mtime(ncss_pack_files))]
+ncss <- read.csv(ncss_pack_path) %>% mutate(dataset = "NCSS")
+
+perry_pack_files <- list.files(here("outputs"),
+                                pattern = "^perry_pack_150_.*\\.csv$",
+                                full.names = TRUE)
+perry_pack_path <- perry_pack_files[which.max(file.mtime(perry_pack_files))]
+perry <- read.csv(perry_pack_path) %>% mutate(dataset = "Perry")
+
+cat("Loaded NCSS:", nrow(ncss), "pedons\n")
+cat("Loaded Perry:", nrow(perry), "pedons\n")
+
+# -----------------------------------------------------------------------------
+# Pretty labels for each predictor
+# -----------------------------------------------------------------------------
+feat_specs <- tribble(
+  ~feature,                ~label,                    ~group,
+  "clay_w",                "Clay (%)",                "Texture",
+  "sand_w",                "Sand (%)",                "Texture",
+  "silt_w",                "Silt (%)",                "Texture",
+  "R_w",                   "Red channel (RGB)",       "Color",
+  "G_w",                   "Green channel (RGB)",     "Color",
+  "B_w",                   "Blue channel (RGB)",      "Color",
+  "depth_to_Bt_cm",        "Depth to Bt (cm)",        "Bt/argillic depth",
+  "bt_thickness_cm",       "Bt thickness (cm)",       "Bt/argillic depth",
+  "max_clay_ratio_0_150",  "Max clay ratio (0-150 cm)",   "Clay translocation",
+  "max_clay_delta_0_150",  "Max clay delta (0-150 cm)",   "Clay translocation",
+  "depth_to_argillic_cm",  "Depth to argillic (cm)",  "Bt/argillic depth",
+  "argillic_thickness_cm", "Argillic thickness (cm)", "Bt/argillic depth"
+)
+
+# Stack into long format, filter to feature set
+long <- bind_rows(
+  ncss  %>% select(dataset, any_of(feat_specs$feature)),
+  perry %>% select(dataset, any_of(feat_specs$feature))
+) %>%
+  pivot_longer(cols = -dataset, names_to = "feature", values_to = "value") %>%
+  filter(!is.na(value), is.finite(value)) %>%
+  left_join(feat_specs, by = "feature") %>%
+  mutate(label = factor(label, levels = feat_specs$label))
+
+# -----------------------------------------------------------------------------
+# Manual x-axis caps for depth/thickness features (restricted to 0-150 cm zone)
+# Other features get automatic 99th-percentile trimming
+# -----------------------------------------------------------------------------
+manual_caps <- tribble(
+  ~label,                      ~xmax,
+  "Depth to Bt (cm)",          150,
+  "Bt thickness (cm)",         150,
+  "Depth to argillic (cm)",    150,
+  "Argillic thickness (cm)",   150
+)
+
+# Auto trim for everything else
+auto_trim <- long %>%
+  group_by(label) %>%
+  summarise(
+    p99 = quantile(value, 0.99, na.rm = TRUE),
+    p99_5 = quantile(value, 0.995, na.rm = TRUE),
+    pmax = max(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    xmax = if_else(pmax > 2 * p99, p99_5, pmax),
+    xmax = xmax * 1.05
+  ) %>%
+  select(label, xmax) %>%
+  # Override with manual caps where specified
+  anti_join(manual_caps, by = "label") %>%
+  bind_rows(manual_caps)
+
+trim_table <- auto_trim
+
+cat("\n--- X-axis trim points per feature ---\n")
+print(trim_table)
+
+# Filter long data to within xmax
+long_trim <- long %>%
+  left_join(trim_table %>% select(label, xmax), by = "label") %>%
+  filter(value <= xmax)
+
+cat("\nRows before/after trimming:", nrow(long), "/", nrow(long_trim), "\n")
+# -----------------------------------------------------------------------------
+# Plot
+# -----------------------------------------------------------------------------
+thesis_theme <- theme_bw(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.position = "top",
+    legend.title = element_blank(),
+    axis.text = element_text(size = 8)
+  )
+
+fig_density <- ggplot(long_trim, aes(x = value, fill = dataset, color = dataset)) +
+  geom_density(alpha = 0.45, linewidth = 0.4) +
+  facet_wrap(~ label, scales = "free", ncol = 4) +
+  scale_fill_manual(values = c("NCSS"  = "#2C7BB6",
+                                "Perry" = "#D7191C")) +
+  scale_color_manual(values = c("NCSS"  = "#1F5780",
+                                 "Perry" = "#9A1419"),
+                     guide = "none") +
+  labs(x = NULL, y = "Density",
+       title = "Predictor distributions: NCSS vs Perry datasets",
+       subtitle = "Densities show distributional shift between regional (NCSS) and field-scale (Perry) data") +
+  thesis_theme
+
+print(fig_density)
+
+ggsave(file.path(fig_dir, "fig_eda_density_ncss_perry.png"),
+       fig_density, width = 14, height = 9, dpi = 300)
+
+cat("\nSaved to:", file.path(fig_dir, "fig_eda_density_ncss_perry.png"), "\n")
+
+# -----------------------------------------------------------------------------
+# Optional: numeric summary table for inline thesis use
+# -----------------------------------------------------------------------------
+summary_tbl <- long %>%
+  group_by(label, dataset) %>%
+  summarise(
+    n = n(),
+    median = round(median(value, na.rm = TRUE), 2),
+    q25 = round(quantile(value, 0.25, na.rm = TRUE), 2),
+    q75 = round(quantile(value, 0.75, na.rm = TRUE), 2),
+    mean = round(mean(value, na.rm = TRUE), 2),
+    sd = round(sd(value, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(label, dataset)
+
+print(summary_tbl, n = Inf)
+
+write.csv(summary_tbl,
+          here("outputs", "reports_05_02", "eda_predictor_summary_ncss_perry.csv"),
+          row.names = FALSE)
+```
+
 
 
 
