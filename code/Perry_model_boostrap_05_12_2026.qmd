@@ -954,12 +954,42 @@ fig1 <- ggplot(fig1_data, aes(x = outcome, y = kap, fill = dataset)) +
 print(fig1)
 ggsave(file.path(fig_dir, "fig1_kappa_by_level.png"),
        fig1, width = 9, height = 5.5, dpi = 300)
-
+library(here)
+ 
+fig_dir <- here("outputs", "figures_05_02")
+ 
+thesis_theme <- theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "top",
+        strip.background = element_rect(fill = "grey95", color = NA))
+ 
+tax_labels <- c(
+  taxorder        = "Order",
+  taxsuborder     = "Suborder",
+  taxgrtgroup     = "Great Group",
+  taxsubgrp_mod1  = "Subgroup",
+  taxpartsize     = "Particle Size",
+  taxonname_clean = "Series"
+)
+ 
+# Define the pair-label order from coarsest (suborder → order) to finest (series → subgroup)
+pair_order <- c(
+  "Order → Suborder",
+  "Suborder → Great Group",
+  "Great Group → Subgroup",
+  "Subgroup → Series"
+)
+ 
 fig2_data <- hier_acc %>%
   mutate(
-    pair_label = paste0(tax_labels[child], " → ", tax_labels[parent]),
-    # Reverse so coarse levels appear first on x-axis
-    pair_label = factor(pair_label, levels = rev(unique(pair_label)))
+    # Flip the arrow direction: Parent → Child (reads as going down the hierarchy)
+    pair_label = paste0(tax_labels[parent], " → ", tax_labels[child]),
+    pair_label = factor(pair_label, levels = c(
+      "Order → Suborder",
+      "Suborder → Great Group",
+      "Great Group → Subgroup",
+      "Subgroup → Series"
+    ))
   ) %>%
   pivot_longer(cols = c(child_acc, parent_acc, parent_acc_when_child_wrong),
                names_to = "metric", values_to = "value") %>%
@@ -968,29 +998,36 @@ fig2_data <- hier_acc %>%
                     child_acc = "Child correct",
                     parent_acc = "Parent correct",
                     parent_acc_when_child_wrong = "Parent correct when child wrong"),
-    metric = factor(metric, levels = c("Child correct", "Parent correct",
-                                        "Parent correct when child wrong"))
+    metric = factor(metric, levels = c("Parent correct when child wrong",
+                                        "Parent correct",
+                                        "Child correct"))
   )
-
+ 
 fig2 <- ggplot(fig2_data, aes(x = pair_label, y = value, fill = metric)) +
   geom_col(position = position_dodge(width = 0.8), width = 0.7) +
   geom_text(aes(label = ifelse(is.na(value), "", round(value, 2))),
             position = position_dodge(width = 0.8),
             vjust = -0.4, size = 3) +
-  scale_fill_manual(values = c("Child correct" = "#2C7BB6",
-                                "Parent correct" = "#1A9641",
-                                "Parent correct when child wrong" = "#FDAE61"),
-                    name = NULL) +
+  scale_fill_manual(
+    values = c("Parent correct when child wrong" = "#FDAE61",
+               "Parent correct"                  = "#1A9641",
+               "Child correct"                   = "#2C7BB6"),
+    breaks = c("Parent correct when child wrong",
+               "Parent correct",
+               "Child correct"),
+    name = NULL
+  ) +
   scale_y_continuous(limits = c(0, 1.05), expand = c(0, 0)) +
   labs(x = NULL, y = "Accuracy",
        title = "Graceful degradation: parent class is recovered when child fails",
        subtitle = "When the model misses the fine class, the level above is usually right") +
   thesis_theme +
   theme(axis.text.x = element_text(angle = 15, hjust = 1))
-
+ 
 print(fig2)
 ggsave(file.path(fig_dir, "fig2_hierarchical_accuracy.png"),
        fig2, width = 10, height = 5.5, dpi = 300)
+ 
 library(cowplot)
 library(patchwork)
 # ============================================================
@@ -1491,7 +1528,8 @@ cat("Saved to: ../outputs/reports_05_02/predictor_inventory.csv\n")
 ```
 
 ```{r}
-
+library(tidyverse)
+library(here)
 
 fig_dir <- here("outputs", "figures_05_02")
 dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
@@ -1499,6 +1537,7 @@ dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
 thesis_theme <- theme_bw(base_size = 12) +
   theme(panel.grid.minor = element_blank(),
         legend.position = "top",
+        legend.box = "horizontal",
         strip.background = element_rect(fill = "grey95", color = NA))
 
 tax_order  <- c("taxorder", "taxsuborder", "taxgrtgroup",
@@ -1508,31 +1547,55 @@ tax_labels <- c("Order", "Suborder", "Great Group",
 names(tax_labels) <- tax_order
 
 # ============================================================
-# LOAD NCSS BOOTSTRAPPED SUMMARY (from repeated-splits framework)
+# REBUILD NCSS SUMMARY FROM ALL-REPS FILE
 # ============================================================
-ncss_for_plot <- read.csv(here("outputs", "reports_05_02",
-                                "test_metrics_summary_clean.csv")) %>%
+reps <- read.csv(here("outputs", "reports_05_02",
+                       "test_metrics_all_reps_ncss.csv"))
+
+reps <- reps %>%
+  mutate(is_min5 = str_detect(bundle_name, "_min5_"))
+
+ncss_summary <- reps %>%
+  group_by(outcome, engine, space, is_min5) %>%
+  summarise(
+    n_reps = n(),
+    kap_median = median(kap, na.rm = TRUE),
+    kap_lo_95 = quantile(kap, 0.025, na.rm = TRUE),
+    kap_hi_95 = quantile(kap, 0.975, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# NCSS: use min_n=15 for series (the bootstrapped version)
+# All other outcomes: use the standard bootstrap (no is_min5 distinction)
+ncss_for_plot <- ncss_summary %>%
+  filter(is_min5 == FALSE) %>%  # only the non-min5 bootstrapped bundles
   mutate(dataset = "NCSS (internal test)") %>%
-  select(outcome, engine, space, dataset,
+  select(outcome, engine, space, is_min5, dataset,
          kap_median, kap_lo_95, kap_hi_95)
 
+cat("NCSS data ready (uses min_n=15 series):\n")
+print(ncss_for_plot %>% arrange(outcome, desc(kap_median)))
+
 # ============================================================
-# LOAD PERRY POINT ESTIMATES (from canonical deployment)
+# PERRY: use min_n=5 for series, drop min_n=15
 # ============================================================
 perry_for_plot <- read.csv(here("outputs", "reports_05_02",
                                  "perry_external_validation.csv")) %>%
-  filter(!is_min5 | outcome != "taxonname_clean") %>%  # use min_n=15 series for parity
+  filter(!(outcome == "taxonname_clean" & is_min5 == FALSE)) %>%
   mutate(
     dataset = "Perry (external)",
     kap_median = kap,
     kap_lo_95 = NA_real_,
     kap_hi_95 = NA_real_
   ) %>%
-  select(outcome, engine, space, dataset,
+  select(outcome, engine, space, is_min5, dataset,
          kap_median, kap_lo_95, kap_hi_95)
 
+cat("\nPerry data ready (uses min_n=5 series):\n")
+print(perry_for_plot %>% arrange(outcome, desc(kap_median)))
+
 # ============================================================
-# n_classes_lookup — derive from bundle inventory
+# n_classes_lookup
 # ============================================================
 n_classes_lookup <- read.csv(here("outputs", "reports_05_02",
                                    "perry_bundle_inventory.csv")) %>%
@@ -1548,41 +1611,76 @@ fig1_data <- bind_rows(ncss_for_plot, perry_for_plot) %>%
   ungroup() %>%
   left_join(n_classes_lookup, by = "outcome") %>%
   mutate(
-    outcome = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
-    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)"))
+    outcome_lbl = factor(outcome, levels = tax_order, labels = tax_labels[tax_order]),
+    dataset = factor(dataset, levels = c("NCSS (internal test)", "Perry (external)")),
+    variant = paste(
+      toupper(engine),
+      ifelse(space == "umap_hdb", "(UMAP+HDB)", "(plain)")
+    ),
+    variant = factor(variant, levels = c("RF (plain)", "XGB (plain)",
+                                          "RF (UMAP+HDB)", "XGB (UMAP+HDB)"))
   )
 
+cat("\nBest variant per (outcome × dataset):\n")
+print(fig1_data %>% select(outcome, dataset, variant, kap_median, kap_lo_95, kap_hi_95))
+
 n_class_labels <- fig1_data %>%
-  group_by(outcome) %>%
+  group_by(outcome_lbl) %>%
   summarise(n_classes_max = first(n_classes_max), .groups = "drop")
 
 # ============================================================
 # BUILD THE FIGURE
+# Color = dataset (NCSS vs Perry)
+# Shape on points = variant (RF/XGB × plain/UMAP+HDB)
 # ============================================================
-fig1 <- ggplot(fig1_data, aes(x = outcome, y = kap_median, fill = dataset)) +
-  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
-  geom_errorbar(aes(ymin = kap_lo_95, ymax = kap_hi_95),
+fig1 <- ggplot(fig1_data, aes(x = outcome_lbl, y = kap_median)) +
+  # Bars colored by dataset
+  geom_col(aes(fill = dataset),
+           position = position_dodge(width = 0.8),
+           width = 0.7, alpha = 0.85) +
+  # Error bars (NCSS only — Perry has NA)
+  geom_errorbar(aes(ymin = kap_lo_95, ymax = kap_hi_95, group = dataset),
                 position = position_dodge(width = 0.8),
-                width = 0.25, na.rm = TRUE) +
-  geom_text(aes(label = sprintf("%.2f", kap_median)),
+                width = 0.25, na.rm = TRUE, linewidth = 0.5) +
+  # Variant marker on top of each bar
+  geom_point(aes(shape = variant, group = dataset),
+             position = position_dodge(width = 0.8),
+             size = 3, color = "black", fill = "white", stroke = 1) +
+  # Kappa value above each bar
+  geom_text(aes(label = sprintf("%.2f", kap_median), group = dataset),
             position = position_dodge(width = 0.8),
-            vjust = -0.4, size = 3.2) +
+            vjust = -1.4, size = 3.2) +
+  # n_classes annotation at top
   geom_text(data = n_class_labels,
-            aes(x = outcome, y = 1.05, label = paste0("k=", n_classes_max)),
+            aes(x = outcome_lbl, y = 1.10, label = paste0("k=", n_classes_max)),
             inherit.aes = FALSE, size = 3.4, fontface = "italic", color = "grey30") +
   scale_fill_manual(values = c("NCSS (internal test)" = "#2C7BB6",
                                 "Perry (external)" = "#D7191C"),
-                    name = NULL) +
-  scale_y_continuous(limits = c(-0.05, 1.10), expand = c(0, 0)) +
+                    name = "Dataset") +
+  scale_shape_manual(values = c("RF (plain)" = 21,
+                                 "XGB (plain)" = 22,
+                                 "RF (UMAP+HDB)" = 24,
+                                 "XGB (UMAP+HDB)" = 23),
+                     name = "Best variant",
+                     drop = FALSE) +
+  scale_y_continuous(limits = c(-0.05, 1.15), expand = c(0, 0)) +
   labs(x = NULL, y = "Cohen's Kappa (median ± 95% range, NCSS only)",
        title = "Model performance degrades from coarse to fine taxonomic levels",
-       subtitle = "NCSS error bars: 95% range across 10 replicates; Perry: canonical-bundle point estimate") +
+       subtitle = paste(
+         "Best variant per (outcome × dataset). NCSS bars: median ± 95% range across 10 replicates.",
+         "Perry bars: canonical-bundle point estimate. Series: NCSS min_n=15, Perry min_n=5.",
+         sep = "\n"
+       )) +
   thesis_theme +
-  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "top",
+        legend.box = "horizontal")
 
 print(fig1)
 ggsave(file.path(fig_dir, "fig1_kappa_by_level_with_ci.png"),
-       fig1, width = 9, height = 5.5, dpi = 300)
+       fig1, width = 11, height = 6.5, dpi = 300)
+
+cat("\nFigure saved.\n")
 ```
 
 ```{r}
